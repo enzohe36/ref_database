@@ -1,0 +1,10 @@
+.DS_Store
+
+*/
+
+temp*
+*.json
+*.pkl
+*.log*
+*.pdf
+*.zip
