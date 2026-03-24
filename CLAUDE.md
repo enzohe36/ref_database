@@ -1,8 +1,7 @@
 ## Project Overview
 
-- This is a literature research and grant writing assistant.
+- This is a literature research and scientific writing assistant.
 - Project-specific files (aims, drafts, notes) are in projects/.
-- Conda environment: py310 (used for convert_pdf.py).
 
 ## General Rules
 
@@ -18,16 +17,15 @@
 
 ## File Structure
 
-- refs.json is the citation database. JSON dict keyed by PMID. Each entry has fields:
-  - "publication_types": array of types (e.g., ["Journal Article", "Review"]).
+- refs.json is the citation database. JSON dict keyed by PMID. Each entry has fields (in order):
   - "citation_in_text": short author-year string for in-text citations. "LastName YYYY" (1 author) / "LastName & LastName YYYY" (2) / "LastName et al. YYYY" (3+). E.g., "Aden et al. 2019".
-  - "title": article title.
   - "journal": journal abbreviation (ISO format).
-  - "pub_date": publication year.
-  - "volume", "issue", "pagination": journal location. May be empty.
+  - "volume", "issue", "pub_date": journal location and publication year. May be empty.
+  - "title": article title.
+  - "pagination": page range. May be empty.
   - "doi": DOI as URL (https://doi.org/...). May be empty.
-  - "authors": array of {"name": "LastName Initials", "affiliations": [...]}.
-  - "references": array of PMIDs (strings) cited by this paper.
+  - "authors": array of "LastName Initials" strings.
+  - "publication_types": array of types (e.g., ["Journal Article", "Review"]).
 - <citation_short> = "<citation_in_text> <journal> <pmid>" (e.g., "Aden et al. 2019 Gastroenterology 30273559"). Used as file name for papers/ files.
 - <citation> = full citation string for reference lists. Format: "Author1, Author2, ... YYYY. Title. Journal. Volume(Issue):Pages. PMID: PMID."
 - papers/ stores pdf files, converted md files, and _summary.md files.
@@ -41,9 +39,9 @@
 
 - `python cite.py <pmid> [<pmid> ...]`: fetches PubMed XML. Adds metadata to refs.json, appends to temp_refs.md. Skips non-Journal Articles, retracted articles, and duplicates.
 - `python cite.py --validate`: checks for retracted articles and searches for published versions of preprints.
-- `conda run -n <env> python convert_pdf.py <file.pdf> [<file.pdf> ...]`: converts PDFs to text using pymupdf4llm (with fitz fallback for scanned PDFs). Writes converted text to <citation_short>.md in the same directory as the PDF, overwriting existing content.
+- `conda run -n py310 python convert_pdf.py <file.pdf> [<file.pdf> ...]`: converts PDFs to text using pymupdf4llm (with fitz fallback for scanned PDFs). Writes converted text to <citation_short>.md in the same directory as the PDF, overwriting existing content.
 - `python search.py <term> [<term> ...]`: search papers, returns ranked JSON with PMIDs and scores.
-- `python search.py --build`: rebuild keyword_map.pkl from papers/*.md.
+- `python search.py --build`: rebuild keyword_map.pkl. Iterates refs.json, uses papers/*.md full text where available, falls back to title.
 
 ## Literature Search
 
@@ -60,70 +58,68 @@
 
 ---
 
-Only read and modify files in papers/! Do not access internet or any other directories!
+ONLY read and modify files in papers/ and /tmp/. DO NOT access internet or any other directories.
 
-Your task: clean up and summarize one paper.
+Your task: clean up and summarize papers/<citation_short>.md.
 
-File: papers/<citation_short>.pdf
-
-Step 1 - Clean up: Read papers/<citation_short>.md. Consult the PDF only when something is ambiguous (e.g., column interleaving, garbled text). Edit papers/<citation_short>.md to apply all of the following cleanup rules. Keep the original wording; do not rewrite unless it is a necessary fix.
+Step 1 - Clean up: Read papers/<citation_short>.pdf. Rearrange text fragments in papers/<citation_short>.md as they appear in the pdf. Then, clean up papers/<citation_short>.md as instructed below; prioritize retaining all body sections over removing non-body sections. Write the cleaned up version to /tmp/<citation_short>.md; when finished, replace the papers/ version with the /tmp version using the `mv` command.
 
 DELETE these sections/elements entirely:
-- Everything before the title (journal name, logos, article type labels)
-- Author names, affiliations, corresponding author info, email addresses
-- Article history (received/accepted dates)
-- Table of contents / contents listing (lines with leader dots)
-- Page headers and footers (author name / journal name / volume / page range lines)
-- Standalone page numbers
-- Copyright and DOI lines
-- Picture placeholders (==> picture ... intentionally omitted <==)
-- Garbled text extracted from figures/charts/diagrams (----- Start/End of picture text -----)
-- References / bibliography section. Stop deleting at supplementary material if present.
-- Acknowledgements, funding, conflict of interest, author contributions, data availability
+- Text from adjacent articles in the same journal issue
+- Cover page
+- Everything before title (journal info, logos, article type labels etc.)
+- First page footnotes/sidenotes (correspondence, article history, copyright, ISSN, DOI etc.)
+- Page margins (headers, footers, page numbers, watermarks etc.)
+- Picture artifacts (placeholders, garbled figure text)
+- Boilerplates (acknowledgements, funding, conflict of interest, author contributions etc.)
+- Back cover
 
 KEEP these sections/elements:
 - Paper title (as ## heading)
-- Abstract text
+- Author names
+- Author affiliations (may be in first page footnotes/sidenotes)
+- Abstract
 - Keywords
-- All body sections (introduction, results, discussion, methods, etc.) regardless of heading style
-- Figure and table captions (lines starting with "Fig." or "Table N")
-- Box/sidebar content
-- Supplementary methods and supplementary figure/table captions
-- Not all papers have typical section titles - reviews, comments, protocols, and other non-primary articles may have arbitrary section structures. Keep all substantive content regardless of section naming.
-- Prioritize retaining all body sections over removing non-body sections.
+- Abbreviations (may be in first page footnotes/sidenotes)
+- All body sections (introduction, results, discussion, methods, etc.)
+- Text box content
+- Figure/table captions
+- References
+- Supplementary methods, supplementary figure/table captions
 
 FIX formatting:
-- Section headings: use ## prefix, plain text, no bold/italic
-- Remove all bold (**), italic (* or _), strikethrough (~~), and other markup
+- Use ## prefix + plain text for section titles
+- Remove markups (bold (**), italic (* or _), strikethrough (~~) etc.)
 - Remove blockquote markers (>)
-- Remove HTML tags (<br>, etc.)
-- Convert markdown tables to plain text: keep the caption, then list content as "Column1: Value1. Column2: Value2." per row, or summarize if the table is simple.
-- Rejoin fragmented paragraphs and deinterleave two-column layouts using the PDF as reference.
-- Collapse multiple blank lines to single blank line
+- Remove HTML tags (<br> etc.)
+- Convert markdown tables to plain text ("Column1: Value1. Column2: Value2." per row)
+- Collapse multiple blank lines to a single blank line
 
-FIX encoding (use context and the PDF to determine the correct replacement):
-- Ligatures: fi, fl, ff, ffi, ffl and font-specific variants -> ASCII equivalents
-- Dashes/hyphens: en dash, em dash, minus sign, non-breaking hyphen -> ASCII hyphen
-- Quotes: curly single/double quotes -> straight quotes; prime symbols -> apostrophe
-- Math fonts: mathematical bold/italic/script characters -> plain ASCII or Greek equivalents
-- Font-specific Greek: codepoints used as Greek letters (e.g., in gammaH2AX, beta-actin, Pol delta, mu-units) -> standard Greek Unicode
-- Standardize mu: micro sign (U+00B5) -> Greek mu (U+03BC)
-- Font-specific symbols: garbled codepoints used as parentheses, equals signs, plus signs, etc. -> correct ASCII
-- Keep legitimate non-ASCII: Greek letters, Latin diacritics in names, math symbols (<=, >=, ~, etc.), degree sign, plus-minus, multiplication sign, Angstrom
+REPLACE non-ASCII characters:
+- Correct garbled text (�, ˛, ˇ, ı etc.) based on the pdf
+- Ligatures (fi, fl, ff, ffi, ffl etc.) -> plain ASCII
+- All dashes/hyphens, minus sign -> ASCII hyphen
+- All quotes, prime, backtick -> ASCII single/double quotes
+- Bold/italic/script math fonts -> plain ASCII
+- Greek letters -> spelled-out words; capitalize upper case letters, e.g. α -> alpha, Δ -> Delta
+- Latin diacritics (é ñ ü ö ø å ä etc.) -> plain ASCII
+- Math symbols (<=, >=, ~, -, x, +/- etc.) -> plain ASCII
 
-Step 2 - Summarize: Check if papers/<citation_short>_summary.md exists. If not, create it by reading papers/<citation_short>.md and summarizing section by section. Write as many bullet points as necessary per section; do not balance counts across sections. Refer to the original PDF if anything in the md file is unclear. If the authors explicitly discuss future directions, add a Future Directions section. Use the following format:
-  ```
-  Section 1 title
-  - Bullet point 1
-  - Bullet point 2
-  - ...
+Step 2 - Summarize: Summarize papers/<citation_short>.md section by section. Write as many bullet points as necessary per section; do not balance bullet point counts across sections. If the authors explicitly discuss future directions, add a Future Directions section. Write to /tmp/<citation_short>_summary.md; when finished, move to papers/ using the `mv` command.
 
-  Section 2 title
-  ...
+Format:
+```
+Section 1 title
+- Bullet point 1
+- Bullet point 2
+- ...
 
-  Future Directions
-  ...
-  ```
+Section 2 title
+...
+
+Future Directions
+...
+```
 ---
 
 1. After all agents finish, run: `python search.py --build` to rebuild the search index.

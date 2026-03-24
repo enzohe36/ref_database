@@ -96,6 +96,14 @@ def parse_xml(xml_data, pmid):
             abstract_parts.append(text)
     abstract = " ".join(abstract_parts)
 
+    # Keywords
+    keywords = []
+    kw_list = mc.find("KeywordList")
+    if kw_list is not None:
+        for kw in kw_list.findall("Keyword"):
+            if kw.text:
+                keywords.append(kw.text.strip())
+
     # Publication types
     pub_types = [pt.text for pt in art.findall(".//PublicationType") if pt.text]
 
@@ -122,7 +130,7 @@ def parse_xml(xml_data, pmid):
     pmid_final = pmid_from_aid or gt(mc, "PMID")
 
     citation_in_text = f"{authors_short} {year}"
-    citation_short = f"{citation_in_text} {journal} {pmid_final}"
+    citation_short = f"{citation_in_text} {journal_abbrev} {pmid_final}"
 
     # Reference PMIDs (deduplicated)
     references = []
@@ -153,6 +161,7 @@ def parse_xml(xml_data, pmid):
         "_authors_raw": authors_raw,
         "references": references,
         "abstract": abstract,
+        "keywords": keywords,
         "citation_short": citation_short,
     }
 
@@ -175,7 +184,7 @@ def save_references(refs):
     # Custom serialization: indent=2 but keep publication_types and references on one line
     raw = json.dumps(refs, indent=2, ensure_ascii=False)
     # Collapse multi-line arrays for these keys onto one line
-    for key in ("publication_types", "references", "affiliations"):
+    for key in ("publication_types", "authors"):
         def _collapse(m):
             items = [s.strip().rstrip(",") for s in m.group(2).split("\n") if s.strip()]
             return m.group(1) + " " + ", ".join(items) + " ]"
@@ -199,25 +208,18 @@ def append_to_references(parsed):
     refs = load_references()
     filtered = [pt for pt in parsed['publication_types']
                 if not pt.startswith("Research Support")]
-    # Build authors
-    authors = []
-    for auth in parsed.get('_authors_raw', []):
-        entry = {"name": auth["name"]}
-        if auth.get("affiliations"):
-            entry["affiliations"] = auth["affiliations"]
-        authors.append(entry)
+    authors = [auth["name"] for auth in parsed.get('_authors_raw', [])]
     refs[parsed['pmid']] = {
-        "publication_types": filtered,
         "citation_in_text": parsed['citation_in_text'],
-        "title": parsed['title'],
         "journal": parsed['journal'],
-        "pub_date": parsed['pub_date'],
         "volume": parsed['volume'],
         "issue": parsed['issue'],
+        "pub_date": parsed['pub_date'],
+        "title": parsed['title'],
         "pagination": parsed['pagination'],
         "doi": parsed['doi'],
         "authors": authors,
-        "references": parsed['references'],
+        "publication_types": filtered,
     }
     save_references(refs)
 

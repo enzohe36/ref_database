@@ -171,7 +171,8 @@ def do_build(reverse_synonyms):
     save_index(vectorizer, tfidf_matrix, pmids)
 
     n_features = len(vectorizer.get_feature_names_out())
-    full_text_count = sum(1 for c in corpus if load_paper_text(c[1]) is not None)
+    refs = load_references()
+    full_text_count = sum(1 for pmid, _ in corpus if load_paper_text(get_citation_short(refs[pmid], pmid)) is not None)
     print(f"Built: {len(corpus)} papers, {n_features} features, "
           f"{full_text_count} full_text, {len(corpus) - full_text_count} abstract-only")
 
