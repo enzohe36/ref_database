@@ -2,12 +2,12 @@
 """Fetch and parse a PubMed citation by PMID.
 
 Usage:
-    python cite.py <pmid> [<pmid> ...]
-    python cite.py --validate
+    python get_citation.py [pmid] [[pmid] ...]
+    python get_citation.py --validate
 
 Outputs JSON with parsed citation fields:
-    pmid, publication_types, citation_in_text, title, journal, pub_date,
-    volume, issue, pagination, doi, references, abstract, citation_short
+    pmid, publication_types, citation_in_text, title, journal, year,
+    volume, issue, pages, doi, references, abstract, citation_short
 """
 
 import os
@@ -153,10 +153,10 @@ def parse_xml(xml_data, pmid):
         "citation_in_text": citation_in_text,
         "title": title,
         "journal": journal_abbrev,
-        "pub_date": year,
+        "year": year,
         "volume": volume,
         "issue": issue,
-        "pagination": pages,
+        "pages": pages,
         "doi": doi,
         "_authors_raw": authors_raw,
         "references": references,
@@ -184,7 +184,7 @@ def save_references(refs):
     # Custom serialization: indent=2 but keep publication_types and references on one line
     raw = json.dumps(refs, indent=2, ensure_ascii=False)
     # Collapse multi-line arrays for these keys onto one line
-    for key in ("publication_types", "authors"):
+    for key in ("publication_types", "keywords", "references"):
         def _collapse(m):
             items = [s.strip().rstrip(",") for s in m.group(2).split("\n") if s.strip()]
             return m.group(1) + " " + ", ".join(items) + " ]"
@@ -208,18 +208,21 @@ def append_to_references(parsed):
     refs = load_references()
     filtered = [pt for pt in parsed['publication_types']
                 if not pt.startswith("Research Support")]
-    authors = [auth["name"] for auth in parsed.get('_authors_raw', [])]
+    authors = [{"author": auth["name"], "affiliation": []} for auth in parsed.get('_authors_raw', [])]
     refs[parsed['pmid']] = {
         "citation_in_text": parsed['citation_in_text'],
         "journal": parsed['journal'],
         "volume": parsed['volume'],
         "issue": parsed['issue'],
-        "pub_date": parsed['pub_date'],
+        "year": parsed['year'],
         "title": parsed['title'],
-        "pagination": parsed['pagination'],
+        "pages": parsed['pages'],
         "doi": parsed['doi'],
+        "abstract": parsed.get('abstract', ''),
         "authors": authors,
         "publication_types": filtered,
+        "keywords": parsed.get('keywords', []),
+        "references": parsed.get('references', []),
     }
     save_references(refs)
 
@@ -305,8 +308,8 @@ def validate():
 
 def main():
     if len(sys.argv) < 2:
-        print("Usage: python cite.py <pmid> [<pmid> ...]\n"
-              "       python cite.py --validate", file=sys.stderr)
+        print("Usage: python get_citation.py [pmid] [[pmid] ...]\n"
+              "       python get_citation.py --validate", file=sys.stderr)
         sys.exit(1)
 
     if sys.argv[1] == "--validate":

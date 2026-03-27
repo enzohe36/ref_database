@@ -1,0 +1,1 @@
+sleep $(($(date -j -f "%H:%M:%S" "01:01:00" +%s) + 86400 - $(date +%s))) && claude --dangerously-skip-permissions 'I am cleaning converted md files. Due to usage limit, I cannot clean all md files in one session. Your task is to continue with "Adding Citations" step 3 in CLAUDE.md.'
