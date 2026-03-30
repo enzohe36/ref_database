@@ -60,7 +60,8 @@ def parse_xml(xml_data, pmid):
     volume = gt(ji, "Volume")
     issue = gt(ji, "Issue")
     pages = gt(pag, "MedlinePgn") if pag is not None else ""
-    title = gt(art, "ArticleTitle")
+    title_el = art.find("ArticleTitle")
+    title = ET.tostring(title_el, encoding="unicode", method="text").strip() if title_el is not None else ""
     doi_raw = ""
     for el in art.findall("ELocationID"):
         if el.get("EIdType") == "doi":

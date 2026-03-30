@@ -52,9 +52,9 @@
 
 ## Adding Citations
 
-1. Extract PMIDs from a user-specified source. Pass each PMID as a separate argument to get_citation.py.
+1. Extract PMIDs from a user-specified source. If the source is a comma-separated list, parse it into individual PMIDs first. Pass each PMID as a separate argument to get_citation.py.
 2. Convert user-specified pdfs to mds. Run in the background.
-3. Identify uncleaned papers/[stem].pdf by those lacking papers/[stem].json. Launch one agent to clean each paper; pass only the prompt below to the agent, substituting [dir], [stem], and [pmid]. Launch up to 20 agents in parallel. Run in the background. When one agent finishes, spawn a new one to clean the next paper. Repeat until all papers are done or you hit a usage limit.
+3. Identify uncleaned papers/[stem].pdf by those lacking papers/[stem].json. Launch one agent to clean each paper; pass only the prompt below to the agent, substituting [dir], [stem], and [pmid]. Launch up to 5 agents in parallel. Run in the background. When one agent finishes, spawn a new one to clean the next paper. Repeat until all papers are done or you hit a usage limit.
 4. Rebuild chroma_db/.
 5. Merge authors and references from all [stem].json files into refs.json.
 
@@ -109,7 +109,7 @@ Replace special characters:
 - Math symbols -> ASCII equivalents (if any) or spelled-out words.
 - All other non-ASCII characters -> ASCII equivalents based on the pdf.
 
-Step 2: Write the output of `python3 -c "import json; d=json.load(open('[dir]/../refs.json'))['[pmid]']; print(json.dumps({'authors':d['authors'],'references':d['references']}, indent=2))"` to /tmp/[stem].json. Fill in "affiliation" and "references" values from the md, as instructed below.
+Step 2: Write the output of `python3 -c "import json; d=json.load(open('[dir]/../refs.json'))['[pmid]']; print(json.dumps({'authors':d['authors'],'references':[]}, indent=2))"` to /tmp/[stem].json. Fill in "affiliation" and "references" values from the md, as instructed below.
 
 Extract authors and references:
 - Match the authors names in the paper to the "author" values in the json, which may be formatted differently. DO NOT modify the "author" values in the json.
