@@ -2,7 +2,10 @@
 """Convert PDFs to markdown text files.
 
 Usage:
-    conda run -n py312 python convert_pdf.py [[stem].pdf] [[[stem].pdf] ...]
+    python convert_pdf.py <path> [<path> ...]
+
+Each path can be a PDF file or a directory (all .pdf files in the directory
+will be processed). Output .md files are written next to each input PDF.
 """
 
 import os
@@ -39,6 +42,9 @@ def process_one(path):
     pdf_dir = os.path.dirname(path)
     target_md = os.path.join(pdf_dir, f"{stem}.md")
 
+    if os.path.exists(target_md):
+        return
+
     try:
         text = convert_pdf(path)
         with open(target_md, "w", encoding="utf-8") as f:
@@ -50,16 +56,22 @@ def process_one(path):
 
 def main():
     if len(sys.argv) < 2:
-        print("Usage: python convert_pdf.py [[stem].pdf] [[[stem].pdf] ...]", file=sys.stderr)
+        print("Usage: python convert_pdf.py <path> [<path> ...]", file=sys.stderr)
         sys.exit(1)
 
     paths = []
     for arg in sys.argv[1:]:
         path = os.path.join(os.getcwd(), arg) if not os.path.isabs(arg) else arg
         if not os.path.exists(path):
-            print(f"File not found: {path}", file=sys.stderr)
+            print(f"Not found: {path}", file=sys.stderr)
             continue
-        paths.append(path)
+        if os.path.isdir(path):
+            pdfs = [os.path.join(path, f) for f in os.listdir(path) if f.lower().endswith(".pdf")]
+            if not pdfs:
+                print(f"No PDFs found in: {path}", file=sys.stderr)
+            paths.extend(sorted(pdfs))
+        else:
+            paths.append(path)
 
     n_workers = multiprocessing.cpu_count()
     print(f"Converting {len(paths)} PDFs using {n_workers} workers...", flush=True)

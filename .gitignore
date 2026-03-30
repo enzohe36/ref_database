@@ -3,6 +3,7 @@
 */
 
 temp*
+refs*
 *.json
 *.pkl
 *.log*

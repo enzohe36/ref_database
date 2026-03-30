@@ -1,13 +1,16 @@
 #!/usr/bin/env python3
-"""Fetch and parse a PubMed citation by PMID.
+"""Fetch and parse PubMed citations by PMID.
 
 Usage:
-    python get_citation.py [pmid] [[pmid] ...]
-    python get_citation.py --validate
+    python get_refs.py <pmid> [<pmid> ...]
+    python get_refs.py --path <file>
+    python get_refs.py --delete <pmid> [<pmid> ...]
+    python get_refs.py --validate
 
-Outputs JSON with parsed citation fields:
-    pmid, publication_types, citation_in_text, title, journal, year,
-    volume, issue, pages, doi, references, abstract, citation_short
+Retrieves citation metadata from PubMed. Writes to refs.json and refs_no_pdf.md.
+Skips non-Journal Articles, Retracted Publications, and duplicates.
+--path reads PMIDs from a file (delimited by punctuation, spaces, or newlines).
+--validate checks for Retracted Publications and published versions of preprints.
 """
 
 import os
@@ -60,7 +63,8 @@ def parse_xml(xml_data, pmid):
     volume = gt(ji, "Volume")
     issue = gt(ji, "Issue")
     pages = gt(pag, "MedlinePgn") if pag is not None else ""
-    title = gt(art, "ArticleTitle")
+    title_el = art.find("ArticleTitle")
+    title = ET.tostring(title_el, encoding="unicode", method="text").strip() if title_el is not None else ""
     doi_raw = ""
     for el in art.findall("ELocationID"):
         if el.get("EIdType") == "doi":
@@ -168,7 +172,7 @@ def parse_xml(xml_data, pmid):
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 REFS_FILE = os.path.join(BASE_DIR, "refs.json")
-REFS_TEMP_FILE = os.path.join(BASE_DIR, "temp_refs.md")
+REFS_NO_PDF_FILE = os.path.join(BASE_DIR, "refs_no_pdf.md")
 
 
 def load_references():
@@ -227,12 +231,16 @@ def append_to_references(parsed):
     save_references(refs)
 
 
-def append_to_references_temp(parsed):
-    """Append citation_short + doi_url to no_pdf.md if PDF is not already present."""
+def append_to_no_pdf(parsed):
+    """Append citation_short + doi to refs_no_pdf.md if PDF is missing and entry not already listed."""
     pdf_path = os.path.join(PAPERS_DIR, f"{parsed['citation_short']}.pdf")
     if os.path.exists(pdf_path):
         return
-    with open(REFS_TEMP_FILE, "a", encoding="utf-8") as f:
+    if os.path.exists(REFS_NO_PDF_FILE):
+        with open(REFS_NO_PDF_FILE, encoding="utf-8") as f:
+            if parsed['citation_short'] in f.read():
+                return
+    with open(REFS_NO_PDF_FILE, "a", encoding="utf-8") as f:
         f.write(f"{parsed['citation_short']}\n")
         f.write(f"{parsed['doi']}\n\n")
 
@@ -308,15 +316,38 @@ def validate():
 
 def main():
     if len(sys.argv) < 2:
-        print("Usage: python get_citation.py [pmid] [[pmid] ...]\n"
-              "       python get_citation.py --validate", file=sys.stderr)
+        print("Usage: python get_refs.py <pmid> [<pmid> ...]\n"
+              "       python get_refs.py --path <file>\n"
+              "       python get_refs.py --delete <pmid> [<pmid> ...]\n"
+              "       python get_refs.py --validate", file=sys.stderr)
         sys.exit(1)
 
     if sys.argv[1] == "--validate":
         validate()
         return
 
-    pmids = sys.argv[1:]
+    if sys.argv[1] == "--delete":
+        if len(sys.argv) < 3:
+            print("Usage: python get_refs.py --delete <pmid> [<pmid> ...]", file=sys.stderr)
+            sys.exit(1)
+        refs = load_references()
+        for pmid in sys.argv[2:]:
+            if pmid in refs:
+                del refs[pmid]
+                print(json.dumps({"pmid": pmid, "status": "deleted"}))
+            else:
+                print(json.dumps({"pmid": pmid, "status": "not found"}))
+        save_references(refs)
+        return
+
+    if sys.argv[1] == "--path":
+        if len(sys.argv) < 3:
+            print("Usage: python get_refs.py --path <file>", file=sys.stderr)
+            sys.exit(1)
+        with open(sys.argv[2], encoding="utf-8") as f:
+            pmids = re.findall(r"\d+", f.read())
+    else:
+        pmids = sys.argv[1:]
     results = []
     fetched_count = 0
     for pmid in pmids:
@@ -344,7 +375,7 @@ def main():
         results.append(parsed)
 
         append_to_references(parsed)
-        append_to_references_temp(parsed)
+        append_to_no_pdf(parsed)
 
     if len(results) == 1:
         print(json.dumps(results[0], indent=2, ensure_ascii=False))

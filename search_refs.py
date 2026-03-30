@@ -2,8 +2,8 @@
 """Search the paper collection by semantic similarity.
 
 Usage:
-    conda run -n py312 python search_refs.py [query]        # search papers
-    conda run -n py312 python search_refs.py --build        # rebuild index
+    python search_refs.py <query>        # search papers
+    python search_refs.py --build        # rebuild index
 
 Uses ChromaDB for vector storage and sentence-transformers for embeddings.
 """
@@ -53,11 +53,10 @@ def get_citation_short(entry, pmid):
 
 def load_paper_text(citation_short):
     """Try to load full paper text from papers/ directory."""
-    for ext in [".md", ".txt"]:
-        path = os.path.join(PAPERS_DIR, citation_short + ext)
-        if os.path.exists(path):
-            with open(path, encoding="utf-8") as f:
-                return f.read()
+    path = os.path.join(PAPERS_DIR, citation_short + ".md")
+    if os.path.exists(path):
+        with open(path, encoding="utf-8") as f:
+            return f.read()
     return None
 
 
