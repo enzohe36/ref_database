@@ -107,14 +107,7 @@ def do_build():
             text = full_text
             full_text_count += 1
         else:
-            parts = [entry.get("title", "")]
-            abstract = entry.get("abstract", "")
-            if abstract:
-                parts.append(abstract)
-            keywords = entry.get("keywords", [])
-            if keywords:
-                parts.append(" ".join(keywords))
-            text = " ".join(parts)
+            text = entry.get("title", "")
 
         chunks = chunk_text(text)
         for i, chunk in enumerate(chunks):

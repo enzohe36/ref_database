@@ -1,0 +1,566 @@
+"""MDPI (mdpi.com) HTML parser."""
+
+import re
+from html import unescape
+
+from ._helpers import (
+    _remove_nested_element,
+    drop_noise,
+    extract_captions,
+    format_author_name,
+    format_doi,
+    get_meta,
+    parse_meta_authors,
+    remove_elements_by_id,
+    strip_common,
+    strip_tags,
+    tags_to_text,
+)
+
+# Publisher-specific noise strings removed from main_text
+_NOISE = (
+    "Google Scholar",
+    "CrossRef",
+    "PubMed",
+    "Open in a new tab",
+)
+
+# Reference section heading pattern
+_REF_RE = re.compile(r"\breferences\b", re.IGNORECASE)
+
+# Supplementary section patterns (kept after first references)
+_SUPP_RE = re.compile(
+    r"supplement|extended data|source data|expanded view|powerpoint|appendix",
+    re.IGNORECASE,
+)
+
+
+# ---------------------------------------------------------------------------
+# Banner removal
+# ---------------------------------------------------------------------------
+
+def remove_banners(html):
+    """Remove floating banners, cookie consent dialogs, and overlays.
+
+    - usercentrics-cmp-ui: Usercentrics consent manager containing the
+      floating cookie banner ("All MDPI websites use third-party website
+      tracking...") and its overlay.
+    - small_right / big_right / small_left / big_left: floating caret
+      arrows on page edges linking to previous / next article in journal
+      and in special issue.
+    - <div class=fixed>: floating top bar with MDPI logo, "Toggle
+      desktop layout" link, search, menu hamburger. Unique across the
+      MDPI corpus so safe to anchor by class alone.
+    """
+    html = remove_elements_by_id(
+        html,
+        "usercentrics-cmp-ui",
+        "small_right", "big_right", "small_left", "big_left",
+    )
+    html = _remove_nested_element(html, r"<div class=fixed\b[^>]*>")
+    return html
+
+
+# ---------------------------------------------------------------------------
+# Metadata
+# ---------------------------------------------------------------------------
+
+def _parse_metadata(html):
+    """Extract bundled metadata: title, journal, volume, issue, year, pages, doi.
+
+    Returns dict with those 7 keys. Each field's output format:
+      - title: str
+      - journal: ISO-ish abbreviation without trailing period
+      - volume, issue: str (may be empty)
+      - year: 4-digit string
+      - pages: "firstpage-lastpage" or firstpage alone
+      - doi: "https://doi.org/..." URL
+    MDPI lacks citation_journal_abbrev; uses citation_journal_title (e.g.
+    "Genes", "Molecules"). The "(Basel)" PubMed disambiguation suffix is
+    not present in the HTML and is not synthesized here.
+    """
+    journal = get_meta(html, "citation_journal_abbrev") or get_meta(html, "citation_journal_title")
+
+    date = get_meta(html, "citation_publication_date") or get_meta(html, "citation_online_date")
+    year = ""
+    if date:
+        m = re.search(r"(\d{4})", date)
+        if m:
+            year = m.group(1)
+
+    firstpage = get_meta(html, "citation_firstpage")
+    lastpage = get_meta(html, "citation_lastpage") if firstpage else ""
+    pages = f"{firstpage}-{lastpage}" if lastpage else firstpage
+
+    return {
+        "title": get_meta(html, "citation_title"),
+        "journal": journal.rstrip(".") if journal else "",
+        "volume": get_meta(html, "citation_volume"),
+        "issue": get_meta(html, "citation_issue"),
+        "year": year,
+        "pages": pages,
+        "doi": format_doi(get_meta(html, "citation_doi")),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Authors
+# ---------------------------------------------------------------------------
+
+def _parse_authors(html):
+    """Extract authors with affiliations.
+
+    Returns list of {"author": "LastName IN", "affiliation": [str, ...]}.
+    MDPI has citation_author meta tags in "LastName, Given" form but
+    lacks citation_author_institution tags; affiliations are in
+    <div class=art-affiliations> keyed by numeric superscript, and each
+    author's name chip carries a <sup>N,M,*</sup> listing their affiliation
+    numbers. This function maps name->affiliation via those superscripts.
+    """
+    # Names from meta tags (preferred — already normalized)
+    names = [
+        format_author_name(a["name"])
+        for a in parse_meta_authors(html)
+    ]
+    if not names:
+        return []
+
+    # Build affiliation number -> text map. Parse the art-affiliations
+    # container first to scope the search; each affiliation entry has an
+    # optional <sup>N</sup> label and an affiliation-name div. When a
+    # paper has a single institution and no superscripts, fall back to
+    # storing it under a synthesized key "1".
+    aff_map = {}
+    aff_order = []
+    cm = re.search(
+        r'<div[^>]*class=["\']?art-affiliations[^"\'>]*["\']?[^>]*>', html,
+    )
+    if cm:
+        pos = cm.end()
+        depth = 1
+        div_open = re.compile(r"<div\b", re.IGNORECASE)
+        div_close = re.compile(r"</div\s*>", re.IGNORECASE)
+        while depth > 0 and pos < len(html):
+            nxt_o = div_open.search(html, pos)
+            nxt_c = div_close.search(html, pos)
+            if nxt_c is None:
+                break
+            if nxt_o and nxt_o.start() < nxt_c.start():
+                depth += 1
+                pos = nxt_o.end()
+            else:
+                depth -= 1
+                pos = nxt_c.start() if depth == 0 else nxt_c.end()
+        aff_scope = html[cm.end():pos]
+    else:
+        aff_scope = html
+    # Iterate individual affiliation divs. Walk them with depth-aware
+    # matching since each contains two nested <div> children
+    # (affiliation-item with <sup>, affiliation-name with text).
+    aff_block_pat = re.compile(
+        r'<div\s+class=["\']?affiliation["\']?[^>]*>', re.IGNORECASE,
+    )
+    div_open = re.compile(r"<div\b", re.IGNORECASE)
+    div_close = re.compile(r"</div\s*>", re.IGNORECASE)
+    bpos = 0
+    while True:
+        bm = aff_block_pat.search(aff_scope, bpos)
+        if not bm:
+            break
+        pos = bm.end()
+        depth = 1
+        while depth > 0 and pos < len(aff_scope):
+            nxt_o = div_open.search(aff_scope, pos)
+            nxt_c = div_close.search(aff_scope, pos)
+            if nxt_c is None:
+                break
+            if nxt_o and nxt_o.start() < nxt_c.start():
+                depth += 1
+                pos = nxt_o.end()
+            else:
+                depth -= 1
+                if depth == 0:
+                    chunk = aff_scope[bm.end():nxt_c.start()]
+                    pos = nxt_c.end()
+                    bpos = pos
+                    break
+                pos = nxt_c.end()
+        else:
+            bpos = pos
+            continue
+        sup_m = re.search(r"<sup>([^<]+)</sup>", chunk)
+        key = sup_m.group(1).strip() if sup_m else ""
+        name_m = re.search(
+            r'<div\s+class=["\']?affiliation-name["\']?[^>]*>(.*?)</div>',
+            chunk, re.DOTALL,
+        )
+        if not name_m:
+            continue
+        text = strip_tags(name_m.group(1)).strip().rstrip(".").rstrip(";")
+        text = re.sub(r"\s+", " ", text)
+        if not text or "correspondence" in text.lower():
+            continue
+        if not key or key == "*":
+            key = str(len(aff_order) + 1)
+        aff_map[key] = text
+        aff_order.append(key)
+
+    # Find the art-authors block and map each author's profile-card-drop
+    # name chip to the following <sup>N,M,...</sup>. The chip carries the
+    # display name in "Given LastName" order so we match by last-name token
+    # against the meta-derived "LastName IN" form.
+    authors_m = re.search(
+        r'<div[^>]*class=["\']?art-authors[^"\'>]*["\']?[^>]*>(.*?)<div\s+class=["\']?art-affiliations',
+        html, re.DOTALL,
+    )
+    chip_map = []  # list of (last_name, [aff_nums])
+    if authors_m:
+        block = authors_m.group(1)
+        chips = re.findall(
+            r'<div\s+class=["\']?profile-card-drop[^>]*>([^<]+)</div>'
+            r'(.*?)'
+            r'(?=<div\s+class=["\']?profile-card-drop|$)',
+            block, re.DOTALL,
+        )
+        for name_raw, tail in chips:
+            display = unescape(name_raw.strip())
+            last = display.rsplit(" ", 1)[-1] if " " in display else display
+            sup_m = re.search(r"<sup>([^<]+)</sup>", tail)
+            nums = []
+            if sup_m:
+                nums = [
+                    n.strip()
+                    for n in re.split(r"[,\s]+", sup_m.group(1))
+                    if n.strip() and n.strip() != "*"
+                ]
+            chip_map.append((last, nums))
+
+    authors = []
+    single_aff = [aff_map[k] for k in aff_order] if len(aff_map) == 1 else []
+    for i, meta_author in enumerate(parse_meta_authors(html)):
+        formatted = format_author_name(meta_author["name"])
+        nums = []
+        if i < len(chip_map):
+            nums = chip_map[i][1]
+        if not nums:
+            surname = formatted.split()[0] if formatted else ""
+            for last, ns in chip_map:
+                if last == surname:
+                    nums = ns
+                    break
+        affs = [aff_map[n] for n in nums if n in aff_map]
+        # Fallback: single shared affiliation for papers without sup labels.
+        if not affs and single_aff:
+            affs = list(single_aff)
+        authors.append({
+            "author": formatted,
+            "affiliation": affs,
+        })
+    return authors
+
+
+# ---------------------------------------------------------------------------
+# References
+# ---------------------------------------------------------------------------
+
+def _parse_references(html):
+    """Extract the reference list.
+
+    Returns list of {"": {journal, volume, issue, year, title, pages, doi, authors}}.
+    Each reference dict uses the same field formats as the main paper, with
+    one exception: authors is a list of "LastName IN" strings (plain strings,
+    not dicts with affiliation). Empty fields are "". Empty authors is [].
+    MDPI references appear inside <ol class=html-xxx> after the References
+    heading. Each <li id=BN-...> has the form:
+      Authors. Title. <span class=html-italic>Journal.</span> <b>Year</b>,
+      <span class=html-italic>Volume</span>, pages. [Google Scholar] [CrossRef] [PubMed]
+    """
+    refs = []
+    hm = re.search(r'<h2[^>]*>\s*References\s*</h2>', html)
+    if not hm:
+        return refs
+
+    after = html[hm.end():]
+    # MDPI varies the ol class by paper: html-x, html-xx, html-xxx.
+    ol_m = re.search(
+        r'<ol[^>]*class=["\']?html-x{1,3}["\']?[^>]*>', after,
+    )
+    if not ol_m:
+        return refs
+
+    list_start = ol_m.end()
+    # Bound the reference list at its closing </ol> so footer ol/li
+    # elements are not pulled into the reference set.
+    close_m = re.search(r"</ol>", after[list_start:])
+    list_end = list_start + (close_m.start() if close_m else len(after) - list_start)
+    list_html = after[list_start:list_end]
+    # Each <li> has no explicit closing tag (HTML5 implicit close). Split
+    # by the next <li start position; the last entry ends at list_end.
+    li_positions = [m.start() for m in re.finditer(r"<li\b[^>]*>", list_html)]
+    li_positions.append(len(list_html))
+
+    for i in range(len(li_positions) - 1):
+        entry_full = list_html[li_positions[i]:li_positions[i + 1]]
+        # Strip the <li ...> opening tag
+        entry = re.sub(r"^<li[^>]*>", "", entry_full, count=1)
+
+        # DOI from CrossRef link
+        doi = ""
+        dm = re.search(
+            r'href=["\']?https?://(?:dx\.)?doi\.org/([^"\'>\s]+)',
+            entry,
+        )
+        if dm:
+            doi = format_doi(unescape(dm.group(1)))
+
+        # Drop the [Google Scholar] [CrossRef] [PubMed] link group
+        # (everything from the first [<a ... class=google-scholar onward).
+        citation = re.split(
+            r'\[<a[^>]*class=["\']?google-scholar',
+            entry, maxsplit=1,
+        )[0]
+
+        # Journal from the first <span class=html-italic>
+        journal = ""
+        jm = re.search(
+            r'<span\s+class=["\']?html-italic["\']?\s*>([^<]+)</span>',
+            citation,
+        )
+        if jm:
+            journal = unescape(jm.group(1)).strip().rstrip(".").rstrip(",")
+
+        # Year from first <b>YYYY</b>
+        year = ""
+        ym = re.search(r"<b>\s*(\d{4})[a-z]?\s*</b>", citation)
+        if ym:
+            year = ym.group(1)
+
+        # Volume from second <span class=html-italic> (after <b>Year</b>)
+        volume = ""
+        spans = re.findall(
+            r'<span\s+class=["\']?html-italic["\']?\s*>([^<]+)</span>',
+            citation,
+        )
+        if len(spans) >= 2:
+            volume = unescape(spans[1]).strip().rstrip(",").rstrip(".")
+
+        # Plain text version for pages extraction
+        plain = strip_tags(citation).strip()
+        plain = re.sub(r"\s+", " ", plain)
+
+        # Pages: after the volume comes ", pages." — match numeric range
+        # or single elocator preceding the final period.
+        pages = ""
+        pm = re.search(
+            r",\s*(\d+\s*[-\u2013]\s*\d+|\d{3,}|[A-Za-z]\d+)\s*\.\s*$",
+            plain,
+        )
+        if pm:
+            pages = re.sub(r"[\u2013\u2014]", "-", pm.group(1)).strip()
+
+        # Title: text between the author list and the journal span.
+        # Authors end with "." before the title. Use structure: after
+        # the last "." that precedes the journal's italic span, the title
+        # starts. Simpler: split by ". " before the <span class=html-italic>.
+        title = ""
+        if jm:
+            before_journal = citation[:jm.start()]
+            before_plain = strip_tags(before_journal).strip()
+            before_plain = re.sub(r"\s+", " ", before_plain)
+            # Authors end at "Surname, I.J.[; Surname, I.J.]*" — the title
+            # is the substring after the LAST ". " in before_plain.
+            split_idx = before_plain.rfind(". ")
+            if split_idx > 0:
+                author_str = before_plain[:split_idx]
+                title = before_plain[split_idx + 2:].strip().rstrip(".")
+            else:
+                author_str = before_plain.rstrip(".")
+        else:
+            # No italic journal — treat whole entry as title
+            author_str = ""
+            title = plain
+
+        # Issue: if pages extraction found "V(I), pages" pattern — look
+        # in the raw text for "Vol, Issue" — but MDPI typically omits
+        # issue from references.
+        issue = ""
+        im = re.search(
+            r"</b>\s*,\s*<span[^>]*html-italic[^>]*>[^<]+</span>\s*,\s*"
+            r"(\d+)\s*\(([^)]+)\)",
+            citation,
+        )
+        if im:
+            volume = im.group(1)
+            issue = im.group(2).strip()
+
+        # Authors: split author_str at "; " (MDPI uses semicolons) then
+        # format each as "LastName IN".
+        authors = []
+        for part in re.split(r"\s*;\s*", author_str):
+            part = part.strip().rstrip(",").strip()
+            if not part:
+                continue
+            if part.lower().startswith("et al"):
+                continue
+            # MDPI uses "LastName, F.M." — format_author_name handles it
+            authors.append(format_author_name(part))
+
+        refs.append({"": {
+            "title": title,
+            "journal": journal,
+            "volume": volume,
+            "issue": issue,
+            "year": year,
+            "pages": pages,
+            "doi": doi,
+            "authors": authors,
+        }})
+    return refs
+
+
+# ---------------------------------------------------------------------------
+# Main text
+# ---------------------------------------------------------------------------
+
+def _extract_mdpi_figures(html):
+    """Replace <div class=html-fig-wrap> blocks with plain-text captions.
+
+    MDPI figures: <div class=html-fig-wrap id=...> contains an image wrapper
+    and <div class=html-fig_description> holding "<b>Figure N.</b> <b>title</b>. body".
+    Entities like &lt; are preserved (using tag-only stripping) so literal
+    < in captions do not break downstream HTML processing.
+    """
+    def _strip_keep_entities(s):
+        return re.sub(r"<[^>]+>", "", s)
+
+    def repl(block):
+        inner = block.group(1)
+        dm = re.search(
+            r'<div[^>]*class=["\']?html-fig_description[^"\'>]*["\']?[^>]*>'
+            r"(.*?)</div>",
+            inner, re.DOTALL,
+        )
+        if not dm:
+            return ""
+        text = _strip_keep_entities(dm.group(1)).strip()
+        text = re.sub(r"\s+", " ", text)
+        return "\n\n" + text + "\n\n"
+
+    # html-fig-wrap opens; find matching close by depth-aware div walk
+    out = []
+    i = 0
+    pat = re.compile(
+        r'<div[^>]*class=["\']?html-fig-wrap[^"\'>]*["\']?[^>]*>',
+    )
+    while True:
+        m = pat.search(html, i)
+        if not m:
+            out.append(html[i:])
+            break
+        out.append(html[i:m.start()])
+        pos = m.end()
+        depth = 1
+        div_open = re.compile(r"<div\b", re.IGNORECASE)
+        div_close = re.compile(r"</div\s*>", re.IGNORECASE)
+        while depth > 0 and pos < len(html):
+            nxt_o = div_open.search(html, pos)
+            nxt_c = div_close.search(html, pos)
+            if nxt_c is None:
+                pos = len(html)
+                break
+            if nxt_o and nxt_o.start() < nxt_c.start():
+                depth += 1
+                pos = nxt_o.end()
+            else:
+                depth -= 1
+                pos = nxt_c.end()
+        block_html = html[m.end():pos - len("</div>")]
+        # Construct a fake match and delegate
+        class _M:
+            def group(self_, n):
+                return block_html
+        out.append(repl(_M()))
+        i = pos
+    return "".join(out)
+
+
+def _parse_main_text(html):
+    """Extract body text.
+
+    Boundary rules (from CLAUDE.md):
+      - Body sections: keep everything from abstract to before first references.
+      - Supplementary: after first references, keep only sections matching
+        supplement/extended data/source data/expanded view/powerpoint/appendix.
+      - Remove all references sections.
+    Pipeline: locate article container -> slice body zones -> extract_captions
+    -> strip_common -> tags_to_text -> drop_noise.
+    MDPI-specific: article body lives in <div class=html-body> which ends
+    at the <h2>References</h2> heading. The Abstract lives outside of
+    html-body in its own <div class=art-abstract>; prepend it here.
+    Back-matter sections (Funding, Acknowledgments, etc.) sit between
+    html-body and References and are included.
+    """
+    parts = []
+
+    # Abstract: sourced from the <section class=html-abstract> nested
+    # inside <div class="art-abstract ...">. The section already contains
+    # its own <h2>Abstract</h2> heading which becomes "## Abstract" via
+    # tags_to_text; no manual prefix is prepended here.
+    abs_m = re.search(
+        r'<section[^>]*class=["\']?html-abstract["\']?[^>]*>(.*?)</section>',
+        html, re.DOTALL,
+    )
+    if abs_m:
+        abs_html = abs_m.group(1)
+        abs_html = extract_captions(abs_html)
+        abs_html = strip_common(abs_html)
+        text = tags_to_text(abs_html)
+        text = drop_noise(text, _NOISE)
+        if text.strip():
+            if not text.lstrip().startswith("## "):
+                text = f"## Abstract\n\n{text}"
+            parts.append(text.strip())
+
+    # Body: from <div class=html-body> to before <h2>References</h2>
+    body_m = re.search(
+        r'<div[^>]*class=["\']?html-body[^"\'>]*["\']?[^>]*>',
+        html,
+    )
+    if body_m:
+        # End at the next <h2>References</h2>
+        start = body_m.end()
+        ref_m = re.search(r"<h2[^>]*>\s*References\s*</h2>", html[start:])
+        end = start + (ref_m.start() if ref_m else len(html) - start)
+        body_html = html[start:end]
+        body_html = _extract_mdpi_figures(body_html)
+        body_html = extract_captions(body_html)
+        body_html = strip_common(body_html)
+        text = tags_to_text(body_html)
+        text = drop_noise(text, _NOISE)
+        if text.strip():
+            parts.append(text.strip())
+
+    return "\n\n".join(parts).strip()
+
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
+
+def parse_article(html):
+    """Parse MDPI HTML into a refs.json-format dict plus main_text."""
+    meta = _parse_metadata(html)
+    return {
+        "stem": "",
+        "journal": meta["journal"],
+        "volume": meta["volume"],
+        "issue": meta["issue"],
+        "year": meta["year"],
+        "title": meta["title"],
+        "pages": meta["pages"],
+        "doi": meta["doi"],
+        "authors": _parse_authors(html),
+        "publication_types": [],
+        "references": _parse_references(html),
+        "main_text": _parse_main_text(html),
+    }
