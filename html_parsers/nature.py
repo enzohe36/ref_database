@@ -65,13 +65,13 @@ def remove_banners(html):
 # ---------------------------------------------------------------------------
 
 def _parse_metadata(html):
-    """Extract bundled metadata: title, journal, volume, issue, year, pages, doi.
+    """Extract bundled metadata: title, journal, year, volume, issue, pages, doi.
 
     Returns dict with those 7 keys. Each field's output format:
       - title: str
       - journal: ISO abbreviation without trailing period
-      - volume, issue: str (may be empty)
       - year: 4-digit string
+      - volume, issue: str (may be empty)
       - pages: "firstpage-lastpage" or firstpage alone
       - doi: "https://doi.org/..." URL
     """
@@ -90,13 +90,28 @@ def _parse_metadata(html):
 
     journal = get_meta(html, "citation_journal_abbrev")
     journal = re.sub(r"  +", " ", journal.replace(".", "")).strip()
+    if not journal:
+        # Springer book chapters (link.springer.com/protocol or /chapter)
+        # lack citation_journal_abbrev but embed the series name in a
+        # JSON blob: "seriesTitle":"Methods in Molecular Biology".
+        series_m = re.search(r'"seriesTitle"\s*:\s*"([^"]+)"', html)
+        if series_m:
+            journal = series_m.group(1).strip()
+
+    volume = get_meta(html, "citation_volume")
+    if not volume:
+        # Springer book chapters expose the series volume inline after
+        # the series link: '((MIMB,volume 2102))' or '((SCBI,volume 104))'.
+        vm = re.search(r'\(\(\w+,\s*volume\s*(\d+)\)\)', html)
+        if vm:
+            volume = vm.group(1)
 
     return {
         "title": get_meta(html, "citation_title"),
         "journal": journal,
-        "volume": get_meta(html, "citation_volume"),
-        "issue": get_meta(html, "citation_issue"),
         "year": year,
+        "volume": volume,
+        "issue": get_meta(html, "citation_issue"),
         "pages": pages,
         "doi": format_doi(get_meta(html, "citation_doi")),
     }
@@ -157,9 +172,9 @@ def _parse_freeform_citation(text):
     return {
         "title": text,
         "journal": "",
+        "year": year,
         "volume": "",
         "issue": "",
-        "year": year,
         "pages": "",
         "doi": doi,
         "authors": [],
@@ -171,7 +186,7 @@ def _parse_citation_reference(content):
 
     Format: 'citation_journal_title=X; citation_title=Y; ...'
     Falls back to freeform parsing for plain-text citations.
-    Returns a dict with {journal, volume, issue, year, title, pages, doi, authors}.
+    Returns a dict with {title, journal, year, volume, issue, pages, doi, authors}.
     """
     fields = {}
     author_parts = []
@@ -204,83 +219,325 @@ def _parse_citation_reference(content):
     return {
         "title": fields.get("citation_title", ""),
         "journal": journal,
+        "year": fields.get("citation_publication_date", ""),
         "volume": fields.get("citation_volume", ""),
         "issue": "",
-        "year": fields.get("citation_publication_date", ""),
         "pages": fields.get("citation_pages", ""),
         "doi": format_doi(fields.get("citation_doi", "")),
         "authors": authors,
     }
 
 
+_DOTTED_AUTHOR_RE = re.compile(
+    r"[A-Z][\w\-']+(?:\s[\w\-']+)*,\s+(?:[A-Z]\.\s*){1,5}"
+)
+_COMPACT_AUTHOR_RE = re.compile(
+    r"([A-Z][\w\-']+(?:\s[\w\-']+)*)\s+([A-Z]{1,5})(?=\s*(?:,|&|et al|\.|$))"
+)
+
+
 def _parse_body_reference(item_html):
     """Parse a single <p class=c-article-references__text> body reference.
 
-    Format: 'AuthorList (YEAR[letter]) Title. Journal Vol[(Issue)][:Pages]'
-    Used as fallback when citation_reference meta tags are absent — Springer
-    Nature paywall pages (e.g. Methods Mol Biol chapters) keep the visible
-    reference list but strip the meta tags. Returns same dict shape as
-    _parse_citation_reference.
+    Uses <i>Journal</i> and <b>Volume</b> tags as structural anchors so
+    field boundaries don't depend on period-splitting in prose (journal
+    abbreviations like "J. Exp. Med." and titles containing colons or
+    species names no longer confuse the parser).
+
+    Covers three observed Nature/Springer layouts:
+      A. Authors. Title. <i>Journal</i> <b>Vol</b>[, Pages] (YEAR).
+      B. Authors. Title. <i>Journal</i> YEAR; <b>Vol</b>: Pages.
+      C. Authors . YEAR <i>Journal</i> <b>Vol</b>: Pages  (no title)
+
+    Fields:
+    - volume: content of the first <b>...</b>.
+    - journal: <i>...</i> preceding <b>, plus an optional following
+      "(<i>...</i>.)" continuation (e.g., "DNA Repair (Amst)").
+    - year: parenthesized (YYYY) anywhere → bare YYYY between </i>
+      and <b> (Layout B) → bare YYYY before <i> (Layout C).
+    - pages/issue: plain text between </b> and trailing (YYYY).
+      Parenthesized span within is issue; remainder is pages.
+    - head: text before journal <i> with trailing Layout-C year
+      removed. Split into authors and title via "et al." or the last
+      "LastName, I[. I.]" / "LastName IN" match.
+
+    Falls back to a title-only record only when no <b> or no <i>
+    precedes <b> (≤0.02% of observed body refs).
     """
     doi = ""
     m = re.search(r'href=["\']?(https?://doi\.org/[^\s"\'<>]+)', item_html)
     if m:
         doi = format_doi(m.group(1))
 
-    text = re.sub(r"<a[^>]*>.*?</a>", " ", item_html, flags=re.DOTALL)
-    text = re.sub(r"<[^>]+>", "", text)
-    text = unescape(text)
-    text = re.sub(r"https?://doi\.org/\S+", "", text)
-    text = re.sub(r"\s+", " ", text).strip().rstrip(".")
+    b_m = re.search(r"<b[^>]*>\s*(.+?)\s*</b>", item_html, re.DOTALL)
+    if not b_m:
+        return _body_fallback(item_html, doi)
+    volume = re.sub(r"<[^>]+>", "", b_m.group(1)).strip()
 
-    m = re.match(r"^(.+?)\s+\((\d{4})[a-z]?\)\s+(.+)$", text)
-    if not m:
-        return {
-            "journal": "", "volume": "", "issue": "", "year": "",
-            "title": text, "pages": "", "doi": doi, "authors": [],
-        }
-    authors_str, year, rest = m.group(1), m.group(2), m.group(3)
-    authors = [a.strip() for a in authors_str.rstrip(",").split(",") if a.strip()]
-
-    # Split title. Journal Vol[(Issue)][:Pages] — anchor at $ and use [^.]+?
-    # for the journal so it can't absorb title text. Journal abbreviations
-    # don't embed periods; parens (e.g. "Genes (Basel)") are fine.
-    tail = re.search(
-        r"\.\s+([^.]+?)\s+(\d+)(?:\((\d[\w\-]*)\))?(?::\s*(.+?))?$",
-        rest,
+    pre_b = item_html[:b_m.start()]
+    jm = re.search(
+        r"<i[^>]*>(.+?)</i>"
+        r"(?:\s*\(<i[^>]*>(.+?)</i>\.?\)\s*)?"
+        r"\s*\.?\s*,?\s*$",
+        pre_b,
+        re.DOTALL,
     )
-    if tail:
-        title = rest[: tail.start()].rstrip(".").strip()
-        journal = tail.group(1).strip().rstrip(".")
-        volume = tail.group(2) or ""
-        issue = tail.group(3) or ""
-        pages = (tail.group(4) or "").replace("\u2013", "-").strip()
+    if jm:
+        main_j = unescape(re.sub(r"<[^>]+>", "", jm.group(1))).strip().rstrip(".").strip()
+        cont = jm.group(2)
+        if cont:
+            cont = unescape(re.sub(r"<[^>]+>", "", cont)).strip().rstrip(".").strip()
+            journal = f"{main_j} ({cont})"
+        else:
+            journal = main_j
+        head_html = pre_b[:jm.start()]
     else:
-        title, journal, volume, issue, pages = rest.rstrip(".").strip(), "", "", "", ""
+        last_i = None
+        for im in re.finditer(r"<i[^>]*>(.+?)</i>", pre_b, re.DOTALL):
+            last_i = im
+        if not last_i:
+            return _body_fallback(item_html, doi)
+        journal = unescape(re.sub(r"<[^>]+>", "", last_i.group(1))).strip().rstrip(".").strip()
+        head_html = pre_b[:last_i.start()]
+
+    year = ""
+    pyrs = re.findall(r"\(\s*(\d{4})[a-z]?\s*\)", item_html)
+    if pyrs:
+        year = pyrs[-1]
+    else:
+        m = re.search(r"</i>\s*\.?\s*(\d{4})[a-z]?\s*[;,]", item_html)
+        if m:
+            year = m.group(1)
+        else:
+            m = re.search(r"[.\s](\d{4})[a-z]?\s+<i", item_html)
+            if m:
+                year = m.group(1)
+
+    after = item_html[b_m.end():]
+    after_text = unescape(re.sub(r"<[^>]+>", "", after))
+    after_text = re.sub(r"\s+", " ", after_text).strip()
+    after_text = re.sub(r"\(\s*\d{4}[a-z]?\s*\)\s*\.?\s*$", "", after_text).strip()
+    after_text = re.sub(r"^\s*[,:;]\s*", "", after_text).strip(" ,:;.")
+    issue = ""
+    im = re.search(r"\(([^)]+)\)", after_text)
+    if im:
+        issue = im.group(1).strip().rstrip(".")
+        after_text = (after_text[:im.start()] + after_text[im.end():]).strip(" ,:;.")
+    pages = after_text.replace("\u2013", "-").strip()
+
+    head = unescape(re.sub(r"<[^>]+>", "", head_html))
+    head = re.sub(r"\s+", " ", head).strip()
+    if year:
+        head = re.sub(r"\s*" + re.escape(year) + r"[a-z]?\s*\.?\s*$", "", head)
+    head = head.strip().rstrip(".")
+
+    authors, title = _split_body_authors_title(head)
 
     return {
+        "title": title,
         "journal": journal,
+        "year": year,
         "volume": volume,
         "issue": issue,
-        "year": year,
-        "title": title,
         "pages": pages,
         "doi": doi,
         "authors": authors,
     }
 
 
+def _body_fallback(item_html, doi):
+    """Parse refs that lack <i>/<b> structural tags.
+
+    Tries three plaintext formats in order:
+      1. "Authors. Title. Journal Vol[, Pages] (YEAR)." — year-at-end,
+         common for modern refs that lost styling in the HTML.
+      2. "AuthorList (YEAR) Title. Journal, Vol, Pages" — EMBO/Oxford
+         comma-style.
+      3. "AuthorList (YEAR) Title. Journal Vol[(Issue)][:Pages]" —
+         older Springer colon-style.
+    Returns a title-only record if none match (true books, theses,
+    software citations).
+    """
+    text = re.sub(r"<a[^>]*>.*?</a>", " ", item_html, flags=re.DOTALL)
+    text = re.sub(r"<[^>]+>", "", text)
+    text = unescape(text)
+    text = re.sub(r"https?://doi\.org/\S+", "", text)
+    text = re.sub(r"\s+", " ", text).strip().rstrip(".")
+
+    year_end = _parse_year_at_end_plaintext(text, doi)
+    if year_end is not None:
+        return year_end
+
+    m = re.match(r"^(.+?)\s+\((\d{4})[a-z]?\)\.?\s+(.+)$", text)
+    if not m:
+        return {
+            "title": text, "journal": "", "year": "",
+            "volume": "", "issue": "", "pages": "", "doi": doi, "authors": [],
+        }
+    authors_str, year, rest = m.group(1), m.group(2), m.group(3)
+    # Try the structured helper first (handles "LastName, I." and "LastName I")
+    # before falling back to naive comma split.
+    authors = _parse_body_author_list(authors_str.rstrip(","))
+    if not authors:
+        authors = [a.strip() for a in authors_str.rstrip(",").split(",") if a.strip()]
+
+    # Two tail shapes observed in Springer/EMBO plaintext refs:
+    #   "Journal Vol[(Issue)][:Pages]"   (colon-separated, older style)
+    #   "Journal, Vol[(Issue)], Pages"   (comma-separated, EMBO/Oxford style)
+    tail = re.search(
+        r"\.\s+(.+?),\s*(\d+)(?:\((\d[\w\-]*)\))?,\s+([\w\-\u2013]+)\s*\.?\s*$",
+        rest,
+    )
+    if tail:
+        title = rest[: tail.start()].rstrip(".").strip()
+        journal = tail.group(1).strip().rstrip(".")
+        volume = tail.group(2)
+        issue = tail.group(3) or ""
+        pages = tail.group(4).replace("\u2013", "-").strip()
+    else:
+        tail = re.search(
+            r"\.\s+([^.]+?)\s+(\d+)(?:\((\d[\w\-]*)\))?(?::\s*(.+?))?$",
+            rest,
+        )
+        if tail:
+            title = rest[: tail.start()].rstrip(".").strip()
+            journal = tail.group(1).strip().rstrip(".")
+            volume = tail.group(2) or ""
+            issue = tail.group(3) or ""
+            pages = (tail.group(4) or "").replace("\u2013", "-").strip()
+        else:
+            title, journal, volume, issue, pages = rest.rstrip(".").strip(), "", "", "", ""
+
+    return {
+        "title": title,
+        "journal": journal,
+        "year": year,
+        "volume": volume,
+        "issue": issue,
+        "pages": pages,
+        "doi": doi,
+        "authors": authors,
+    }
+
+
+def _parse_year_at_end_plaintext(text, doi):
+    """Parse 'Authors. Title. Journal Vol[, Pages] (YEAR).' without tags.
+
+    Mirrors the tag-anchored logic but identifies the journal as the
+    trailing sequence of capital-letter words preceded by ". "
+    (covers multi-word abbreviations like "Nucleic Acids Res." and
+    "FEBS J."). Returns None when the text doesn't end in "(YEAR)"
+    or can't locate a journal-like suffix — caller falls through.
+    """
+    core = text.rstrip(".")
+    ym = re.search(r"\(\s*(\d{4})[a-z]?\s*\)\s*$", core)
+    if not ym:
+        return None
+    year = ym.group(1)
+    core = core[: ym.start()].rstrip(" ,.")
+
+    volume = pages = ""
+    m = re.search(r"\s+(\d+),\s+([\w\-\u2013]+)\s*$", core)
+    if m:
+        volume = m.group(1)
+        pages = m.group(2).replace("\u2013", "-")
+        core = core[: m.start()].rstrip(" ,.")
+    else:
+        m = re.search(r"\s+(\d+)\s*$", core)
+        if m:
+            volume = m.group(1)
+            core = core[: m.start()].rstrip(" ,.")
+        else:
+            # e.g. "Nucleic Acids Res. 1–18" or "F1000Res" alone
+            m = re.search(r"\s+([\w\-\u2013]+)\s*$", core)
+            if m and re.search(r"[\d\u2013\-]", m.group(1)):
+                pages = m.group(1).replace("\u2013", "-")
+                core = core[: m.start()].rstrip(" ,.")
+
+    jm = re.search(
+        r"(?:(?<=\.\s)|^)([A-Z][\w]*\.?(?:\s+[A-Z][\w]*\.?)*)$",
+        core,
+    )
+    if not jm:
+        return None
+    journal = jm.group(1).rstrip(".").strip()
+    head = core[: jm.start()].rstrip(" .")
+
+    authors, title = _split_body_authors_title(head)
+    if not authors and not title:
+        return None
+
+    return {
+        "title": title,
+        "journal": journal,
+        "year": year,
+        "volume": volume,
+        "issue": "",
+        "pages": pages,
+        "doi": doi,
+        "authors": authors,
+    }
+
+
+def _split_body_authors_title(head):
+    """Split head text into (authors list, title string).
+
+    Recognizes "et al." as an anchor; otherwise walks the last dotted
+    "LastName, I[. I.]" match or the last compact "LastName IN" match
+    (Layout C). When no author pattern matches (e.g., consortium names
+    like "The Cancer Genome Atlas Network"), emits authors=[] and
+    title=head so the raw string is still searchable.
+    """
+    et_al = re.search(r"\b[Ee]t al\.?", head)
+    if et_al:
+        authors_str = head[:et_al.end()]
+        title = head[et_al.end():].lstrip(" .").rstrip(".")
+        return _parse_body_author_list(authors_str), title.strip()
+
+    last_end = 0
+    for m in _DOTTED_AUTHOR_RE.finditer(head):
+        last_end = m.end()
+    if not last_end:
+        for m in _COMPACT_AUTHOR_RE.finditer(head):
+            last_end = m.end()
+    if last_end:
+        authors_str = head[:last_end]
+        title = head[last_end:].lstrip(" .").rstrip(".")
+        return _parse_body_author_list(authors_str), title.strip()
+    return [], head.strip()
+
+
+def _parse_body_author_list(authors_str):
+    """Extract "LastName IN" strings from the author section text."""
+    authors = []
+    for m in re.finditer(
+        r"([A-Z][\w\-']+(?:\s[\w\-']+)*),\s+((?:[A-Z]\.\s*){1,5})",
+        authors_str,
+    ):
+        authors.append(format_name(m.group(2).strip(), m.group(1)))
+    if authors:
+        return authors
+    for m in re.finditer(
+        r"([A-Z][\w\-']+(?:\s[\w\-']+)*)\s+([A-Z]{1,5})(?=\s*(?:,|&|et al|\.|$))",
+        authors_str,
+    ):
+        authors.append(format_name(m.group(2), m.group(1)))
+    return authors
+
+
 def _parse_references(html):
     """Extract the reference list.
 
-    Returns list of {"": {journal, volume, issue, year, title, pages, doi, authors}}.
+    Returns list of {"": {title, journal, year, volume, issue, pages, doi, authors}}.
     Each reference dict uses the same field formats as the main paper, with
     one exception: authors is a list of "LastName IN" strings (plain strings,
     not dicts with affiliation). Empty fields are "". Empty authors is [].
-    Primary source: citation_reference meta tags. Falls back to
-    <p class=c-article-references__text> body items when the visible list is
-    longer than the meta list (older Springer articles can have incomplete
-    meta) or when meta tags are absent (Springer Nature paywall pages).
+
+    Prefers body parsing (anchored on <i>Journal</i>/<b>Volume</b> tags)
+    and falls back to citation_reference meta tags only when body entries
+    are fewer. Body parsing tolerates freeform meta content (no
+    citation_title=...; k/v pairs), supplement parens, Layout B/C
+    ordering, and non-digit volumes that the meta path can't resolve.
     """
     meta_refs = [
         {"": _parse_citation_reference(unescape(m.group(1)))}
@@ -299,7 +556,7 @@ def _parse_references(html):
             re.DOTALL,
         )
     ]
-    return body_refs if len(body_refs) > len(meta_refs) else meta_refs
+    return body_refs if len(body_refs) >= len(meta_refs) else meta_refs
 
 
 # ---------------------------------------------------------------------------
@@ -523,19 +780,17 @@ def _parse_main_text(html):
 # ---------------------------------------------------------------------------
 
 def parse_article(html):
-    """Parse Nature HTML into a refs.json-format dict plus main_text."""
+    """Parse Nature HTML into a papers/*.json-format dict."""
     meta = _parse_metadata(html)
     return {
-        "stem": "",
+        "title": meta["title"],
         "journal": meta["journal"],
+        "year": meta["year"],
         "volume": meta["volume"],
         "issue": meta["issue"],
-        "year": meta["year"],
-        "title": meta["title"],
         "pages": meta["pages"],
         "doi": meta["doi"],
         "authors": _parse_authors(html),
-        "publication_types": [],
-        "references": _parse_references(html),
         "main_text": _parse_main_text(html),
+        "references": _parse_references(html),
     }

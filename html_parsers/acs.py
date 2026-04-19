@@ -103,13 +103,13 @@ def _parse_cit_fg(html):
 
 
 def _parse_metadata(html):
-    """Extract bundled metadata: title, journal, volume, issue, year, pages, doi.
+    """Extract bundled metadata: title, journal, year, volume, issue, pages, doi.
 
     Returns dict with those 7 keys. Each field's output format:
       - title: str
       - journal: ISO abbreviation without trailing period
-      - volume, issue: str (may be empty)
       - year: 4-digit string
+      - volume, issue: str (may be empty)
       - pages: "firstpage-lastpage" or firstpage alone
       - doi: "https://doi.org/..." URL
     ACS-specific: title from dc.Title meta, DOI from publication_doi meta,
@@ -137,9 +137,9 @@ def _parse_metadata(html):
     return {
         "title": title,
         "journal": journal,
+        "year": year,
         "volume": volume,
         "issue": issue,
-        "year": year,
         "pages": pages,
         "doi": format_doi(doi),
     }
@@ -183,25 +183,6 @@ def _parse_affiliations(html):
         if text:
             affs.append((symbols, text))
     return affs
-
-
-def _display_to_last_first(name):
-    """Convert "Given Last" display name to "LastName IN" initials form.
-
-    Examples:
-      "Katarzyna Bebenek" -> "Bebenek K"
-      "Lars C. Pedersen"  -> "Pedersen LC"
-    """
-    name = re.sub(r'\s+', ' ', name.strip())
-    if not name:
-        return ""
-    parts = name.split(' ')
-    if len(parts) == 1:
-        return parts[0]
-    last = parts[-1]
-    given = ' '.join(parts[:-1])
-    # Reuse format_author_name via "LastName, Given" form
-    return format_author_name(f"{last}, {given}")
 
 
 def _parse_authors(html):
@@ -290,7 +271,7 @@ def _parse_authors(html):
             author_affs = [affs[0][1]]
 
         authors.append({
-            "author": _display_to_last_first(display),
+            "author": format_author_name(display),
             "affiliation": author_affs,
         })
     return authors
@@ -305,7 +286,7 @@ def _parse_inline_ref(entry):
 
     Older ACS papers use a single inline citation string like:
       "Joyce, C. M., and Steitz, T. A. (1994) Annu. Rev. Biochem. 63, 777−822."
-    Returns dict with journal, volume, year, pages, title, authors.
+    Returns dict with title, journal, year, volume, pages, authors.
     """
     m = re.search(
         r'class="?NLM_string-ref"?[^>]*>(.*?)</span>', entry, re.DOTALL
@@ -362,9 +343,9 @@ def _parse_inline_ref(entry):
     return {
         "title": "",
         "journal": journal,
+        "year": year,
         "volume": volume,
         "issue": "",
-        "year": year,
         "pages": pages,
         "doi": "",
         "authors": authors,
@@ -442,9 +423,9 @@ def _parse_structured_ref(entry):
     return {
         "title": title,
         "journal": journal,
+        "year": year,
         "volume": volume,
         "issue": "",
-        "year": year,
         "pages": pages,
         "doi": "",
         "authors": authors,
@@ -454,7 +435,7 @@ def _parse_structured_ref(entry):
 def _parse_references(html):
     """Extract the reference list.
 
-    Returns list of {"": {journal, volume, issue, year, title, pages, doi, authors}}.
+    Returns list of {"": {title, journal, year, volume, issue, pages, doi, authors}}.
     Each reference dict uses the same field formats as the main paper, with
     one exception: authors is a list of "LastName IN" strings (plain strings,
     not dicts with affiliation). Empty fields are "". Empty authors is [].
@@ -516,9 +497,9 @@ def _parse_references(html):
             ref = {
                 "title": text,
                 "journal": "",
+                "year": "",
                 "volume": "",
                 "issue": "",
-                "year": "",
                 "pages": "",
                 "doi": doi,
                 "authors": [],
@@ -647,19 +628,17 @@ def _parse_main_text(html):
 # ---------------------------------------------------------------------------
 
 def parse_article(html):
-    """Parse ACS HTML into a refs.json-format dict plus main_text."""
+    """Parse ACS HTML into a papers/*.json-format dict."""
     meta = _parse_metadata(html)
     return {
-        "stem": "",
+        "title": meta["title"],
         "journal": meta["journal"],
+        "year": meta["year"],
         "volume": meta["volume"],
         "issue": meta["issue"],
-        "year": meta["year"],
-        "title": meta["title"],
         "pages": meta["pages"],
         "doi": meta["doi"],
         "authors": _parse_authors(html),
-        "publication_types": [],
-        "references": _parse_references(html),
         "main_text": _parse_main_text(html),
+        "references": _parse_references(html),
     }

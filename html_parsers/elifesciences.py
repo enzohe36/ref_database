@@ -82,7 +82,7 @@ def _parse_self_citation(html):
 
 
 def _parse_metadata(html):
-    """Extract bundled metadata: title, journal, volume, issue, year, pages, doi.
+    """Extract bundled metadata: title, journal, year, volume, issue, pages, doi.
 
     eLife has no citation_* meta tags; uses dc.* meta tags plus the
     self-citation block for volume and elocation id.
@@ -115,9 +115,9 @@ def _parse_metadata(html):
     return {
         "title": title,
         "journal": journal,
+        "year": year,
         "volume": volume,
         "issue": "",
-        "year": year,
         "pages": pages,
         "doi": doi,
     }
@@ -198,9 +198,12 @@ def _parse_authors(html):
                     sec_inner,
                 ):
                     continue
-                # Extract text spans
+                # Affiliation text lives in <span class=author-details__text>
+                # for single-affiliation authors and <li class=author-details__text>
+                # inside <ol class=author-details__list> for multi-affiliation
+                # authors. Match both tags.
                 for spn in re.finditer(
-                    r'<span[^>]*class="?author-details__text"?[^>]*>(.*?)</span>',
+                    r'<(?:span|li)[^>]*class="?author-details__text"?[^>]*>(.*?)</(?:span|li)>',
                     sec_inner, re.DOTALL,
                 ):
                     text = unescape(strip_tags(spn.group(1))).strip()
@@ -301,9 +304,9 @@ def _parse_ref_entry(entry_html):
     return {
         "title": title,
         "journal": journal,
+        "year": year,
         "volume": volume,
         "issue": issue,
-        "year": year,
         "pages": pages,
         "doi": doi,
         "authors": authors,
@@ -493,19 +496,17 @@ def _parse_main_text(html):
 # ---------------------------------------------------------------------------
 
 def parse_article(html):
-    """Parse eLife HTML into a refs.json-format dict plus main_text."""
+    """Parse eLife HTML into a papers/*.json-format dict."""
     meta = _parse_metadata(html)
     return {
-        "stem": "",
+        "title": meta["title"],
         "journal": meta["journal"],
+        "year": meta["year"],
         "volume": meta["volume"],
         "issue": meta["issue"],
-        "year": meta["year"],
-        "title": meta["title"],
         "pages": meta["pages"],
         "doi": meta["doi"],
         "authors": _parse_authors(html),
-        "publication_types": [],
-        "references": _parse_references(html),
         "main_text": _parse_main_text(html),
+        "references": _parse_references(html),
     }

@@ -4,64 +4,41 @@
 Usage:
     python merge_refs.py
     python merge_refs.py --patch
+    python merge_refs.py --add-refs
 
-Scans refs.json for all entries with empty affiliations or references.
-For each, loads papers/<stem>.json and fills in missing values:
-- Affiliations: matched by "author" name between refs.json and papers/*.json.
-- References: structured citation objects from papers/*.json are searched
-  on PubMed for PMIDs. Resolved PMIDs are written back to papers/*.json
-  (as single-key dicts keyed by PMID) and copied to refs.json.
-  Unresolved references are saved to refs_no_pmid.json.
+Default: for every refs.json entry with a corresponding papers/<stem>.json,
+fill empty affiliations from the paper JSON, resolve any structured refs in
+the paper JSON to PMIDs via PubMed search, and union resolved PMIDs into
+refs.json's references list. Existing refs.json field values are never
+overwritten; the references list is the only field that is augmented (via
+union) rather than left alone.
 
---patch copies manually resolved PMIDs from refs_no_pmid.json into
-papers/*.json and refs.json, then removes them from refs_no_pmid.json.
+--patch copies manually-resolved PMIDs from refs_no_pmid.json into
+papers/<stem>.json and refs.json (unioned), then removes them from
+refs_no_pmid.json.
 
-Only fills missing values; does not overwrite existing affiliations or references.
+--add-refs collects every PMID cited in refs.json's references lists,
+subtracts the PMIDs already present as refs.json keys, and invokes
+get_refs.py on the remainder to fetch metadata and HTML.
 """
 
 import json
 import os
 import re
+import subprocess
 import sys
+import time
+import urllib.parse
+import urllib.request
+import xml.etree.ElementTree as ET
+from concurrent.futures import ThreadPoolExecutor
+from itertools import combinations
 
-from get_refs import load_references, save_references, make_stem
-from parse_citation import (
-    parse_citation,
-    search_with_retry,
-    search_structured_ref,
-)
+from get_refs import load_references, pubmed_throttle, save_references
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 PAPERS_DIR = os.path.join(BASE_DIR, "papers")
 NO_PMID_FILE = os.path.join(BASE_DIR, "refs_no_pmid.json")
-
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-def stem_for_entry(pmid, entry):
-    """Construct stem from refs.json entry."""
-    # Use stored stem if available
-    if entry.get("stem"):
-        return entry["stem"]
-    # Fallback: reconstruct from fields
-    authors = entry.get("authors", [])
-    first_last = authors[0]["author"].split()[0] if authors else ""
-    year = entry.get("year", "")
-    journal = entry.get("journal", "")
-    return make_stem(first_last, year, journal, pmid)
-
-
-def has_empty_affiliations(entry):
-    for author in entry.get("authors", []):
-        if not author.get("affiliation"):
-            return True
-    return False
-
-
-def has_empty_references(entry):
-    return not entry.get("references")
 
 
 # ---------------------------------------------------------------------------
@@ -76,6 +53,10 @@ def load_no_pmid():
 
 
 def save_no_pmid(data):
+    if not data:
+        if os.path.exists(NO_PMID_FILE):
+            os.remove(NO_PMID_FILE)
+        return
     raw = json.dumps(data, indent=2, ensure_ascii=False)
     with open(NO_PMID_FILE, "w", encoding="utf-8") as f:
         f.write(raw)
@@ -83,109 +64,493 @@ def save_no_pmid(data):
 
 
 # ---------------------------------------------------------------------------
-# Reference resolution
+# PubMed query builder
 # ---------------------------------------------------------------------------
 
-def _resolve_structured_refs(paper_refs):
-    """Resolve structured reference objects to PMIDs.
+def _surname(author):
+    """Extract surname from 'LastName IN' format.
 
-    Input: list of single-key dicts [{"": {...}}, {"": {...}}, ...]
-    Returns: (resolved_refs, unresolved_refs)
-      resolved_refs: [{"12345678": {...}}, ...]
-      unresolved_refs: [{"": {...}}, ...]
+    PubMed author strings end with an all-caps initials token; drop it and
+    return the remaining text. Preserves compound surnames ('de Lange T' ->
+    'de Lange'; 'Nick McElhinny SA' -> 'Nick McElhinny').
     """
-    resolved = []
-    unresolved = []
-
-    for ref_dict in paper_refs:
-        # Each is a single-key dict
-        key = list(ref_dict.keys())[0]
-        ref_data = ref_dict[key]
-
-        # Already resolved
-        if key and key != "":
-            resolved.append(ref_dict)
-            continue
-
-        # Try to resolve
-        result_pmid = None
-        try:
-            result_pmid, _, _ = search_structured_ref(ref_data)
-        except Exception:
-            pass
-
-        if result_pmid:
-            resolved.append({result_pmid: ref_data})
-            print(
-                json.dumps(
-                    {
-                        "reference": ref_data.get("title", "")[:80],
-                        "found": result_pmid,
-                    }
-                )
-            )
-        else:
-            unresolved.append({"": ref_data})
-
-    return resolved, unresolved
+    parts = author.strip().split()
+    if len(parts) >= 2 and parts[-1].isalpha() and parts[-1].isupper():
+        return " ".join(parts[:-1])
+    return author.strip()
 
 
-def _resolve_string_refs(citations, pmid):
-    """Resolve raw citation strings (from PDF/agent) to PMIDs.
+def _title_chunks(title, n=3):
+    """Chunk title into unquoted N-word [ti] AND-groups.
 
-    Input: list of plain citation strings
-    Returns: (resolved_pmids, unresolved_strings)
+    Stop words are preserved verbatim. Verified empirically: quoted phrases
+    return 0 hits, per-word [ti] stumbles on stop words, but unquoted
+    multi-word [ti] chunks resolve correctly via PubMed's phrase matching
+    on the title field.
     """
-    no_pmid = load_no_pmid()
-    already_unresolved = set(no_pmid.get(pmid, {}).get("references", []))
+    words = re.sub(r"[,.\;:\?\!\(\)\[\]]", " ", title).split()
+    return [" ".join(words[i:i + n]) + "[ti]" for i in range(0, len(words), n)]
 
-    resolved_pmids = []
-    unresolved = list(no_pmid.get(pmid, {}).get("references", []))
 
-    for citation_string in citations:
-        if citation_string in already_unresolved:
+def _build_query_groups(ref):
+    """Turn a structured-ref dict into four AND-joinable query groups."""
+    authors = ref.get("authors") or []
+    title = ref.get("title") or ""
+    journal = ref.get("journal") or ""
+    year = ref.get("year") or ""
+
+    author_terms = []
+    for a in authors[:5]:
+        if not isinstance(a, str):
             continue
+        surname = _surname(a)
+        if surname:
+            author_terms.append(f"{surname}[au]")
 
-        groups = parse_citation(citation_string)
-        if groups is None:
-            unresolved.append(citation_string)
+    return {
+        "authors": author_terms,
+        "title": _title_chunks(title) if title else [],
+        "journal": [f"{journal}[ta]"] if journal else [],
+        "yvip": [f"{year}[dp]"] if year else [],
+    }
+
+
+def _join_groups(groups, exclude_keys=None, exclude_chunks=None):
+    """Join query groups with AND, omitting excluded keys and chunks."""
+    exclude_keys = exclude_keys or set()
+    exclude_chunks = exclude_chunks or {}
+    parts = []
+    for key in ("authors", "title", "journal", "yvip"):
+        if key in exclude_keys:
             continue
+        skip = exclude_chunks.get(key, set())
+        for i, chunk in enumerate(groups[key]):
+            if i not in skip:
+                parts.append(chunk)
+    return " AND ".join(parts) if parts else ""
 
-        result = None
-        for attempt in range(2):
-            try:
-                result_pmid, _, _ = search_with_retry(groups, citation_string)
-                if result_pmid:
-                    result = result_pmid
-                break
-            except Exception:
-                if attempt == 0:
+
+# ---------------------------------------------------------------------------
+# PubMed esearch
+# ---------------------------------------------------------------------------
+
+_last_request_time = 0.0
+
+
+def _search_pmid(query):
+    """Run esearch.fcgi. Returns (pmid_or_None, count). Rate-limited per
+    pubmed_throttle() (0.1 s with API key, 0.4 s without)."""
+    global _last_request_time
+    delay, api_suffix = pubmed_throttle()
+    elapsed = time.time() - _last_request_time
+    if elapsed < delay:
+        time.sleep(delay - elapsed)
+    _last_request_time = time.time()
+
+    url = (
+        "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi"
+        f"?db=pubmed&term={urllib.parse.quote(query)}&retmax=2&retmode=xml"
+        f"{api_suffix}"
+    )
+    with urllib.request.urlopen(url) as resp:
+        xml_data = resp.read().decode("utf-8")
+    root = ET.fromstring(xml_data)
+    count = int(root.findtext(".//Count", "0"))
+    ids = root.findall(".//IdList/Id")
+    if count == 1 and ids:
+        return ids[0].text, count
+    return None, count
+
+
+def _search_with_retry(groups):
+    """Iteratively relax the query until a single hit is found.
+
+    Full query -> drop one group -> drop two groups -> drop individual
+    chunks within 'suspicious' groups (those that returned count>=2 when
+    dropped, implying they narrow without uniquely identifying).
+    """
+    GROUP_KEYS = ["authors", "title", "journal", "yvip"]
+
+    query = _join_groups(groups)
+    if not query:
+        return None
+    pmid, count = _search_pmid(query)
+    if count == 1:
+        return pmid
+
+    suspicious = []
+    for key in GROUP_KEYS:
+        if not groups[key]:
+            continue
+        q = _join_groups(groups, exclude_keys={key})
+        if not q:
+            continue
+        pmid, cnt = _search_pmid(q)
+        if cnt == 1:
+            return pmid
+        if cnt >= 2:
+            suspicious.append((key,))
+
+    if not suspicious:
+        pair_suspicious = []
+        for combo in combinations(GROUP_KEYS, 2):
+            if not any(groups[k] for k in combo):
+                continue
+            q = _join_groups(groups, exclude_keys=set(combo))
+            if not q:
+                continue
+            pmid, cnt = _search_pmid(q)
+            if cnt == 1:
+                return pmid
+            if cnt >= 2:
+                pair_suspicious.append(combo)
+        suspicious = pair_suspicious
+
+    for sus in suspicious:
+        if len(sus) == 1:
+            key = sus[0]
+            for i in range(len(groups[key])):
+                q = _join_groups(groups, exclude_chunks={key: {i}})
+                if not q:
                     continue
-
-        if result:
-            resolved_pmids.append(result)
-            print(
-                json.dumps(
-                    {
-                        "pmid": pmid,
-                        "reference": citation_string[:80],
-                        "found": result,
-                    }
-                )
-            )
+                pmid, cnt = _search_pmid(q)
+                if cnt == 1:
+                    return pmid
         else:
-            unresolved.append(citation_string)
+            for drop_full, refine in [(sus[0], sus[1]), (sus[1], sus[0])]:
+                for i in range(len(groups[refine])):
+                    q = _join_groups(
+                        groups,
+                        exclude_keys={drop_full},
+                        exclude_chunks={refine: {i}},
+                    )
+                    if not q:
+                        continue
+                    pmid, cnt = _search_pmid(q)
+                    if cnt == 1:
+                        return pmid
+    return None
 
-    return resolved_pmids, unresolved
+
+def _search_structured_ref(ref):
+    """Resolve a structured reference dict to a single PubMed PMID.
+
+    DOI shortcut first (bare DOI as [doi]); falls back to the
+    author + title + journal + year query with iterative relaxation.
+    Returns a PMID string or None.
+    """
+    doi = ref.get("doi") or ""
+    if doi:
+        bare_doi = re.sub(r"^https?://doi\.org/", "", doi)
+        if bare_doi:
+            pmid, count = _search_pmid(f"{bare_doi}[doi]")
+            if count == 1:
+                return pmid
+
+    return _search_with_retry(_build_query_groups(ref))
 
 
 # ---------------------------------------------------------------------------
-# Patch
+# Helpers
 # ---------------------------------------------------------------------------
 
-def validate_no_pmid():
-    """Copy manually resolved PMIDs from refs_no_pmid.json into papers/*.json
-    and refs.json, then remove them from refs_no_pmid.json."""
+def _union_pmids(existing, paper_pmids):
+    """Append PMIDs from paper_pmids that are not already in existing.
+
+    Returns (new_list, added_count). Preserves existing order; dedupes
+    within paper_pmids too (in case a paper lists the same PMID twice).
+    """
+    out = list(existing)
+    seen = set(out)
+    added = 0
+    for p in paper_pmids:
+        if p in seen:
+            continue
+        seen.add(p)
+        out.append(p)
+        added += 1
+    return out, added
+
+
+def _ref_identity(ref_data):
+    """Stable identity for a structured reference dict.
+
+    Prefers DOI over title; returns None if neither is populated. Used
+    to detect when the same reference appears in both the paper JSON
+    and refs_no_pmid.json so we can dedupe writes and drop stale
+    entries once they have been resolved upstream.
+    """
+    if not isinstance(ref_data, dict):
+        return None
+    doi = (ref_data.get("doi") or "").strip().lower()
+    if doi:
+        return ("doi", doi)
+    title = (ref_data.get("title") or "").strip().lower()
+    if title:
+        return ("title", title)
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Default merge — two-phase
+# ---------------------------------------------------------------------------
+#
+# Phase 1: sequential PubMed lookup. For each papers/<stem>.json with
+# unresolved structured references (empty-key entries in the refs list),
+# call _search_structured_ref and write the PMID back into the paper
+# JSON. Sequential because esearch is rate-limited to ~3 req/s and each
+# query may iteratively relax several times. Phase 1 also prunes
+# refs_no_pmid.json in place: whenever a paper reference carries a PMID
+# (pre-existing or newly retrieved), any matching entry in
+# refs_no_pmid[main_pmid] is dropped.
+#
+# Phase 2: parallel per-paper patch computation. Each worker diffs its
+# paper against the corresponding refs.json entry — no network, just
+# local JSON — and returns (affiliation fills, PMIDs to union,
+# still-unresolved refs). The main thread applies all patches in memory
+# and writes refs.json + refs_no_pmid.json once at the end. Parallel is
+# safe because workers don't mutate shared state.
+
+def _write_paper(paper_path, paper_data):
+    """Persist paper_data to paper_path in the standard pretty-JSON form."""
+    with open(paper_path, "w", encoding="utf-8") as f:
+        json.dump(paper_data, f, indent=2, ensure_ascii=False)
+        f.write("\n")
+
+
+def _resolve_paper_refs(paper_path, main_pmid, no_pmid):
+    """Phase 1: resolve empty-key refs and prune refs_no_pmid in place.
+
+    For each reference in the paper JSON:
+      - If it already has a PMID, drop any matching entry from
+        no_pmid[main_pmid] (a user-edited resolution there is now
+        stale; the paper itself is the source of truth).
+      - If it has an empty key, call PubMed. On success, persist the
+        PMID into the paper JSON and drop the matching no_pmid entry.
+
+    Writes the paper JSON after every successful resolution so a crash
+    loses at most one in-flight query. Runs in the main thread —
+    PubMed esearch is rate-limited.
+
+    Verification of resolved refs against no_pmid uses a one-time
+    identity index of no_pmid[main_pmid] so each prune is O(1); when
+    the paper has no no_pmid entry, skips the identity computation
+    altogether (common case).
+    """
+    with open(paper_path, encoding="utf-8") as f:
+        paper_data = json.load(f)
+    paper_refs = paper_data.get("references") or []
+
+    np_entry = no_pmid.get(main_pmid)
+    if np_entry:
+        np_list = np_entry.get("references") or []
+        ident_to_positions = {}
+        for idx, rd in enumerate(np_list):
+            if not isinstance(rd, dict):
+                continue
+            ident = _ref_identity(rd[next(iter(rd))])
+            if ident is not None:
+                ident_to_positions.setdefault(ident, []).append(idx)
+        pruned_positions = set()
+    else:
+        np_list = None
+        ident_to_positions = None
+        pruned_positions = None
+
+    def _mark_pruned(ref_data):
+        if ident_to_positions is None:
+            return
+        ident = _ref_identity(ref_data)
+        if ident is None:
+            return
+        positions = ident_to_positions.pop(ident, None)
+        if positions:
+            pruned_positions.update(positions)
+
+    for i, ref_dict in enumerate(paper_refs):
+        if not isinstance(ref_dict, dict):
+            continue
+        key = next(iter(ref_dict))
+        if key and re.fullmatch(r"\d+", key):
+            _mark_pruned(ref_dict[key])
+            continue
+        if key != "":
+            continue
+        ref_data = ref_dict[key]
+        try:
+            found = _search_structured_ref(ref_data)
+        except Exception:
+            found = None
+        if not found:
+            continue
+        paper_refs[i] = {found: ref_data}
+        paper_data["references"] = paper_refs
+        _write_paper(paper_path, paper_data)
+        _mark_pruned(ref_data)
+        print(json.dumps({
+            "paper": os.path.basename(paper_path),
+            "reference": (ref_data.get("title") or "")[:80],
+            "found": found,
+        }))
+
+    if np_entry and pruned_positions:
+        new_list = [r for idx, r in enumerate(np_list) if idx not in pruned_positions]
+        if new_list:
+            np_entry["references"] = new_list
+        else:
+            del no_pmid[main_pmid]
+        save_no_pmid(no_pmid)
+
+
+def _compute_patch(pmid, entry, paper_path):
+    """Phase 2 worker: compute a merge patch for one paper.
+
+    Returns a dict with:
+      - 'affiliations': list of (author_index, aff_list) for refs.json
+        authors whose affiliation is currently empty but present on the
+        paper-side author with the matching display name.
+      - 'paper_pmids': list of PMID strings extracted from the paper's
+        resolved references (main thread unions into refs.json).
+      - 'unresolved': list of still-empty-key reference dicts that go
+        into refs_no_pmid.json.
+      - 'stem': the paper's stem (for the refs_no_pmid payload).
+    Workers touch only their own paper file; main thread owns refs.json.
+    """
+    with open(paper_path, encoding="utf-8") as f:
+        paper_data = json.load(f)
+
+    paper_author_aff = {
+        a["author"]: a["affiliation"]
+        for a in paper_data.get("authors") or []
+        if isinstance(a, dict) and a.get("author") and a.get("affiliation")
+    }
+    affiliation_fills = []
+    for i, author in enumerate(entry.get("authors") or []):
+        if not isinstance(author, dict) or author.get("affiliation"):
+            continue
+        aff = paper_author_aff.get(author.get("author"))
+        if aff:
+            affiliation_fills.append((i, aff))
+
+    paper_pmids = []
+    unresolved = []
+    for ref_dict in paper_data.get("references") or []:
+        if not isinstance(ref_dict, dict):
+            continue
+        key = next(iter(ref_dict))
+        if key and re.fullmatch(r"\d+", key):
+            paper_pmids.append(key)
+        elif key == "":
+            unresolved.append(ref_dict)
+
+    return {
+        "pmid": pmid,
+        "stem": entry.get("stem"),
+        "affiliations": affiliation_fills,
+        "paper_pmids": paper_pmids,
+        "unresolved": unresolved,
+    }
+
+
+def _apply_patch(refs, no_pmid, patch):
+    """Apply a phase-2 patch to the in-memory refs and no_pmid dicts.
+
+    Phase 1 already pruned no_pmid of any entries whose references
+    are now resolved in the paper. This step only appends the
+    still-unresolved refs, skipping any whose identity is already
+    present (so user edits in refs_no_pmid.json are never duplicated).
+    """
+    pmid = patch["pmid"]
+    entry = refs[pmid]
+    authors = entry.get("authors") or []
+    for i, aff in patch["affiliations"]:
+        if 0 <= i < len(authors):
+            authors[i]["affiliation"] = aff
+            print(json.dumps({
+                "pmid": pmid,
+                "affiliation_filled": authors[i].get("author"),
+            }))
+    existing = entry.setdefault("references", [])
+    unioned, added = _union_pmids(existing, patch["paper_pmids"])
+    if added:
+        entry["references"] = unioned
+
+    existing_entry = no_pmid.get(pmid) or {}
+    existing_list = list(existing_entry.get("references") or [])
+    existing_idents = set()
+    for ref_dict in existing_list:
+        if not isinstance(ref_dict, dict):
+            continue
+        key = next(iter(ref_dict))
+        ident = _ref_identity(ref_dict[key])
+        if ident is not None:
+            existing_idents.add(ident)
+
+    appended = list(existing_list)
+    for ref_dict in patch["unresolved"]:
+        if not isinstance(ref_dict, dict):
+            continue
+        key = next(iter(ref_dict))
+        ident = _ref_identity(ref_dict[key])
+        if ident is not None and ident in existing_idents:
+            continue
+        appended.append(ref_dict)
+        if ident is not None:
+            existing_idents.add(ident)
+
+    if appended:
+        no_pmid[pmid] = {
+            "stem": patch["stem"] or existing_entry.get("stem"),
+            "references": appended,
+        }
+    elif pmid in no_pmid:
+        del no_pmid[pmid]
+
+
+def _run_default_merge():
+    refs = load_references()
+    no_pmid = load_no_pmid()
+
+    work = []
+    for pmid, entry in refs.items():
+        stem = entry.get("stem")
+        if not stem:
+            continue
+        paper_path = os.path.join(PAPERS_DIR, f"{stem}.json")
+        if not os.path.exists(paper_path):
+            continue
+        work.append((pmid, entry, paper_path))
+
+    # Phase 1: sequential PubMed PMID resolution, eager per-paper writes,
+    # in-place pruning of refs_no_pmid for refs the paper has resolved.
+    print(f"Phase 1: resolving unresolved refs in {len(work)} papers (sequential).",
+          file=sys.stderr)
+    for main_pmid, _, paper_path in work:
+        _resolve_paper_refs(paper_path, main_pmid, no_pmid)
+
+    # Phase 2: parallel per-paper patch computation (local I/O + diff only)
+    n_workers = os.cpu_count() or 1
+    print(
+        f"Phase 2: computing refs.json patches (parallel, {n_workers} workers).",
+        file=sys.stderr,
+    )
+    with ThreadPoolExecutor(max_workers=n_workers) as ex:
+        patches = list(ex.map(
+            lambda w: _compute_patch(*w), work
+        ))
+
+    for patch in patches:
+        _apply_patch(refs, no_pmid, patch)
+
+    save_references(refs)
+    save_no_pmid(no_pmid)
+
+
+# ---------------------------------------------------------------------------
+# --patch: apply manual resolutions from refs_no_pmid.json
+# ---------------------------------------------------------------------------
+
+def _run_patch():
     no_pmid = load_no_pmid()
     if not no_pmid:
         print("refs_no_pmid.json is empty or not found.", file=sys.stderr)
@@ -195,69 +560,61 @@ def validate_no_pmid():
     total_moved = 0
 
     for pmid, obj in list(no_pmid.items()):
+        stem = obj.get("stem") or refs.get(pmid, {}).get("stem")
+        entries = obj.get("references") or []
+        resolved_inner = []
         remaining = []
-        resolved_pmids = []
+        for ref_dict in entries:
+            if not isinstance(ref_dict, dict):
+                remaining.append(ref_dict)
+                continue
+            key = next(iter(ref_dict))
+            if key and re.fullmatch(r"\d+", key):
+                resolved_inner.append((key, ref_dict[key]))
+            else:
+                remaining.append(ref_dict)
 
-        for ref_dict in obj.get("references", []):
-            if isinstance(ref_dict, dict):
-                key = list(ref_dict.keys())[0]
-                if key and key != "":
-                    resolved_pmids.append(key)
-                else:
-                    remaining.append(ref_dict)
-            elif isinstance(ref_dict, str):
-                # Legacy string format
-                if re.fullmatch(r"\d+", ref_dict.strip()):
-                    resolved_pmids.append(ref_dict.strip())
-                else:
-                    remaining.append(ref_dict)
+        resolved_pmids = [p for p, _ in resolved_inner]
 
+        # Union into refs.json
         if resolved_pmids and pmid in refs:
-            existing = refs[pmid].get("references", [])
-            added = []
-            for r in resolved_pmids:
-                if r not in existing:
-                    existing.append(r)
-                    added.append(r)
-            refs[pmid]["references"] = existing
-            total_moved += len(added)
+            existing = refs[pmid].get("references") or []
+            unioned, added = _union_pmids(existing, resolved_pmids)
             if added:
-                print(json.dumps({"pmid": pmid, "moved": added}))
+                refs[pmid]["references"] = unioned
+                total_moved += added
+                print(json.dumps({"pmid": pmid, "moved": resolved_pmids}))
 
-            # Also update papers/<stem>.json if it exists
-            stem = stem_for_entry(pmid, refs[pmid])
+        # Apply to papers/<stem>.json: match unresolved entries by title
+        if stem and resolved_inner:
             paper_path = os.path.join(PAPERS_DIR, f"{stem}.json")
             if os.path.exists(paper_path):
                 with open(paper_path, encoding="utf-8") as f:
                     paper_data = json.load(f)
-                paper_refs = paper_data.get("references", [])
-                # Update resolved refs in paper data
-                new_paper_refs = []
-                for pr in paper_refs:
-                    if isinstance(pr, dict):
-                        pk = list(pr.keys())[0]
-                        if pk == "":
-                            # Check if this was resolved
-                            ref_data = pr[pk]
-                            matched = False
-                            for rp in resolved_pmids:
-                                # Simple match: just move it
-                                if not matched:
-                                    new_paper_refs.append({rp: ref_data})
-                                    matched = True
-                            if not matched:
-                                new_paper_refs.append(pr)
-                        else:
-                            new_paper_refs.append(pr)
-                    else:
-                        new_paper_refs.append(pr)
-                paper_data["references"] = new_paper_refs
+                paper_refs = paper_data.get("references") or []
+                for rp, ref_data in resolved_inner:
+                    target_title = (ref_data.get("title") or "").strip()
+                    for i, pr in enumerate(paper_refs):
+                        if not isinstance(pr, dict):
+                            continue
+                        pk = next(iter(pr))
+                        if pk:
+                            continue
+                        inner = pr[pk]
+                        if (inner.get("title") or "").strip() == target_title:
+                            paper_refs[i] = {rp: inner}
+                            break
+                paper_data["references"] = paper_refs
                 with open(paper_path, "w", encoding="utf-8") as f:
                     json.dump(paper_data, f, indent=2, ensure_ascii=False)
                     f.write("\n")
 
+        # Update or remove refs_no_pmid.json entry (stem first for readability)
         if remaining:
-            obj["references"] = remaining
+            no_pmid[pmid] = (
+                {"stem": stem, "references": remaining}
+                if stem else {"references": remaining}
+            )
         else:
             del no_pmid[pmid]
 
@@ -267,153 +624,48 @@ def validate_no_pmid():
 
 
 # ---------------------------------------------------------------------------
+# --add-refs: citation-graph expansion
+# ---------------------------------------------------------------------------
+
+def _run_add_refs():
+    refs = load_references()
+    cited = set()
+    for entry in refs.values():
+        for p in entry.get("references") or []:
+            if isinstance(p, str) and p.isdigit():
+                cited.add(p)
+    existing = set(refs.keys())
+    missing = sorted(cited - existing)
+    print(
+        f"Cited: {len(cited)}. Already present: {len(cited & existing)}. "
+        f"Missing: {len(missing)}."
+    )
+    if not missing:
+        return
+    cmd = [sys.executable, os.path.join(BASE_DIR, "get_refs.py"), *missing]
+    subprocess.run(cmd, check=False)
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
 def main():
-    refs = load_references()
+    if len(sys.argv) >= 2:
+        flag = sys.argv[1]
+        if flag == "--patch":
+            _run_patch()
+            return
+        if flag == "--add-refs":
+            _run_add_refs()
+            return
+        print(
+            "Usage: python merge_refs.py [--patch | --add-refs]",
+            file=sys.stderr,
+        )
+        sys.exit(1)
 
-    if len(sys.argv) >= 2 and sys.argv[1] == "--patch":
-        validate_no_pmid()
-        return
-
-    for pmid, entry in refs.items():
-        needs_aff = has_empty_affiliations(entry)
-        needs_ref = has_empty_references(entry)
-
-        if not needs_aff and not needs_ref:
-            continue
-
-        stem = stem_for_entry(pmid, entry)
-        filepath = os.path.join(PAPERS_DIR, f"{stem}.json")
-
-        if not os.path.exists(filepath):
-            if needs_aff or needs_ref:
-                print(
-                    json.dumps({"pmid": pmid, "error": f"file not found: {filepath}"})
-                )
-            continue
-
-        with open(filepath, encoding="utf-8") as f:
-            paper_data = json.load(f)
-
-        # Fill empty affiliations
-        if needs_aff:
-            paper_authors = paper_data.get("authors", [])
-            if paper_authors:
-                # Build lookup: paper authors may have "author" key or "name" key
-                paper_map = {}
-                for a in paper_authors:
-                    name = a.get("author", a.get("name", ""))
-                    aff = a.get("affiliation", a.get("affiliations", []))
-                    if name and aff:
-                        paper_map[name] = aff
-
-                filled = 0
-                missing = []
-                for author in entry["authors"]:
-                    if not author.get("affiliation"):
-                        aff = paper_map.get(author["author"], [])
-                        if aff:
-                            author["affiliation"] = aff
-                            filled += 1
-                        else:
-                            missing.append(author["author"])
-                msg = {"pmid": pmid, "affiliations_filled": filled}
-                if missing:
-                    msg["affiliations_missing"] = missing
-                print(json.dumps(msg))
-            else:
-                missing = [
-                    a["author"]
-                    for a in entry["authors"]
-                    if not a.get("affiliation")
-                ]
-                print(
-                    json.dumps(
-                        {
-                            "pmid": pmid,
-                            "affiliations_filled": 0,
-                            "affiliations_missing": missing,
-                        }
-                    )
-                )
-
-        # Fill empty references
-        if needs_ref:
-            paper_refs = paper_data.get("references", [])
-            if not paper_refs:
-                print(
-                    json.dumps(
-                        {
-                            "pmid": pmid,
-                            "references_filled": 0,
-                            "references_missing": "no references in source",
-                        }
-                    )
-                )
-                continue
-
-            # Detect format: structured (list of dicts) vs raw strings
-            if isinstance(paper_refs[0], dict):
-                # Structured references from HTML
-                resolved_refs, unresolved_refs = _resolve_structured_refs(paper_refs)
-
-                # Update papers/<stem>.json
-                paper_data["references"] = resolved_refs + unresolved_refs
-                with open(filepath, "w", encoding="utf-8") as f:
-                    json.dump(paper_data, f, indent=2, ensure_ascii=False)
-                    f.write("\n")
-
-                # Copy resolved PMIDs to refs.json
-                resolved_pmids = [
-                    list(r.keys())[0]
-                    for r in resolved_refs
-                    if list(r.keys())[0]
-                ]
-                if resolved_pmids:
-                    entry["references"] = resolved_pmids
-
-                print(
-                    json.dumps(
-                        {
-                            "pmid": pmid,
-                            "references_resolved": len(resolved_pmids),
-                            "references_total": len(paper_refs),
-                        }
-                    )
-                )
-
-                # Record unresolved in refs_no_pmid.json
-                if unresolved_refs:
-                    no_pmid = load_no_pmid()
-                    no_pmid[pmid] = {"references": unresolved_refs}
-                    save_no_pmid(no_pmid)
-
-            elif isinstance(paper_refs[0], str):
-                # Raw citation strings from PDF/agent
-                resolved_pmids, unresolved = _resolve_string_refs(paper_refs, pmid)
-
-                if resolved_pmids:
-                    entry["references"] = resolved_pmids
-                print(
-                    json.dumps(
-                        {
-                            "pmid": pmid,
-                            "references_resolved": len(resolved_pmids),
-                            "references_total": len(paper_refs),
-                        }
-                    )
-                )
-
-                no_pmid = load_no_pmid()
-                if unresolved:
-                    no_pmid[pmid] = {"references": unresolved}
-                elif pmid in no_pmid:
-                    del no_pmid[pmid]
-                save_no_pmid(no_pmid)
-
-    save_references(refs)
+    _run_default_merge()
 
 
 if __name__ == "__main__":

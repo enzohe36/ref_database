@@ -360,6 +360,13 @@ _NAME_SUFFIXES = frozenset({
     "phd", "md", "dr",
 })
 
+# Academic honorifics stripped from the head of combined names so they
+# don't leak into initials ("Prof. Ming-De Li" -> "Ming-De Li" -> "Li MD",
+# "Dr. Ying Li" -> "Ying Li" -> "Li Y"). Case-insensitive, period-tolerant.
+_NAME_HONORIFICS = frozenset({
+    "prof", "dr", "mr", "mrs", "ms", "mx", "sir", "dame",
+})
+
 # Characters that separate initial-bearing tokens within a given name:
 # whitespace, ASCII hyphen, Unicode hyphens (U+2010–U+2013), periods.
 _GIVEN_SPLIT_RE = re.compile(r"[\s.\-\u2010\u2011\u2012\u2013]+")
@@ -429,6 +436,10 @@ def format_name(given, surname):
         for subpart in _GIVEN_SPLIT_RE.split(token):
             if subpart and subpart[0].isalpha():
                 initials += subpart[0].upper()
+    # PubMed caps initials at two letters (first and second given-name
+    # part). Keeps 'Reijns MAM' ↔ 'Reijns MA', 'Huang SYN' ↔ 'Huang SY'
+    # aligned with refs.json.
+    initials = initials[:2]
     if not initials:
         return surname
     if not surname:
@@ -468,6 +479,24 @@ def parse_combined_name(name):
     if not name:
         return ("", "")
 
+    # Strip trailing suffix tokens from the whole string before shape
+    # detection. Handles the 'Given Last, Suffix' form ('Thomas E.
+    # Cheatham, III') where the comma is a suffix separator rather than
+    # a surname-reversal marker. After stripping, the remaining string
+    # falls through cleanly to the shape detector (shape 3 for this
+    # example, shape 1 for 'Smith, John Jr.' etc.).
+    while True:
+        stripped = name.rstrip()
+        tok_m = re.search(r"[\s,]+(\S+)$", stripped)
+        if not tok_m:
+            break
+        tok = tok_m.group(1).rstrip(".").lower()
+        if tok not in _NAME_SUFFIXES:
+            break
+        name = stripped[:tok_m.start()].rstrip().rstrip(",").rstrip()
+    if not name:
+        return ("", "")
+
     # Shape 1: 'Last, Given' — comma is unambiguous. Dutch/Portuguese
     # convention trails the surname prefix on the given side (e.g.
     # 'Lange, Titia de'); absorb trailing prefix tokens back into the
@@ -476,8 +505,41 @@ def parse_combined_name(name):
         last, given = name.split(",", 1)
         last = last.strip()
         given_tokens = given.strip().split()
-        while given_tokens and _is_surname_prefix(given_tokens[-1]):
+        # Strip generational suffixes (Jr., III, PhD, ...) from both
+        # sides — publishers are inconsistent about placement:
+        # 'Yates III, John R.' puts it in the surname; 'Smith, John
+        # Jr.' puts it in the given. Either way it shouldn't leak
+        # into the initials or surname output.
+        last_tokens = last.split()
+        while last_tokens and last_tokens[-1].rstrip(".").lower() in _NAME_SUFFIXES:
+            last_tokens.pop()
+        last = " ".join(last_tokens)
+        while given_tokens and given_tokens[-1].rstrip(".").lower() in _NAME_SUFFIXES:
+            given_tokens.pop()
+        # Absorb trailing particle tokens back into the surname, but only
+        # if a given name would remain. Without this guard, 'Gui, Bin'
+        # collapses to ('', 'Bin Gui') because Arabic patronymic 'bin' is
+        # a registered prefix that coincides with the Chinese given name
+        # 'Bin'. Similarly protects single-token given names that happen
+        # to spell 'de', 'al', etc.
+        while len(given_tokens) > 1 and _is_surname_prefix(given_tokens[-1]):
             last = given_tokens.pop() + " " + last
+        # Interior-prefix case: 'Marion de Procé, Sophie' — the
+        # publisher places 'Marion' inside the surname but PubMed
+        # records 'Marion' as a middle given name with 'de Procé' as
+        # the surname. When the surname contains an interior prefix
+        # token whose predecessor is NOT itself a prefix, split there
+        # — tokens before the prefix move into the given side.
+        # Prefix stacks like 'van der Berg' or 'd'Adda di Fagagna'
+        # are preserved because their interior prefix's predecessor
+        # is itself a prefix, so the check fails and no split happens.
+        last_tokens = last.split()
+        for i in range(1, len(last_tokens)):
+            if (_is_surname_prefix(last_tokens[i])
+                    and not _is_surname_prefix(last_tokens[i - 1])):
+                given_tokens.extend(last_tokens[:i])
+                last = " ".join(last_tokens[i:])
+                break
         return (" ".join(given_tokens), last)
 
     tokens = name.split()
@@ -486,7 +548,10 @@ def parse_combined_name(name):
     if len(tokens) == 1:
         return ("", tokens[0])
 
-    # Strip trailing suffix tokens (Jr., III, PhD, ...).
+    # Strip leading honorifics (Prof., Dr., Mr., ...) and trailing
+    # suffix tokens (Jr., III, PhD, ...).
+    while len(tokens) > 1 and tokens[0].rstrip(".").lower() in _NAME_HONORIFICS:
+        tokens.pop(0)
     while len(tokens) > 1 and tokens[-1].rstrip(".").lower() in _NAME_SUFFIXES:
         tokens.pop()
     if len(tokens) == 1:
@@ -504,18 +569,26 @@ def parse_combined_name(name):
     # (e.g. 'JD Griffith', 'J.D. Griffith'). Only fires with exactly two
     # tokens (single initial + surname) or multiple leading initials, so
     # a middle-name input like 'A. Hunter Shain' falls through to shape 3
-    # rather than misparsing 'Hunter Shain' as surname.
+    # rather than misparsing 'Hunter Shain' as surname. Also stops
+    # consuming initials when a candidate token is a known surname
+    # prefix ('T. DE LANGE' must not treat 'DE' as an initial despite
+    # its all-caps rendering).
     if _is_initials_token(tokens[0]):
         i = 0
         while i < len(tokens) and _is_initials_token(tokens[i]):
+            if tokens[i].rstrip(".").lower() in _SURNAME_PREFIXES:
+                break
             i += 1
         if 0 < i < len(tokens) and (i >= 2 or len(tokens) == 2):
             return (" ".join(tokens[:i]), " ".join(tokens[i:]))
 
     # Shape 3: 'Given Last' — surname starts at the last token and
-    # extends left across any compound-surname prefixes.
+    # extends left across any compound-surname prefixes. Stop before
+    # consuming the first given-name token so 'Bin Gui' stays as
+    # ('Bin', 'Gui') instead of collapsing to ('', 'Bin Gui') via the
+    # Arabic patronymic 'bin'.
     i = len(tokens) - 1
-    while i > 0 and _is_surname_prefix(tokens[i - 1]):
+    while i > 1 and _is_surname_prefix(tokens[i - 1]):
         i -= 1
     return (" ".join(tokens[:i]), " ".join(tokens[i:]))
 
@@ -529,6 +602,34 @@ def format_author_name(name):
     """
     given, surname = parse_combined_name(name)
     return format_name(given, surname)
+
+
+# Mapping from academic email domains to the canonical institution name
+# PubMed records for papers hosted by that institution. Used as a
+# last-resort affiliation inference when the publisher HTML exposes only
+# author correspondence emails without structured affiliation data (older
+# CSHLP symposium papers, T&F Cell Cycle, etc.). Narrow on purpose —
+# only domains where every paper we encounter maps to a single canonical
+# affiliation string should be added.
+_EMAIL_DOMAIN_TO_AFFILIATION = {
+    "rockefeller.edu": "The Rockefeller University, New York, NY, USA",
+    "mail.rockefeller.edu": "The Rockefeller University, New York, NY, USA",
+}
+
+
+def affiliation_from_email(email):
+    """Return a canonical institution string inferred from an email domain,
+    or '' when the domain isn't in the known map.
+
+    The returned string is conservative — it omits department and
+    lab-specific detail the email can't resolve. Callers should only use
+    this as a fallback when no structural affiliation is available in
+    the HTML.
+    """
+    if not email or "@" not in email:
+        return ""
+    domain = email.rsplit("@", 1)[1].lower().strip().rstrip(".")
+    return _EMAIL_DOMAIN_TO_AFFILIATION.get(domain, "")
 
 
 def format_doi(doi):

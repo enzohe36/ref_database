@@ -1,13 +1,13 @@
 .DS_Store
 
 __pycache__/
-.claude/
 chroma_db/
 papers/
 projects/
 
 temp*
 refs*
+api*
 *.json
 *.pdf
 *.zip

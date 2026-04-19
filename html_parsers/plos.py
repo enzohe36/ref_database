@@ -56,13 +56,13 @@ def remove_banners(html):
 # ---------------------------------------------------------------------------
 
 def _parse_metadata(html):
-    """Extract bundled metadata: title, journal, volume, issue, year, pages, doi.
+    """Extract bundled metadata: title, journal, year, volume, issue, pages, doi.
 
     Returns dict with those 7 keys. Each field's output format:
       - title: str
       - journal: ISO abbreviation without trailing period
-      - volume, issue: str (may be empty)
       - year: 4-digit string
+      - volume, issue: str (may be empty)
       - pages: "firstpage-lastpage" or firstpage alone
       - doi: "https://doi.org/..." URL
     """
@@ -90,9 +90,9 @@ def _parse_metadata(html):
     return {
         "title": get_meta(html, "citation_title"),
         "journal": journal,
+        "year": year,
         "volume": get_meta(html, "citation_volume"),
         "issue": get_meta(html, "citation_issue"),
-        "year": year,
         "pages": pages,
         "doi": format_doi(get_meta(html, "citation_doi")),
     }
@@ -133,7 +133,7 @@ def _parse_freeform_citation(text):
     Two formats occur in PLOS references:
       - "Authors. Title. Journal. YYYY;V:FP-LP. pmid:N"
       - "Authors (YYYY) Title. Journal V: FP-LP."
-    Returns dict {title, journal, volume, issue, year, pages, doi, authors}.
+    Returns dict {title, journal, year, volume, issue, pages, doi, authors}.
     """
     text = re.sub(r"\s+", " ", text).strip()
     year = ""
@@ -204,9 +204,9 @@ def _parse_freeform_citation(text):
     return {
         "title": title,
         "journal": journal,
+        "year": year,
         "volume": volume,
         "issue": issue,
-        "year": year,
         "pages": pages,
         "doi": doi,
         "authors": authors,
@@ -249,9 +249,9 @@ def _parse_structured_citation(content):
     return {
         "title": fields.get("citation_title", ""),
         "journal": journal,
+        "year": fields.get("citation_publication_date", ""),
         "volume": fields.get("citation_volume", ""),
         "issue": "",
-        "year": fields.get("citation_publication_date", ""),
         "pages": pages,
         "doi": format_doi(fields.get("citation_doi", "")),
         "authors": authors,
@@ -524,19 +524,17 @@ def _parse_main_text(html):
 # ---------------------------------------------------------------------------
 
 def parse_article(html):
-    """Parse PLOS HTML into a refs.json-format dict plus main_text."""
+    """Parse PLOS HTML into a papers/*.json-format dict."""
     meta = _parse_metadata(html)
     return {
-        "stem": "",
+        "title": meta["title"],
         "journal": meta["journal"],
+        "year": meta["year"],
         "volume": meta["volume"],
         "issue": meta["issue"],
-        "year": meta["year"],
-        "title": meta["title"],
         "pages": meta["pages"],
         "doi": meta["doi"],
         "authors": _parse_authors(html),
-        "publication_types": [],
-        "references": _parse_references(html),
         "main_text": _parse_main_text(html),
+        "references": _parse_references(html),
     }

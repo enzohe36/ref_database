@@ -78,13 +78,13 @@ def remove_banners(html):
 # ---------------------------------------------------------------------------
 
 def _parse_metadata(html):
-    """Extract bundled metadata: title, journal, volume, issue, year, pages, doi.
+    """Extract bundled metadata: title, journal, year, volume, issue, pages, doi.
 
     Returns dict with those 7 keys. Each field's output format:
       - title: str
       - journal: ISO abbreviation without trailing period
-      - volume, issue: str (may be empty)
       - year: 4-digit string
+      - volume, issue: str (may be empty)
       - pages: "firstpage-lastpage" or firstpage alone
       - doi: "https://doi.org/..." URL
     """
@@ -105,9 +105,9 @@ def _parse_metadata(html):
     return {
         "title": get_meta(html, "citation_title"),
         "journal": journal,
+        "year": year,
         "volume": get_meta(html, "citation_volume"),
         "issue": get_meta(html, "citation_issue"),
-        "year": year,
         "pages": pages,
         "doi": format_doi(get_meta(html, "citation_doi")),
     }
@@ -222,7 +222,7 @@ def _parse_structured_authors(entry):
 def _parse_references(html):
     """Extract the reference list.
 
-    Returns list of {"": {journal, volume, issue, year, title, pages, doi, authors}}.
+    Returns list of {"": {title, journal, year, volume, issue, pages, doi, authors}}.
     Each reference dict uses the same field formats as the main paper, with
     one exception: authors is a list of "LastName IN" strings (plain strings,
     not dicts with affiliation). Empty fields are "". Empty authors is [].
@@ -303,11 +303,11 @@ def _parse_references(html):
             doi = format_doi(unescape(dm.group(1)))
 
         refs.append({"": {
+            "title": title,
             "journal": journal,
+            "year": year,
             "volume": volume,
             "issue": issue,
-            "year": year,
-            "title": title,
             "pages": pages,
             "doi": doi,
             "authors": authors,
@@ -476,19 +476,17 @@ def _parse_main_text(html):
 # ---------------------------------------------------------------------------
 
 def parse_article(html):
-    """Parse AACR HTML into a refs.json-format dict plus main_text."""
+    """Parse AACR HTML into a papers/*.json-format dict."""
     meta = _parse_metadata(html)
     return {
-        "stem": "",
+        "title": meta["title"],
         "journal": meta["journal"],
+        "year": meta["year"],
         "volume": meta["volume"],
         "issue": meta["issue"],
-        "year": meta["year"],
-        "title": meta["title"],
         "pages": meta["pages"],
         "doi": meta["doi"],
         "authors": _parse_authors(html),
-        "publication_types": [],
-        "references": _parse_references(html),
         "main_text": _parse_main_text(html),
+        "references": _parse_references(html),
     }

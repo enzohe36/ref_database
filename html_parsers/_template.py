@@ -59,7 +59,7 @@ def remove_banners(html):
 # ---------------------------------------------------------------------------
 
 def _parse_metadata(html):
-    """Extract bundled metadata: title, journal, volume, issue, year, pages, doi.
+    """Extract bundled metadata: title, journal, year, volume, issue, pages, doi.
 
     Returns dict with those 7 keys. Each field's output format:
       - title: str without trailing period
@@ -68,8 +68,8 @@ def _parse_metadata(html):
         with dots stripped. Never hardcode an abbreviation or maintain
         a title->abbreviation map; each publisher emits one journal-name
         style consistently across its journals.
-      - volume, issue: str (may be empty)
       - year: 4-digit string
+      - volume, issue: str (may be empty)
       - pages: "firstpage-lastpage" or firstpage alone
       - doi: "https://doi.org/..." URL
     """
@@ -93,9 +93,9 @@ def _parse_metadata(html):
     return {
         "title": title,
         "journal": journal,
+        "year": year,
         "volume": get_meta(html, "citation_volume"),
         "issue": get_meta(html, "citation_issue"),
-        "year": year,
         "pages": pages,
         "doi": format_doi(get_meta(html, "citation_doi")),
     }
@@ -165,7 +165,7 @@ def _parse_authors(html):
 def _parse_references(html):
     """Extract the reference list.
 
-    Returns list of {"": {journal, volume, issue, year, title, pages, doi, authors}}.
+    Returns list of {"": {title, journal, year, volume, issue, pages, doi, authors}}.
     Each reference dict uses the same field formats as the main paper
     (notably title without trailing period, journal as ISO abbreviation
     when the source exposes one and full title otherwise — same
@@ -205,19 +205,17 @@ def _parse_main_text(html):
 # ---------------------------------------------------------------------------
 
 def parse_article(html):
-    """Parse <Publisher> HTML into a refs.json-format dict plus main_text."""
+    """Parse <Publisher> HTML into a papers/*.json-format dict."""
     meta = _parse_metadata(html)
     return {
-        "stem": "",
+        "title": meta["title"],
         "journal": meta["journal"],
+        "year": meta["year"],
         "volume": meta["volume"],
         "issue": meta["issue"],
-        "year": meta["year"],
-        "title": meta["title"],
         "pages": meta["pages"],
         "doi": meta["doi"],
         "authors": _parse_authors(html),
-        "publication_types": [],
-        "references": _parse_references(html),
         "main_text": _parse_main_text(html),
+        "references": _parse_references(html),
     }

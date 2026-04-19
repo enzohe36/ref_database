@@ -74,7 +74,7 @@ def remove_banners(html):
 # ---------------------------------------------------------------------------
 
 def _parse_metadata(html):
-    """Extract bundled metadata: title, journal, volume, issue, year, pages, doi.
+    """Extract bundled metadata: title, journal, year, volume, issue, pages, doi.
 
     Returns dict with those 7 keys. molbiolcell lacks citation_* meta for
     volume/issue/pages — volume/issue parsed from the breadcrumb URL
@@ -118,40 +118,35 @@ def _parse_metadata(html):
         get_meta(html, "publication_doi") or get_meta(html, "citation_doi")
     )
 
-    # Volume/issue: DOI-encoded format "mbc.<vol>.<issue>.<firstpage>"
-    # (older papers) takes priority; fall back to the toc breadcrumb
-    # (must be /toc/<journal>/<digits>/<digits>, not "current").
+    # Volume/issue: from the breadcrumb TOC link
+    # (/toc/<journal>/<vol>/<issue>). Require the article__tocHeading
+    # class so a nav-menu link like /toc/mboc/0/0 ("In Press") does not
+    # match. Class value may be quoted or unquoted; digits must both be
+    # positive (skip 0/0).
     volume = ""
     issue = ""
+    for bm in re.finditer(
+        r'href=["\']?https?://[^"\'>\s]*/toc/[^/]+/(\d+)/(\d+)[^>]*'
+        r'class=["\']?[^"\'>\s]*article__tocHeading',
+        html,
+    ):
+        if bm.group(1) != "0" and bm.group(2) != "0":
+            volume = bm.group(1)
+            issue = bm.group(2)
+            break
+
+    # Pages: Mol Biol Cell HTML does not expose a first/last page pair
+    # anywhere (no citation_firstpage / citation_lastpage, no
+    # schema.org pageStart/pageEnd, no body byline). Leave empty when
+    # absent rather than returning an incomplete firstpage-only value.
     pages = ""
-    dm = re.match(
-        r"https?://doi\.org/10\.1091/mbc\.(\d+)\.(\d+)\.(\d+)", doi or "",
-    )
-    if dm:
-        volume = dm.group(1)
-        issue = dm.group(2)
-        pages = dm.group(3)
-    if not volume:
-        # Breadcrumb TOC link; require the article__tocHeading class so a
-        # nav-menu link like /toc/mboc/0/0 ("In Press") does not match.
-        # Class value may be quoted or unquoted; digits must both be
-        # positive (skip 0/0).
-        for bm in re.finditer(
-            r'href=["\']?https?://[^"\'>\s]*/toc/[^/]+/(\d+)/(\d+)[^>]*'
-            r'class=["\']?[^"\'>\s]*article__tocHeading',
-            html,
-        ):
-            if bm.group(1) != "0" and bm.group(2) != "0":
-                volume = bm.group(1)
-                issue = bm.group(2)
-                break
 
     return {
         "title": title,
         "journal": journal,
+        "year": year,
         "volume": volume,
         "issue": issue,
-        "year": year,
         "pages": pages,
         "doi": doi,
     }
@@ -197,7 +192,7 @@ def _format_display_name(name):
     surname = " ".join(surname_parts)
     given = " ".join(parts[:i + 1])
     pieces = re.split(r"[\s.\-\u2010\u2011\u2012\u2013]+", given)
-    initials = "".join(p[0] for p in pieces if p and p[0].isupper())
+    initials = "".join(p[0] for p in pieces if p and p[0].isupper())[:2]
     return f"{surname} {initials}" if initials else surname
 
 
@@ -281,7 +276,7 @@ def _parse_authors(html):
 def _parse_references(html):
     """Extract the reference list.
 
-    Returns list of {"": {journal, volume, issue, year, title, pages, doi, authors}}.
+    Returns list of {"": {title, journal, year, volume, issue, pages, doi, authors}}.
     Each reference dict uses the same field formats as the main paper, with
     one exception: authors is a list of "LastName IN" strings (plain strings,
     not dicts with affiliation). Empty fields are "". Empty authors is [].
@@ -471,9 +466,9 @@ def _parse_references(html):
         refs.append({"": {
             "title": title,
             "journal": journal,
+            "year": year,
             "volume": volume,
             "issue": issue,
-            "year": year,
             "pages": pages,
             "doi": doi,
             "authors": authors,
@@ -562,19 +557,17 @@ def _parse_main_text(html):
 # ---------------------------------------------------------------------------
 
 def parse_article(html):
-    """Parse molbiolcell HTML into a refs.json-format dict plus main_text."""
+    """Parse molbiolcell HTML into a papers/*.json-format dict."""
     meta = _parse_metadata(html)
     return {
-        "stem": "",
+        "title": meta["title"],
         "journal": meta["journal"],
+        "year": meta["year"],
         "volume": meta["volume"],
         "issue": meta["issue"],
-        "year": meta["year"],
-        "title": meta["title"],
         "pages": meta["pages"],
         "doi": meta["doi"],
         "authors": _parse_authors(html),
-        "publication_types": [],
-        "references": _parse_references(html),
         "main_text": _parse_main_text(html),
+        "references": _parse_references(html),
     }

@@ -164,22 +164,22 @@ def _parse_citation_primary(html):
 
     return {
         "journal": journal,
+        "year": year,
         "volume": volume,
         "issue": issue,
         "pages": pages,
-        "year": year,
         "doi": doi,
     }, doi
 
 
 def _parse_metadata(html):
-    """Extract bundled metadata: title, journal, volume, issue, year, pages, doi.
+    """Extract bundled metadata: title, journal, year, volume, issue, pages, doi.
 
     Returns dict with those 7 keys. Each field's output format:
       - title: str
       - journal: ISO abbreviation without trailing period
-      - volume, issue: str (may be empty)
       - year: 4-digit string
+      - volume, issue: str (may be empty)
       - pages: "firstpage-lastpage" or firstpage alone
       - doi: "https://doi.org/..." URL
     OUP-specific: tries citation_ meta tags first (newer format), falls back to
@@ -226,9 +226,9 @@ def _parse_metadata(html):
     return {
         "title": title,
         "journal": journal,
+        "year": year,
         "volume": volume,
         "issue": issue,
-        "year": year,
         "pages": pages,
         "doi": format_doi(doi_raw),
     }
@@ -246,17 +246,122 @@ def _parse_authors(html):
     Tries citation_author meta tags first (newer OUP format with comma-
     separated LastName, Given). Falls back to al-author-name links
     (older format, full display names).
+
+    When meta citation_author_institution is missing for an author
+    (common on older NAR / Genetics papers), falls back to the
+    <div class="info-card-author"> author-popup widget which carries
+    each author's full-name display plus an optional <div class=aff>.
     """
+    # Build name -> affiliation lookup from info-card author widgets.
+    info_card_affs = {}
+    for m in re.finditer(
+        r'<div\s+class="info-card-author[^"]*"[^>]*>(.*?)(?=<div\s+class="info-card-author|\Z)',
+        html, re.DOTALL,
+    ):
+        block = m.group(1)
+        name_m = re.search(
+            r'<div\s+class=info-card-name[^>]*>\s*([^<]+?)\s*(?:<|$)',
+            block,
+        )
+        if not name_m:
+            continue
+        display = unescape(name_m.group(1)).strip()
+        if not display:
+            continue
+        affs = []
+        # <div class=aff> may contain a nested <div class=institution>
+        # that closes before the outer aff div. Walk the block with a
+        # depth counter so the full aff text (institution + address) is
+        # captured rather than just the institution stub.
+        pos = 0
+        while pos < len(block):
+            am = re.search(r'<div\s+class=aff\b[^>]*>', block[pos:])
+            if not am:
+                break
+            start = pos + am.end()
+            depth = 1
+            p = start
+            while depth > 0 and p < len(block):
+                no = re.search(r'<div[\s>]', block[p:])
+                nc = re.search(r'</div>', block[p:])
+                if not nc:
+                    break
+                if no and no.start() < nc.start():
+                    depth += 1
+                    p += no.end()
+                else:
+                    depth -= 1
+                    if depth == 0:
+                        inner = block[start:p + nc.start()]
+                    p += nc.end()
+            else:
+                inner = block[start:p]
+            # Drop <span class="label title-label">N</span> superscripts
+            txt = re.sub(r'<span[^>]*class="?label[^>]*>.*?</span>', '', inner, flags=re.DOTALL)
+            txt = unescape(re.sub(r'<[^>]+>', ', ', txt))
+            txt = re.sub(r'\s*,\s*,\s*', ', ', txt).strip(' ,')
+            txt = re.sub(r'\s+', ' ', txt).strip()
+            if txt:
+                affs.append(txt)
+            pos = p
+        if affs:
+            info_card_affs[display] = affs
+
+    def lookup_info_card(meta_name):
+        """Match a citation_author display name to the info-card lookup.
+        citation_author is "Last, Given"; info-card is "Given Last".
+        """
+        if meta_name in info_card_affs:
+            return info_card_affs[meta_name]
+        if "," in meta_name:
+            last, given = meta_name.split(",", 1)
+            flipped = f"{given.strip()} {last.strip()}"
+            if flipped in info_card_affs:
+                return info_card_affs[flipped]
+        return []
+
     # Try meta tags first
     meta_authors = parse_meta_authors(html)
     if meta_authors:
-        return [
-            {
+        result = []
+        for a in meta_authors:
+            affs = a.get("affiliations", [])
+            if not affs:
+                affs = lookup_info_card(a["name"])
+            result.append({
                 "author": format_author_name(a["name"]),
-                "affiliation": a.get("affiliations", []),
-            }
-            for a in meta_authors
-        ]
+                "affiliation": affs,
+            })
+        # Shared-affiliation broadcast. Two safe patterns:
+        # Rule A: when >=2 authors already carry the same single
+        #   affiliation string, broadcast it to empty-aff authors.
+        #   Skips cases where different authors have different affs
+        #   (don't overwrite publisher-specified mappings) and cases
+        #   where only one author has an aff (avoids attributing a
+        #   single corresponding-author lab to unrelated co-authors).
+        # Rule B: when ONLY the last author carries affs and >=2 other
+        #   authors are empty (typical of older OUP meta where the
+        #   citation_author_institution tags all cluster at the end
+        #   and parse_meta_authors attaches them to the last author),
+        #   broadcast the last author's affs to all empty authors.
+        #   Narrow on purpose — requires last-author-only, not
+        #   mid-stream singletons (Wang_2006 where the single aff
+        #   belongs to a non-last author stays unbroadcast).
+        with_affs = [a for a in result if a["affiliation"]]
+        unique_affs = {tuple(a["affiliation"]) for a in with_affs}
+        if len(with_affs) >= 2 and len(unique_affs) == 1:
+            shared = list(next(iter(unique_affs)))
+            for a in result:
+                if not a["affiliation"]:
+                    a["affiliation"] = list(shared)
+        elif (len(result) >= 3 and result[-1]["affiliation"]
+                and len(with_affs) == 1
+                and sum(1 for a in result if not a["affiliation"]) >= 2):
+            shared = list(result[-1]["affiliation"])
+            for a in result:
+                if not a["affiliation"]:
+                    a["affiliation"] = list(shared)
+        return result
 
     # Fallback: body HTML author links
     authors = []
@@ -270,9 +375,10 @@ def _parse_authors(html):
         name = unescape(m.group(1)).strip()
         if name and name not in seen and not name.startswith("http"):
             seen.add(name)
+            affs = info_card_affs.get(name, [])
             authors.append({
                 "author": name,
-                "affiliation": [],
+                "affiliation": affs,
             })
     return authors
 
@@ -284,7 +390,7 @@ def _parse_authors(html):
 def _parse_references(html):
     """Extract the reference list.
 
-    Returns list of {"": {journal, volume, issue, year, title, pages, doi, authors}}.
+    Returns list of {"": {title, journal, year, volume, issue, pages, doi, authors}}.
     Each reference dict uses the same field formats as the main paper, with
     one exception: authors is a list of "LastName IN" strings (plain strings,
     not dicts with affiliation). Empty fields are "". Empty authors is [].
@@ -398,9 +504,9 @@ def _parse_references(html):
         refs.append({"": {
             "title": title,
             "journal": journal,
+            "year": year,
             "volume": volume,
             "issue": issue,
-            "year": year,
             "pages": pages,
             "doi": doi,
             "authors": authors,
@@ -692,19 +798,17 @@ def _parse_main_text(html):
 # ---------------------------------------------------------------------------
 
 def parse_article(html):
-    """Parse OUP HTML into a refs.json-format dict plus main_text."""
+    """Parse OUP HTML into a papers/*.json-format dict."""
     meta = _parse_metadata(html)
     return {
-        "stem": "",
+        "title": meta["title"],
         "journal": meta["journal"],
+        "year": meta["year"],
         "volume": meta["volume"],
         "issue": meta["issue"],
-        "year": meta["year"],
-        "title": meta["title"],
         "pages": meta["pages"],
         "doi": meta["doi"],
         "authors": _parse_authors(html),
-        "publication_types": [],
-        "references": _parse_references(html),
         "main_text": _parse_main_text(html),
+        "references": _parse_references(html),
     }

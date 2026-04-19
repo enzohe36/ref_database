@@ -37,6 +37,31 @@ REFS_NO_HTML_FILE = os.path.join(BASE_DIR, "refs_no_html.md")
 PAPERS_DIR = os.path.join(BASE_DIR, "papers")
 os.makedirs(PAPERS_DIR, exist_ok=True)
 EDGE_PATH = "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge"
+_PUBMED_API_FILE = os.path.join(BASE_DIR, "api_pubmed.txt")
+_pubmed_throttle_cached = None
+
+
+def pubmed_throttle():
+    """Return (rate_gap_seconds, url_suffix) for PubMed E-utilities.
+
+    When api_pubmed.txt exists and is non-empty: 0.11 s gap + '&api_key=<key>'
+    suffix (authenticated 10 req/s allowance). Otherwise: 0.31 s gap + ''
+    (unauthenticated 3 req/s allowance). Result is cached after first call.
+    """
+    global _pubmed_throttle_cached
+    if _pubmed_throttle_cached is not None:
+        return _pubmed_throttle_cached
+    key = ""
+    try:
+        with open(_PUBMED_API_FILE, encoding="utf-8") as f:
+            key = f.read().strip()
+    except (FileNotFoundError, OSError):
+        pass
+    if key:
+        _pubmed_throttle_cached = (0.11, f"&api_key={key}")
+    else:
+        _pubmed_throttle_cached = (0.31, "")
+    return _pubmed_throttle_cached
 
 
 
@@ -64,9 +89,10 @@ def make_stem(first_last_name, year, journal, pmid):
 
 def fetch_xml(pmid):
     """Fetch XML from PubMed E-utilities."""
+    _, api_suffix = pubmed_throttle()
     url = (
         f"https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi"
-        f"?db=pubmed&id={pmid}&rettype=xml&retmode=xml"
+        f"?db=pubmed&id={pmid}&rettype=xml&retmode=xml{api_suffix}"
     )
     with urllib.request.urlopen(url) as resp:
         return resp.read().decode("utf-8")
@@ -161,8 +187,8 @@ def parse_xml(xml_data, pmid):
             if kw.text:
                 keywords.append(kw.text.strip())
 
-    # Publication types
-    pub_types = [pt.text for pt in art.findall(".//PublicationType") if pt.text]
+    # Publication type
+    pub_type = [pt.text for pt in art.findall(".//PublicationType") if pt.text]
 
     # CitationShort
     author_last_names = [
@@ -203,14 +229,14 @@ def parse_xml(xml_data, pmid):
                         references.append(aid.text)
 
     # Validate
-    if "Journal Article" not in pub_types:
+    if "Journal Article" not in pub_type:
         return None
-    if "Retracted Publication" in pub_types:
+    if "Retracted Publication" in pub_type:
         return None
 
     return {
         "pmid": pmid_final,
-        "publication_types": pub_types,
+        "pub_type": pub_type,
         "citation_in_text": citation_in_text,
         "title": title,
         "journal": journal_abbrev,
@@ -240,9 +266,9 @@ def load_references():
 
 
 def save_references(refs):
-    """Save dict to refs.json with compact arrays for publication_types and references."""
+    """Save dict to refs.json with compact arrays for pub_type and references."""
     raw = json.dumps(refs, indent=2, ensure_ascii=False)
-    for key in ("publication_types", "references"):
+    for key in ("pub_type", "references"):
 
         def _collapse(m):
             items = [s.strip().rstrip(",") for s in m.group(2).split("\n") if s.strip()]
@@ -270,7 +296,7 @@ def append_to_references(parsed):
     refs = load_references()
     filtered = [
         pt
-        for pt in parsed["publication_types"]
+        for pt in parsed["pub_type"]
         if not pt.startswith("Research Support")
     ]
     authors = [
@@ -279,15 +305,15 @@ def append_to_references(parsed):
     ]
     refs[parsed["pmid"]] = {
         "stem": parsed["citation_short"],
+        "pub_type": filtered,
+        "title": parsed["title"],
         "journal": parsed["journal"],
+        "year": parsed["year"],
         "volume": parsed["volume"],
         "issue": parsed["issue"],
-        "year": parsed["year"],
-        "title": parsed["title"],
         "pages": parsed["pages"],
         "doi": parsed["doi"],
         "authors": authors,
-        "publication_types": filtered,
         "references": parsed.get("references", []),
     }
     save_references(refs)
@@ -1045,9 +1071,11 @@ def _fetch_batch(batch, port):
 
 def search_pmids(query):
     """Search PubMed and return list of PMIDs."""
+    _, api_suffix = pubmed_throttle()
     url = (
         f"https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi"
         f"?db=pubmed&term={urllib.parse.quote(query)}&retmax=20&retmode=xml"
+        f"{api_suffix}"
     )
     with urllib.request.urlopen(url) as resp:
         xml_data = resp.read().decode("utf-8")
@@ -1071,7 +1099,7 @@ def validate():
 
     for pmid in pmids:
         if fetch_count > 0:
-            time.sleep(0.4)
+            time.sleep(pubmed_throttle()[0])
         try:
             xml_data = fetch_xml(pmid)
             fetch_count += 1
@@ -1102,7 +1130,7 @@ def validate():
 
     for pmid, title in preprints:
         if fetch_count > 0:
-            time.sleep(0.4)
+            time.sleep(pubmed_throttle()[0])
         try:
             query = f"{title} NOT preprint[pt]"
             result_pmids = search_pmids(query)
@@ -1205,7 +1233,7 @@ def main():
             parsed_proxy = {"pmid": pmid, "citation_short": stem, "doi": doi}
         else:
             if fetched_count > 0:
-                time.sleep(0.4)
+                time.sleep(pubmed_throttle()[0])
             try:
                 xml_data = fetch_xml(pmid)
                 fetched_count += 1

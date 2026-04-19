@@ -96,9 +96,9 @@ def _parse_metadata(html):
     return {
         "title": get_meta(html, "citation_title"),
         "journal": journal,
+        "year": year,
         "volume": get_meta(html, "citation_volume"),
         "issue": get_meta(html, "citation_issue"),
-        "year": year,
         "pages": pages,
         "doi": format_doi(get_meta(html, "citation_doi")),
     }
@@ -316,9 +316,12 @@ def _parse_ref_entry(entry_html):
     )
     tail_text = re.sub(r"\s+", " ", unescape(strip_tags(tail_html))).strip()
 
-    # Year: first (YYYY) at start
+    # Year: first (YYYY) at start. Optional leading punctuation (".", ",")
+    # tolerates tail like ". (2017). Title..." that arises when an "et al."
+    # span sits inside the personGroup and the HTML emits a stray period
+    # immediately after the personGroup closes.
     year = ""
-    ym = re.match(r"\s*\(\s*(\d{4})[a-z]?\s*\)", tail_text)
+    ym = re.match(r"\s*[.,]?\s*\(\s*(\d{4})[a-z]?\s*\)", tail_text)
     if ym:
         year = ym.group(1)
         tail_text = tail_text[ym.end():].strip(" .,")
@@ -349,9 +352,9 @@ def _parse_ref_entry(entry_html):
     return {
         "title": title,
         "journal": journal,
+        "year": year,
         "volume": volume,
         "issue": issue,
-        "year": year,
         "pages": pages,
         "doi": doi,
         "authors": authors,
@@ -635,19 +638,17 @@ def _parse_main_text(html):
 # ---------------------------------------------------------------------------
 
 def parse_article(html):
-    """Parse Frontiers HTML into a refs.json-format dict plus main_text."""
+    """Parse Frontiers HTML into a papers/*.json-format dict."""
     meta = _parse_metadata(html)
     return {
-        "stem": "",
+        "title": meta["title"],
         "journal": meta["journal"],
+        "year": meta["year"],
         "volume": meta["volume"],
         "issue": meta["issue"],
-        "year": meta["year"],
-        "title": meta["title"],
         "pages": meta["pages"],
         "doi": meta["doi"],
         "authors": _parse_authors(html),
-        "publication_types": [],
-        "references": _parse_references(html),
         "main_text": _parse_main_text(html),
+        "references": _parse_references(html),
     }

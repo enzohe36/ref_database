@@ -43,7 +43,7 @@ def remove_banners(html):
 # ---------------------------------------------------------------------------
 
 def _parse_metadata(html):
-    """Extract bundled metadata: title, journal, volume, issue, year, pages, doi.
+    """Extract bundled metadata: title, journal, year, volume, issue, pages, doi.
 
     bioRxiv preprints lack volume/issue; citation_firstpage carries the
     preprint ID (e.g. "2023.04.10.536247").
@@ -66,9 +66,9 @@ def _parse_metadata(html):
     return {
         "title": get_meta(html, "citation_title"),
         "journal": journal,
+        "year": year,
         "volume": get_meta(html, "citation_volume"),
         "issue": get_meta(html, "citation_issue"),
-        "year": year,
         "pages": pages,
         "doi": format_doi(get_meta(html, "citation_doi")),
     }
@@ -151,19 +151,17 @@ def _parse_main_text(html):
 # ---------------------------------------------------------------------------
 
 def parse_article(html):
-    """Parse a bioRxiv landing page into a refs.json-format dict plus main_text."""
+    """Parse a bioRxiv landing page into a papers/*.json-format dict."""
     meta = _parse_metadata(html)
     return {
-        "stem": "",
+        "title": meta["title"],
         "journal": meta["journal"],
+        "year": meta["year"],
         "volume": meta["volume"],
         "issue": meta["issue"],
-        "year": meta["year"],
-        "title": meta["title"],
         "pages": meta["pages"],
         "doi": meta["doi"],
         "authors": _parse_authors(html),
-        "publication_types": [],
-        "references": _parse_references(html),
         "main_text": _parse_main_text(html),
+        "references": _parse_references(html),
     }

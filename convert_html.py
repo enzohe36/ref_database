@@ -2,11 +2,11 @@
 """Convert article HTML pages to structured JSON.
 
 Usage:
-    python convert_html.py <path> [<path> ...]
+    python convert_html.py [<path> ...]
 
 Each path can be an HTML file or a directory (all .html files in the
-directory will be processed). Skips files whose JSON already has non-empty
-main_text.
+directory will be processed). Defaults to papers/ when no path is given.
+Skips files whose JSON already has non-empty main_text.
 
 Two-phase processing:
   Phase 1: Parse all HTMLs in parallel via ProcessPoolExecutor (no browser).
@@ -16,10 +16,12 @@ Two-phase processing:
            rounds are exhausted.
 """
 
+import atexit
 import json
 import os
 import re
 import sys
+import tempfile
 import time
 import urllib.request
 from concurrent.futures import ProcessPoolExecutor
@@ -38,7 +40,6 @@ from get_refs import (
     REFS_NO_HTML_FILE,
     CDP_PORT,
 )
-from parse_citation import ensure_journals
 
 MIN_MAIN_TEXT_LEN = 5000
 MIN_REFERENCES = 5
@@ -174,11 +175,73 @@ def _fetch_pmc(pmcid, output_path, port):
 # _abbreviate_journals normalizes to the NLM MedAbbr so refs.json and
 # papers/<stem>.json agree on the canonical journal string.
 #
-# The lookup is built once per convert run from NLM's J_Entrez.txt (via
-# parse_citation.ensure_journals) and shared with parallel workers through
-# the ProcessPoolExecutor initializer.
+# The NLM journal list is downloaded once per convert run to a temp file
+# (cleaned up at exit) and shared with parallel workers through the
+# ProcessPoolExecutor initializer so they don't each redownload.
 
+_JOURNALS_URL = "https://ftp.ncbi.nih.gov/pubmed/J_Entrez.txt"
+_JOURNALS_FILE = None
 _JOURNAL_LOOKUP = None
+# Prefix index: tuple(normalized paren-stripped JournalTitle tokens[:n]) ->
+# abbr, populated only when exactly one NLM entry registers that prefix.
+# Min prefix length = 3 tokens (see _PREFIX_MIN_TOKENS).
+_JOURNAL_PREFIX_INDEX = None
+_PREFIX_MIN_TOKENS = 3
+
+
+def _cleanup_journals_file():
+    """atexit hook: remove the temp journals.json written by ensure_journals."""
+    global _JOURNALS_FILE
+    if _JOURNALS_FILE and os.path.exists(_JOURNALS_FILE):
+        os.remove(_JOURNALS_FILE)
+        _JOURNALS_FILE = None
+
+
+atexit.register(_cleanup_journals_file)
+
+
+def ensure_journals():
+    """Download the NLM J_Entrez.txt file, parse it, and write the
+    result to a temp JSON keyed by NlmId. Returns the file path.
+    Re-downloads each run; short-circuits if the path is already set
+    (via _worker_init in child processes).
+    """
+    global _JOURNALS_FILE
+    if _JOURNALS_FILE and os.path.exists(_JOURNALS_FILE):
+        return _JOURNALS_FILE
+    print(f"Downloading {_JOURNALS_URL}...", flush=True)
+    with urllib.request.urlopen(_JOURNALS_URL) as resp:
+        data = resp.read().decode("utf-8")
+
+    entries = []
+    current = {}
+    for line in data.split("\n"):
+        line = line.strip()
+        if line.startswith("---"):
+            if current:
+                entries.append(current)
+            current = {}
+        elif ": " in line:
+            key, val = line.split(": ", 1)
+            current[key] = val.strip()
+    if current:
+        entries.append(current)
+
+    journal_map = {}
+    for e in entries:
+        nlmid = e.get("NlmId", "").strip()
+        abbr = e.get("MedAbbr", "").strip()
+        title = e.get("JournalTitle", "").strip()
+        if nlmid and abbr:
+            journal_map[nlmid] = {"JournalTitle": title, "MedAbbr": abbr}
+
+    fd, path = tempfile.mkstemp(prefix="journals_", suffix=".json")
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        json.dump(journal_map, f, indent=2, ensure_ascii=False)
+        f.write("\n")
+    _JOURNALS_FILE = path
+    print(f"Loaded {len(journal_map)} journals")
+    return path
 
 
 def _norm_journal_key(s):
@@ -200,52 +263,136 @@ def _norm_journal_key(s):
 
 
 def _load_journal_lookup(journals_path):
-    """Populate the module-level lookup from a journals.json temp file.
+    """Populate the module-level lookup and prefix index from the
+    journals.json temp file.
 
-    Indexes each NLM entry under several keys so the common publisher
-    forms all resolve to the same MedAbbr:
-      - JournalTitle verbatim
-      - JournalTitle with ' : ' qualifier stripped (NLM format
-        'Genes to cells : devoted to...' matches publisher 'Genes to Cells')
-      - JournalTitle with trailing 'of the United States of America'
-        stripped (the unique PNAS suffix)
-      - MedAbbr verbatim (passthrough for parsers that already emit it)
-      - MedAbbr with parenthesized location suffix stripped ('DNA Repair'
-        -> 'DNA Repair (Amst)'). setdefault preserves the unambiguous
-        paren-less match when an NLM entry shares the pre-paren form.
-    Unknown journals are left verbatim by the lookup.
+    Verbatim lookup: publisher -> MedAbbr with tiered priority per key.
+    Each candidate is registered with a priority tier:
+      0 (highest) - MedAbbr verbatim. Parsers that already emit the
+        MedAbbr pass through unchanged; PubMed-canonical MedAbbrs win
+        when they collide with a JournalTitle of a different journal
+        (e.g. 'Nucleus' is the MedAbbr of the Austin, Tex. Nucleus and
+        also the ' : '-stripped form of The Nucleus (Calcutta) title —
+        the Austin entry wins because its MedAbbr is the exact match).
+      1 - JournalTitle verbatim.
+      2 - Transforms: ' : ' qualifier stripped ('Genes to cells :
+        devoted to...' -> 'Genes to Cells'), trailing 'of the United
+        States of America' stripped (PNAS), MedAbbr paren suffix
+        stripped ('DNA Repair (Amst)' -> 'DNA Repair').
+    If multiple distinct MedAbbrs share the top (lowest) tier for a
+    key, the key is dropped — an unambiguous resolution is preferred
+    over a guess.
+
+    Prefix index: tuple of normalized JournalTitle tokens[:n] -> MedAbbr
+    for n >= _PREFIX_MIN_TOKENS. Tokenization keeps parenthesized
+    content so 'Angewandte Chemie (International ed. in English)'
+    tokenizes as [angewandte, chemie, international, ed, in, english]
+    and a publisher string 'Angewandte Chemie International Edition'
+    matches at the 3-token prefix. Prefixes registered by more than one
+    entry are discarded.
     """
-    global _JOURNAL_LOOKUP
+    global _JOURNAL_LOOKUP, _JOURNAL_PREFIX_INDEX
     with open(journals_path, encoding="utf-8") as f:
         jdata = json.load(f)
-    d = {}
+
+    # key -> list of (tier, abbr)
+    candidates = {}
+    prefix_counts = {}
+    prefix_abbr = {}
+
+    def add(key, abbr, tier):
+        if not key:
+            return
+        candidates.setdefault(key, []).append((tier, abbr))
+
     for entry in jdata.values():
         abbr = entry.get("MedAbbr", "").strip()
         if not abbr:
             continue
         jt = entry.get("JournalTitle", "").strip()
+        add(_norm_journal_key(abbr), abbr, 0)
+        if "-" in abbr:
+            # NLM hyphenates some tokens ('Sub-cellular' in MedAbbrs like
+            # 'Subcell Biochem' are not hyphenated but JournalTitles
+            # sometimes are). Index the hyphen-removed concatenated form
+            # so publisher non-hyphenated forms match.
+            add(_norm_journal_key(abbr.replace("-", "")), abbr, 2)
         if jt:
-            d.setdefault(_norm_journal_key(jt), abbr)
+            add(_norm_journal_key(jt), abbr, 1)
+            if "-" in jt:
+                add(_norm_journal_key(jt.replace("-", "")), abbr, 2)
             if " : " in jt:
-                d.setdefault(_norm_journal_key(jt.split(" : ", 1)[0]), abbr)
+                add(_norm_journal_key(jt.split(" : ", 1)[0]), abbr, 2)
             trimmed = re.sub(
                 r"\s+of\s+the\s+United\s+States\s+of\s+America\s*$",
                 "", jt, flags=re.IGNORECASE,
             )
             if trimmed != jt:
-                d.setdefault(_norm_journal_key(trimmed), abbr)
-        d.setdefault(_norm_journal_key(abbr), abbr)
+                add(_norm_journal_key(trimmed), abbr, 2)
+            # Prefix index: tokenize keeping paren content so qualified
+            # NLM titles expose their descriptive words as token
+            # candidates (see docstring).
+            toks = _norm_journal_key(jt).split()
+            for n in range(_PREFIX_MIN_TOKENS, len(toks) + 1):
+                prefix = tuple(toks[:n])
+                prefix_counts[prefix] = prefix_counts.get(prefix, 0) + 1
+                if prefix_counts[prefix] == 1:
+                    prefix_abbr[prefix] = abbr
         if "(" in abbr:
             stripped = re.sub(r"\s*\([^)]*\)\s*", " ", abbr).strip()
             if stripped:
-                d.setdefault(_norm_journal_key(stripped), abbr)
+                add(_norm_journal_key(stripped), abbr, 2)
+
+    d = {}
+    for key, cands in candidates.items():
+        cands.sort(key=lambda x: x[0])
+        top = cands[0][0]
+        top_abbrs = {c[1] for c in cands if c[0] == top}
+        if len(top_abbrs) == 1:
+            d[key] = next(iter(top_abbrs))
+        # else: ambiguous top tier — leave key unmapped so lookup
+        # returns the publisher string verbatim rather than guessing.
     _JOURNAL_LOOKUP = d
+    _JOURNAL_PREFIX_INDEX = {
+        p: prefix_abbr[p] for p, c in prefix_counts.items() if c == 1
+    }
+
+
+def _lookup_journal(name):
+    """Resolve a publisher journal name to an NLM MedAbbr.
+
+    Tries in order: verbatim lookup, verbatim lookup with
+    parenthesized qualifier stripped from the query (publishers like
+    Elsevier brand sub-journals as 'X (BBA) - Y'), then progressive
+    prefix matching — iterates n from _PREFIX_MIN_TOKENS upward and
+    returns the shortest publisher-token prefix that identifies
+    exactly one NLM entry. Returns the original name if nothing
+    matches.
+    """
+    if not name or not _JOURNAL_LOOKUP:
+        return name
+    key = _norm_journal_key(name)
+    if key in _JOURNAL_LOOKUP:
+        return _JOURNAL_LOOKUP[key]
+    if "(" in name:
+        stripped_key = _norm_journal_key(
+            re.sub(r"\s*\([^)]*\)\s*", " ", name)
+        )
+        if stripped_key and stripped_key != key and stripped_key in _JOURNAL_LOOKUP:
+            return _JOURNAL_LOOKUP[stripped_key]
+    if _JOURNAL_PREFIX_INDEX:
+        toks = key.split()
+        for n in range(_PREFIX_MIN_TOKENS, len(toks) + 1):
+            hit = _JOURNAL_PREFIX_INDEX.get(tuple(toks[:n]))
+            if hit is not None:
+                return hit
+    return name
 
 
 def _abbreviate_journals(parsed):
     """Replace journal names in parsed dict with their NLM MedAbbr.
 
-    Walks the refs.json-format dict and rewrites 'journal' on the main
+    Walks the papers/*.json-format dict and rewrites 'journal' on the main
     paper and on each reference. Parsers that already emit the MedAbbr
     are unaffected (the lookup's passthrough entries map MedAbbr to
     itself). Unknown journals are left verbatim so parser output is
@@ -255,33 +402,29 @@ def _abbreviate_journals(parsed):
     if not parsed or not _JOURNAL_LOOKUP:
         return parsed
     if parsed.get("journal"):
-        parsed["journal"] = _JOURNAL_LOOKUP.get(
-            _norm_journal_key(parsed["journal"]), parsed["journal"]
-        )
+        parsed["journal"] = _lookup_journal(parsed["journal"])
     for ref in parsed.get("references") or []:
         if not isinstance(ref, dict):
             continue
         inner = ref.get("") if "" in ref else ref
         if isinstance(inner, dict) and inner.get("journal"):
-            inner["journal"] = _JOURNAL_LOOKUP.get(
-                _norm_journal_key(inner["journal"]), inner["journal"]
-            )
+            inner["journal"] = _lookup_journal(inner["journal"])
     return parsed
 
 
 # ---------------------------------------------------------------------------
-# Parse HTML into refs.json-format object
+# Parse HTML into papers/*.json-format object
 # ---------------------------------------------------------------------------
 
 def _parse_html(html, parser):
-    """Parse HTML into a refs.json-format dict using the publisher parser.
+    """Parse HTML into a papers/*.json-format dict using the publisher parser.
 
-    Calls parser.parse_article(html) to produce the refs.json-format dict,
+    Calls parser.parse_article(html) to produce the papers/*.json-format dict,
     runs clean_parsed_output to enforce shared formatting rules (no
     trailing period in titles, no dots in journal abbreviations), then
     _abbreviate_journals to normalize main-paper and reference journal
     names to their NLM MedAbbr via the lookup loaded in main().
-    Returns dict with all refs.json fields, or None if parsing fails.
+    Returns dict with all paper fields, or None if parsing fails.
     """
     try:
         parsed = parser.parse_article(html)
@@ -748,21 +891,18 @@ def _fetch_round(fetch_items, port):
 def _worker_init(journals_path):
     """Initialize a ProcessPoolExecutor worker.
 
-    Points parse_citation at the parent-downloaded journals temp file
-    (so workers don't re-download) and loads the journal-abbreviation
-    lookup into the worker's module global.
+    Seeds the worker's _JOURNALS_FILE with the parent-downloaded temp
+    path so ensure_journals() short-circuits (no redownload), and
+    builds the journal-abbreviation lookup.
     """
-    import parse_citation
-    parse_citation._journals_file = journals_path
+    global _JOURNALS_FILE
+    _JOURNALS_FILE = journals_path
     _load_journal_lookup(journals_path)
 
 
 def main():
-    if len(sys.argv) < 2:
-        print(__doc__, file=sys.stderr)
-        sys.exit(1)
-
-    to_process = _collect_paths(sys.argv[1:])
+    args = sys.argv[1:] or ["papers/"]
+    to_process = _collect_paths(args)
 
     # Download the NLM journal list once before parsing and load the
     # abbreviation lookup. Workers receive the temp file path via

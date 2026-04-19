@@ -152,7 +152,7 @@ def _parse_pages_from_abstract(html):
 
 
 def _parse_metadata(html):
-    """Extract bundled metadata: title, journal, volume, issue, year, pages, doi.
+    """Extract bundled metadata: title, journal, year, volume, issue, pages, doi.
 
     SAGE uses dc.* meta tags for most fields. citation_journal_title is
     present; volume/issue/pages must be parsed from body HTML.
@@ -222,9 +222,9 @@ def _parse_metadata(html):
     return {
         "title": title,
         "journal": journal,
+        "year": year,
         "volume": volume,
         "issue": issue,
-        "year": year,
         "pages": pages,
         "doi": format_doi(doi_raw),
     }
@@ -297,7 +297,7 @@ def _parse_authors(html):
 def _parse_one_reference(block):
     """Parse one <div id=BN class=citations> block.
 
-    Returns dict {title, journal, volume, issue, year, pages, doi, authors}.
+    Returns dict {title, journal, year, volume, issue, pages, doi, authors}.
     """
     # Citation text
     cm = re.search(
@@ -455,9 +455,9 @@ def _parse_one_reference(block):
     return {
         "title": title,
         "journal": journal,
+        "year": year,
         "volume": volume,
         "issue": issue,
-        "year": year,
         "pages": pages,
         "doi": doi,
         "authors": norm_authors,
@@ -465,28 +465,64 @@ def _parse_one_reference(block):
 
 
 def _parse_references(html):
-    """Extract references from <div id=PREFIX_N class=citations> blocks.
+    """Extract references from <div class=citations> blocks.
 
-    Atypon-based sites use varied id prefixes:
+    Atypon-based sites expose each reference as <div class=citations>,
+    usually with an id matching a reference-number prefix:
       - SAGE: B1, B2, ...
       - science.org (modern): R1, R2, ...
       - science.org (legacy): REF1, REF2, ...
-    Match any uppercase letter prefix followed by digits.
+    Some legacy Science papers (e.g. 2007-era) omit the id on specific
+    citation divs, instead identifying the reference number via a
+    sibling ``<div class=label>N</div>``. Match both layouts and
+    deduplicate by reference number so the hidden/visible copies the
+    Atypon template renders don't each count.
     """
     refs = []
-    seen = set()
+    seen_numbers = set()
+    # Walk every <div class=citations> opening in document order.
+    # Atypon Science papers render each reference in the main list plus
+    # a visible core-collateral duplicate (accessible from the text), and
+    # some are additionally cloned as hidden screen-reader entries. Some
+    # references (e.g. legacy Science papers) omit the id attribute and
+    # instead carry a sibling <div class=label>N</div>. Dedupe by the
+    # numeric reference key extracted from either the id or the label so
+    # every cited work appears exactly once regardless of which Atypon
+    # clone is visible.
+    # Match divs whose class is exactly "citations" — multi-class divs
+    # like class="citations to-citation__accordion external-links" are
+    # empty UI chrome (accordions/tooltips) that should not be treated
+    # as references.
     for m in re.finditer(
-        r'<div\s+id=([A-Z]+)(\d+)\s+class=["\']?citations["\']?[^>]*>',
+        r'<div(?P<attrs>\s+[^>]*?)'
+        r'class=(?:"citations"|\'citations\'|citations(?=[\s>]))[^>]*>',
         html,
     ):
-        prefix = m.group(1)
-        n = int(m.group(2))
-        ref_id = (prefix, n)
-        if ref_id in seen:
+        attrs = m.group("attrs") or ""
+        before = html[max(0, m.start() - 200):m.start()]
+        # Skip hidden clones (screen-reader copies) since their text
+        # duplicates a visible entry elsewhere.
+        if re.search(r'role=listitem[^>]*\bhidden\b', before):
             continue
-        seen.add(ref_id)
+        # Derive a numeric reference key from the id ("REF4", "R1",
+        # "B1", "core-collateral-REF4") or from the preceding
+        # <div class=label>N</div> sibling for id-less entries.
+        id_m = re.search(r'\bid=\S*?([A-Z]+)(\d+)\b', attrs)
+        if id_m:
+            key = int(id_m.group(2))
+        else:
+            label_m = re.search(
+                r'<div\s+class=["\']?label["\']?[^>]*>\s*(\d+)\s*</div>\s*$',
+                before,
+            )
+            if not label_m:
+                continue
+            key = int(label_m.group(1))
+        if key in seen_numbers:
+            continue
+        seen_numbers.add(key)
         next_m = re.search(
-            rf'<div\s+id={prefix}{n + 1}\s+class=["\']?citations',
+            r'<div\s+[^>]*class=["\']?citations["\']?',
             html[m.end():],
         )
         end = m.end() + next_m.start() if next_m else m.end() + 8000
@@ -644,19 +680,17 @@ def _parse_main_text(html):
 # ---------------------------------------------------------------------------
 
 def parse_article(html):
-    """Parse SAGE HTML into a refs.json-format dict plus main_text."""
+    """Parse SAGE HTML into a papers/*.json-format dict."""
     meta = _parse_metadata(html)
     return {
-        "stem": "",
+        "title": meta["title"],
         "journal": meta["journal"],
+        "year": meta["year"],
         "volume": meta["volume"],
         "issue": meta["issue"],
-        "year": meta["year"],
-        "title": meta["title"],
         "pages": meta["pages"],
         "doi": meta["doi"],
         "authors": _parse_authors(html),
-        "publication_types": [],
-        "references": _parse_references(html),
         "main_text": _parse_main_text(html),
+        "references": _parse_references(html),
     }

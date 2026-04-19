@@ -236,7 +236,7 @@ def _parse_title(html):
 
 
 def _parse_metadata(html):
-    """Extract bundled metadata: title, journal, volume, issue, year, pages, doi.
+    """Extract bundled metadata: title, journal, year, volume, issue, pages, doi.
 
     ClinicalKey has no citation_* meta tags; fields are parsed from the
     rendered header. DOI is not exposed in ClinicalKey HTML and is left empty.
@@ -245,9 +245,9 @@ def _parse_metadata(html):
     return {
         "title": _parse_title(html),
         "journal": cite["journal"],
+        "year": cite["year"],
         "volume": cite["volume"],
         "issue": cite["issue"],
-        "year": cite["year"],
         "pages": cite["pages"],
         "doi": "",
     }
@@ -359,9 +359,9 @@ def _parse_ref_entry(entry_html):
     return {
         "title": title,
         "journal": journal,
+        "year": year,
         "volume": volume,
         "issue": issue,
-        "year": year,
         "pages": pages,
         "doi": doi,
         "authors": authors,
@@ -556,19 +556,17 @@ def _parse_main_text(html):
 # ---------------------------------------------------------------------------
 
 def parse_article(html):
-    """Parse ClinicalKey HTML into a refs.json-format dict plus main_text."""
+    """Parse ClinicalKey HTML into a papers/*.json-format dict."""
     meta = _parse_metadata(html)
     return {
-        "stem": "",
+        "title": meta["title"],
         "journal": meta["journal"],
+        "year": meta["year"],
         "volume": meta["volume"],
         "issue": meta["issue"],
-        "year": meta["year"],
-        "title": meta["title"],
         "pages": meta["pages"],
         "doi": meta["doi"],
         "authors": _parse_authors(html),
-        "publication_types": [],
-        "references": _parse_references(html),
         "main_text": _parse_main_text(html),
+        "references": _parse_references(html),
     }

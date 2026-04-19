@@ -65,13 +65,13 @@ def remove_banners(html):
 # ---------------------------------------------------------------------------
 
 def _parse_metadata(html):
-    """Extract bundled metadata: title, journal, volume, issue, year, pages, doi.
+    """Extract bundled metadata: title, journal, year, volume, issue, pages, doi.
 
     Returns dict with those 7 keys. Each field's output format:
       - title: str
       - journal: ISO abbreviation without trailing period
-      - volume, issue: str (may be empty)
       - year: 4-digit string
+      - volume, issue: str (may be empty)
       - pages: "firstpage-lastpage" or firstpage alone
       - doi: "https://doi.org/..." URL
     """
@@ -113,9 +113,9 @@ def _parse_metadata(html):
     return {
         "title": title,
         "journal": journal.rstrip(".") if journal else "",
+        "year": year,
         "volume": volume,
         "issue": issue,
-        "year": year,
         "pages": pages,
         "doi": format_doi(get_meta(html, "citation_doi")),
     }
@@ -174,7 +174,7 @@ def _jci_format_name(name):
     surname = " ".join(surname_parts)
     given = " ".join(parts[:i + 1])
     pieces = re.split(r"[\s.\-\u2010\u2011\u2012\u2013]+", given)
-    initials = "".join(p[0] for p in pieces if p and p[0].isupper())
+    initials = "".join(p[0] for p in pieces if p and p[0].isupper())[:2]
     return f"{surname} {initials}" if initials else surname
 
 
@@ -253,7 +253,7 @@ def _parse_ref_text(text):
 def _parse_references(html):
     """Extract the reference list.
 
-    Returns list of {"": {journal, volume, issue, year, title, pages, doi, authors}}.
+    Returns list of {"": {title, journal, year, volume, issue, pages, doi, authors}}.
     Each reference dict uses the same field formats as the main paper, with
     one exception: authors is a list of "LastName IN" strings (plain strings,
     not dicts with affiliation). Empty fields are "". Empty authors is [].
@@ -353,9 +353,9 @@ def _parse_references(html):
         refs.append({"": {
             "title": title,
             "journal": journal,
+            "year": year,
             "volume": volume,
             "issue": issue,
-            "year": year,
             "pages": pages,
             "doi": doi,
             "authors": authors,
@@ -481,19 +481,17 @@ def _parse_main_text(html):
 # ---------------------------------------------------------------------------
 
 def parse_article(html):
-    """Parse JCI HTML into a refs.json-format dict plus main_text."""
+    """Parse JCI HTML into a papers/*.json-format dict."""
     meta = _parse_metadata(html)
     return {
-        "stem": "",
+        "title": meta["title"],
         "journal": meta["journal"],
+        "year": meta["year"],
         "volume": meta["volume"],
         "issue": meta["issue"],
-        "year": meta["year"],
-        "title": meta["title"],
         "pages": meta["pages"],
         "doi": meta["doi"],
         "authors": _parse_authors(html),
-        "publication_types": [],
-        "references": _parse_references(html),
         "main_text": _parse_main_text(html),
+        "references": _parse_references(html),
     }

@@ -51,12 +51,27 @@ def remove_banners(html):
 # ---------------------------------------------------------------------------
 
 def _parse_metadata(html):
-    """Extract bundled metadata: title, journal, volume, issue, year, pages, doi.
+    """Extract bundled metadata: title, journal, year, volume, issue, pages, doi.
 
-    Uses standard citation_* meta tags. Wiley emits extra citation_author
-    tags for affiliations, but the main paper's title/journal/volume/... tags
-    are reliable.
+    Uses standard citation_* meta tags, with a body-HTML fallback for
+    volume / issue / year when citation_issue is empty (supplement
+    issues like 'S1') or citation_online_date reflects the acceptance
+    rather than publication year. The fallback reads the ToC URL
+    '/toc/<journal-id>/<year>/<volume>/<issue>' from the byline's
+    <a class=volume-issue> anchor.
     """
+    # Body-HTML fallback: extracts year, volume, issue from the ToC
+    # link's URL. Present on every Wiley article page as e.g.
+    # <a href="https://onlinelibrary.wiley.com/toc/10982280/2024/65/S1" class=volume-issue>.
+    toc_m = re.search(
+        r'href=(?:"|\')?https?://[^/]*wiley\.com/toc/\d+/(\d{4})/([^/]+)/([^/\s"\']+)'
+        r'[^>]*class=(?:"|\')?volume-issue',
+        html,
+    )
+    body_year = toc_m.group(1) if toc_m else ""
+    body_volume = toc_m.group(2) if toc_m else ""
+    body_issue = toc_m.group(3) if toc_m else ""
+
     date = (get_meta(html, "citation_publication_date")
             or get_meta(html, "citation_online_date"))
     year = ""
@@ -64,6 +79,10 @@ def _parse_metadata(html):
         m = re.search(r"(\d{4})", date)
         if m:
             year = m.group(1)
+    # Prefer body's publication year over citation_online_date, which
+    # Wiley populates with the acceptance date for some papers.
+    if body_year:
+        year = body_year
 
     firstpage = get_meta(html, "citation_firstpage")
     lastpage = get_meta(html, "citation_lastpage") if firstpage else ""
@@ -72,12 +91,15 @@ def _parse_metadata(html):
     journal = get_meta(html, "citation_journal_abbrev") or get_meta(html, "citation_journal_title")
     journal = journal.rstrip(".") if journal else ""
 
+    volume = get_meta(html, "citation_volume") or body_volume
+    issue = get_meta(html, "citation_issue") or body_issue
+
     return {
         "title": get_meta(html, "citation_title"),
         "journal": journal,
-        "volume": get_meta(html, "citation_volume"),
-        "issue": get_meta(html, "citation_issue"),
         "year": year,
+        "volume": volume,
+        "issue": issue,
         "pages": pages,
         "doi": format_doi(get_meta(html, "citation_doi")),
     }
@@ -144,10 +166,15 @@ def _parse_authors(html):
         seen.add(display)
 
         # Remaining <p> tags carry the affiliation text(s); skip those that
-        # match the name again (which Wiley repeats) and the moreInfoLink.
+        # match the name again (which Wiley repeats), the moreInfoLink, and
+        # <p class="author-type">...</p> role labels ("Corresponding
+        # Author"), which would otherwise leak in as a fake affiliation.
         affs = []
-        for pm in re.finditer(r'<p[^>]*>([^<]*)</p>', block):
-            text = unescape(pm.group(1)).strip()
+        for pm in re.finditer(r'(<p[^>]*>)([^<]*)</p>', block):
+            open_tag, inner = pm.group(1), pm.group(2)
+            if re.search(r'\bclass=(["\']?)[^"\'>]*author-type\b', open_tag):
+                continue
+            text = unescape(inner).strip()
             if not text or text == display:
                 continue
             affs.append(text)
@@ -271,12 +298,19 @@ def _parse_references(html):
             if name:
                 authors.append(_normalize_ref_author(name))
 
+        # Skip composite-reference header <li>s that contain only a
+        # <span class=bullet> label (e.g., chemistry papers number
+        # reference 1 as empty header and list the actual citations
+        # under sub-items 1a, 1b, 1c).
+        if not (title or journal or year or authors or doi):
+            continue
+
         refs.append({"": {
             "title": title,
             "journal": journal,
+            "year": year,
             "volume": volume,
             "issue": issue,
-            "year": year,
             "pages": pages,
             "doi": doi,
             "authors": authors,
@@ -362,19 +396,17 @@ def _parse_main_text(html):
 # ---------------------------------------------------------------------------
 
 def parse_article(html):
-    """Parse Wiley HTML into a refs.json-format dict plus main_text."""
+    """Parse Wiley HTML into a papers/*.json-format dict."""
     meta = _parse_metadata(html)
     return {
-        "stem": "",
+        "title": meta["title"],
         "journal": meta["journal"],
+        "year": meta["year"],
         "volume": meta["volume"],
         "issue": meta["issue"],
-        "year": meta["year"],
-        "title": meta["title"],
         "pages": meta["pages"],
         "doi": meta["doi"],
         "authors": _parse_authors(html),
-        "publication_types": [],
-        "references": _parse_references(html),
         "main_text": _parse_main_text(html),
+        "references": _parse_references(html),
     }

@@ -79,13 +79,13 @@ def remove_banners(html):
 # ---------------------------------------------------------------------------
 
 def _parse_metadata(html):
-    """Extract bundled metadata: title, journal, volume, issue, year, pages, doi.
+    """Extract bundled metadata: title, journal, year, volume, issue, pages, doi.
 
     Returns dict with those 7 keys. Each field's output format:
       - title: str
       - journal: ISO abbreviation without trailing period
-      - volume, issue: str (may be empty)
       - year: 4-digit string
+      - volume, issue: str (may be empty)
       - pages: "firstpage-lastpage" or firstpage alone
       - doi: "https://doi.org/..." URL
     """
@@ -106,12 +106,16 @@ def _parse_metadata(html):
     if issue == "N/A":
         issue = ""
 
+    # Book chapters (Methods in Enzymology etc.) set citation_inbook_title
+    # instead of citation_journal_title. Fall back for those.
+    journal = (get_meta(html, "citation_journal_title")
+               or get_meta(html, "citation_inbook_title"))
     return {
         "title": get_meta(html, "citation_title"),
-        "journal": get_meta(html, "citation_journal_title"),
+        "journal": journal,
+        "year": year,
         "volume": get_meta(html, "citation_volume"),
         "issue": issue,
-        "year": year,
         "pages": pages,
         "doi": format_doi(get_meta(html, "citation_doi")),
     }
@@ -232,11 +236,12 @@ def _parse_authors(html):
             rm.group(1)
             for rm in re.finditer(
                 r'<span[^>]*class=["\']?author-ref[^>]*id=["\']?b'
-                r'([Aa][Ff][Ff]\d+)',
+                r'([Aa][Ff]+\d+)',
                 search_area,
             )
         ]
-        # Normalize case: HTML has bAff0005 / baff0005; preload uses aff0005
+        # Normalize case: HTML has bAff0005 / baff0005 (newer) or baf015
+        # (older); preload keys match under the same case/letter form.
         refids = [r.lower() for r in refids]
 
         # Resolve via preload meta (HTML source of truth for affiliations).
@@ -358,14 +363,101 @@ def _parse_host(host_text):
     return journal, volume, year, pages
 
 
+def _parse_other_ref_text(text):
+    """Parse a plain-text reference from <div class=other-ref>.
+
+    Handles two observed Elsevier formats:
+    - Old Cell / dissertation:
+        "Authors (YEAR). Title. Journal Vol, Pages."
+    - Newer Elsevier numbered (prefix "[N]" already stripped by caller):
+        "Authors. Title. Journal, YEAR. Vol(Issue): p. Pages."
+
+    Returns a field dict on partial/full success, or None when the
+    leading "Author (YEAR)" or "Author et al." anchor isn't present
+    (genuinely unstructured refs like Wan-Kobbe in-press citations).
+    """
+    text = re.sub(r"\s+", " ", text).strip().rstrip(".")
+    text = re.sub(r"^\s*\[\d+\]\s*", "", text)
+    text = re.sub(r"^\s*\d+\.\s+(?=[A-Z])", "", text)
+
+    m = re.match(r"^(.+?)\s*\((\d{4})[a-z]?\)[.,]?\s*(.+)$", text)
+    if m:
+        authors_str, year, rest = m.group(1), m.group(2), m.group(3)
+        authors = _parse_other_ref_authors(authors_str)
+        tail = re.search(
+            r"\.\s+((?:[A-Z][\w.\-]*\s*)+?(?:\([^)]*\)\s*)?)(\d+),\s+([\w\-\u2013]+)\s*\.?\s*$",
+            rest,
+        )
+        if tail:
+            return {
+                "title": rest[: tail.start()].rstrip(" .").strip(),
+                "journal": tail.group(1).strip().rstrip(" ."),
+                "year": year,
+                "volume": tail.group(2),
+                "issue": "",
+                "pages": tail.group(3).replace("\u2013", "-"),
+                "authors": authors,
+            }
+        return {
+            "title": rest.rstrip(". ").strip(),
+            "journal": "", "year": year, "volume": "", "issue": "",
+            "pages": "", "authors": authors,
+        }
+
+    m = re.match(
+        r"^(?P<authors>.+?(?:et al\.|\.))\s+"
+        r"(?P<title>.+?)\.\s+"
+        r"(?P<journal>[^,]+?),\s+"
+        r"(?P<year>\d{4})\.\s+"
+        r"(?P<volume>\d+)(?:\((?P<issue>\d+[\w-]*)\))?"
+        r":?\s*(?:p\.\s*)?(?P<pages>[\w\-\u2013]+)\.?\s*$",
+        text,
+    )
+    if m:
+        return {
+            "title": m.group("title").strip(),
+            "journal": m.group("journal").strip().rstrip(" ."),
+            "year": m.group("year"),
+            "volume": m.group("volume"),
+            "issue": m.group("issue") or "",
+            "pages": m.group("pages").replace("\u2013", "-"),
+            "authors": _parse_other_ref_authors(m.group("authors")),
+        }
+    return None
+
+
+def _parse_other_ref_authors(authors_str):
+    """Split an author string like 'Adam, J., Deans, B., and Thacker, J.'
+    into ['Adam J', 'Deans B', 'Thacker J']. Also handles 'Malfatti MC.
+    et al.' (initials-trailing without commas)."""
+    s = authors_str.strip().rstrip(",.")
+    s = re.sub(r",?\s+et\s+al\.?\s*$", "", s, flags=re.IGNORECASE)
+    s = re.sub(r",?\s+and\s+", ", ", s)
+    # Tokenize into "LastName, Initials" pairs. Initials may be "J.",
+    # "J.A.", "M.C." or no-dot "MC".
+    authors = []
+    parts = [p.strip() for p in s.split(",") if p.strip()]
+    i = 0
+    while i < len(parts):
+        surname = parts[i]
+        if i + 1 < len(parts) and re.fullmatch(r"(?:[A-Z]\.?){1,5}", parts[i + 1].replace(" ", "")):
+            authors.append(_format_ref_author(f"{surname} {parts[i + 1]}"))
+            i += 2
+        else:
+            authors.append(_format_ref_author(surname))
+            i += 1
+    return authors
+
+
 def _parse_references(html):
     """Extract the reference list.
 
-    Returns list of {"": {journal, volume, issue, year, title, pages, doi, authors}}.
+    Returns list of {"": {title, journal, year, volume, issue, pages, doi, authors}}.
     Each reference dict uses the same field formats as the main paper, with
     one exception: authors is a list of "LastName IN" strings (plain strings,
     not dicts with affiliation). Empty fields are "". Empty authors is [].
-    Parses structured spans: authors, title, host (journal info), DOI link.
+    Parses structured spans when present; falls back to <div class=other-ref>
+    plain-text parsing for book chapters, software, old-Cell-format refs.
     """
     refs = []
     # Find all reference ol elements (main + supplementary)
@@ -408,6 +500,7 @@ def _parse_references(html):
 
             # Parse host (journal, volume, year, pages)
             journal, volume, year, pages = _parse_host(host_text)
+            issue = ""
 
             # Extract DOI
             doi = ""
@@ -415,16 +508,34 @@ def _parse_references(html):
             if doi_m:
                 doi = unescape(doi_m.group(1))
 
-            # Fallback: if no structured fields, use full text
+            # Fallback: no structured fields → parse <div class=other-ref>
             if not title and not authors_text:
-                title = strip_tags(entry).strip()
+                other_m = re.search(
+                    r'<div[^>]*class="?other-ref"?[^>]*>(.*?)</div>',
+                    entry, re.DOTALL,
+                )
+                if other_m:
+                    other_text = unescape(strip_tags(other_m.group(1))).strip()
+                    parsed = _parse_other_ref_text(other_text)
+                    if parsed:
+                        title = parsed["title"]
+                        journal = parsed["journal"]
+                        volume = parsed["volume"]
+                        issue = parsed["issue"]
+                        year = parsed["year"]
+                        pages = parsed["pages"]
+                        authors = parsed["authors"]
+                    else:
+                        title = other_text
+                else:
+                    title = strip_tags(entry).strip()
 
             refs.append({"": {
                 "title": title,
                 "journal": journal,
-                "volume": volume,
-                "issue": "",
                 "year": year,
+                "volume": volume,
+                "issue": issue,
                 "pages": pages,
                 "doi": doi,
                 "authors": authors,
@@ -775,19 +886,17 @@ def _parse_main_text(html):
 # ---------------------------------------------------------------------------
 
 def parse_article(html):
-    """Parse ScienceDirect HTML into a refs.json-format dict plus main_text."""
+    """Parse ScienceDirect HTML into a papers/*.json-format dict."""
     meta = _parse_metadata(html)
     return {
-        "stem": "",
+        "title": meta["title"],
         "journal": meta["journal"],
+        "year": meta["year"],
         "volume": meta["volume"],
         "issue": meta["issue"],
-        "year": meta["year"],
-        "title": meta["title"],
         "pages": meta["pages"],
         "doi": meta["doi"],
         "authors": _parse_authors(html),
-        "publication_types": [],
-        "references": _parse_references(html),
         "main_text": _parse_main_text(html),
+        "references": _parse_references(html),
     }

@@ -5,6 +5,7 @@ from html import unescape
 
 from ._helpers import (
     _remove_nested_element,
+    affiliation_from_email,
     drop_noise,
     extract_captions,
     format_author_name,
@@ -67,13 +68,13 @@ def remove_banners(html):
 # ---------------------------------------------------------------------------
 
 def _parse_metadata(html):
-    """Extract bundled metadata: title, journal, volume, issue, year, pages, doi.
+    """Extract bundled metadata: title, journal, year, volume, issue, pages, doi.
 
     Returns dict with those 7 keys. Each field's output format:
       - title: str
       - journal: ISO abbreviation without trailing period
-      - volume, issue: str (may be empty)
       - year: 4-digit string
+      - volume, issue: str (may be empty)
       - pages: "firstpage-lastpage" or firstpage alone
       - doi: "https://doi.org/..." URL
     """
@@ -99,9 +100,9 @@ def _parse_metadata(html):
     return {
         "title": title,
         "journal": journal.rstrip(".") if journal else "",
+        "year": year,
         "volume": volume,
         "issue": issue,
-        "year": year,
         "pages": pages,
         "doi": doi,
     }
@@ -180,7 +181,21 @@ def _parse_authors(html):
     if any(a["affiliation"] for a in authors):
         return authors
     # Fallback: parse affiliations from HTML body
-    return _parse_body_affiliations(html, authors)
+    authors = _parse_body_affiliations(html, authors)
+    # Email-domain inference: older CSHLP symposium HTMLs expose the
+    # corresponding author's email (citation_author_email meta) but no
+    # structural affiliation block. When the email maps to a known
+    # academic domain, attribute that institution to authors who
+    # otherwise have no aff. get_meta handles both quoted and unquoted
+    # content values (older CSHLP uses unquoted).
+    if not any(a["affiliation"] for a in authors):
+        email = get_meta(html, "citation_author_email")
+        aff = affiliation_from_email(email)
+        if aff:
+            for a in authors:
+                if not a["affiliation"]:
+                    a["affiliation"] = [aff]
+    return authors
 
 
 # ---------------------------------------------------------------------------
@@ -190,7 +205,7 @@ def _parse_authors(html):
 def _parse_references(html):
     """Extract the reference list.
 
-    Returns list of {"": {journal, volume, issue, year, title, pages, doi, authors}}.
+    Returns list of {"": {title, journal, year, volume, issue, pages, doi, authors}}.
     Each reference dict uses the same field formats as the main paper, with
     one exception: authors is a list of "LastName IN" strings (plain strings,
     not dicts with affiliation). Empty fields are "". Empty authors is [].
@@ -313,9 +328,9 @@ def _parse_references(html):
         refs.append({"": {
             "title": title,
             "journal": journal,
+            "year": year,
             "volume": volume,
             "issue": "",
-            "year": year,
             "pages": pages,
             "doi": doi,
             "authors": authors,
@@ -430,19 +445,17 @@ def _parse_main_text(html):
 # ---------------------------------------------------------------------------
 
 def parse_article(html):
-    """Parse CSHLP HTML into a refs.json-format dict plus main_text."""
+    """Parse CSHLP HTML into a papers/*.json-format dict."""
     meta = _parse_metadata(html)
     return {
-        "stem": "",
+        "title": meta["title"],
         "journal": meta["journal"],
+        "year": meta["year"],
         "volume": meta["volume"],
         "issue": meta["issue"],
-        "year": meta["year"],
-        "title": meta["title"],
         "pages": meta["pages"],
         "doi": meta["doi"],
         "authors": _parse_authors(html),
-        "publication_types": [],
-        "references": _parse_references(html),
         "main_text": _parse_main_text(html),
+        "references": _parse_references(html),
     }

@@ -51,7 +51,7 @@ def remove_banners(html):
 # ---------------------------------------------------------------------------
 
 def _parse_metadata(html):
-    """Extract bundled metadata: title, journal, volume, issue, year, pages, doi.
+    """Extract bundled metadata: title, journal, year, volume, issue, pages, doi.
 
     Uses standard citation_* meta tags. The journal title in citation_journal_title
     may contain "(Albany NY)" etc.; rstrip trailing period only.
@@ -73,9 +73,9 @@ def _parse_metadata(html):
     return {
         "title": get_meta(html, "citation_title"),
         "journal": journal,
+        "year": year,
         "volume": get_meta(html, "citation_volume"),
         "issue": get_meta(html, "citation_issue"),
-        "year": year,
         "pages": pages,
         "doi": format_doi(get_meta(html, "citation_doi")),
     }
@@ -141,7 +141,7 @@ def _parse_ref_text(text):
       "Author1, Author2 and Author3. Title. Journal. Year; Volume:Pages."
     or:
       "Author1 Title. Journal. Year; Volume:Pages."  (older, no period after authors)
-    Returns dict with journal/volume/issue/year/title/pages/doi/authors.
+    Returns dict with title/journal/year/volume/issue/pages/doi/authors.
     """
     # Normalize whitespace
     text = re.sub(r'\s+', ' ', text).strip()
@@ -149,8 +149,8 @@ def _parse_ref_text(text):
     text = re.sub(r'\[\s*PubMed\s*\]\s*\.?$', '', text).strip()
 
     result = {
-        "title": "", "journal": "", "volume": "", "issue": "",
-        "year": "", "pages": "", "doi": "", "authors": [],
+        "title": "", "journal": "", "year": "", "volume": "", "issue": "",
+        "pages": "", "doi": "", "authors": [],
     }
 
     # Year/volume/pages: " YYYY; VOLUME:PAGES"  (pages may be "X-Y" or single page)
@@ -339,19 +339,17 @@ def _parse_main_text(html):
 # ---------------------------------------------------------------------------
 
 def parse_article(html):
-    """Parse aging-us HTML into a refs.json-format dict plus main_text."""
+    """Parse aging-us HTML into a papers/*.json-format dict."""
     meta = _parse_metadata(html)
     return {
-        "stem": "",
+        "title": meta["title"],
         "journal": meta["journal"],
+        "year": meta["year"],
         "volume": meta["volume"],
         "issue": meta["issue"],
-        "year": meta["year"],
-        "title": meta["title"],
         "pages": meta["pages"],
         "doi": meta["doi"],
         "authors": _parse_authors(html),
-        "publication_types": [],
-        "references": _parse_references(html),
         "main_text": _parse_main_text(html),
+        "references": _parse_references(html),
     }

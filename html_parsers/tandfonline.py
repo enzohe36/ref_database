@@ -8,6 +8,7 @@ import urllib.parse
 from html import unescape
 
 from ._helpers import (
+    affiliation_from_email,
     drop_noise,
     extract_captions,
     format_author_name,
@@ -120,13 +121,13 @@ def _parse_title(html):
 
 
 def _parse_metadata(html):
-    """Extract bundled metadata: title, journal, volume, issue, year, pages, doi.
+    """Extract bundled metadata: title, journal, year, volume, issue, pages, doi.
 
     Returns dict with those 7 keys. Each field's output format:
       - title: str
       - journal: ISO abbreviation without trailing period
-      - volume, issue: str (may be empty)
       - year: 4-digit string
+      - volume, issue: str (may be empty)
       - pages: "firstpage-lastpage" or firstpage alone
       - doi: "https://doi.org/..." URL
     Tandfonline-specific: uses dc.Date for year, issue-heading span for volume
@@ -157,9 +158,9 @@ def _parse_metadata(html):
     return {
         "title": _parse_title(html),
         "journal": _get_meta(html, "citation_journal_title"),
+        "year": year,
         "volume": volume,
         "issue": issue,
-        "year": year,
         "pages": pages,
         "doi": format_doi(doi),
     }
@@ -240,6 +241,17 @@ def _parse_authors(html):
                 parts = re.split(r'\s*;\s*', aff_text)
                 affiliations = [p.strip() for p in parts if p.strip()]
 
+        # Email-domain inference: older T&F Cell Cycle HTML exposes only
+        # the corresponding-author email in the overlay, not a structured
+        # affiliation block. Fall back to the known-domain map so
+        # authors from major academic institutions still get an aff.
+        if not affiliations:
+            for em in re.finditer(r'mailto:([^"\'\s>]+)', block):
+                aff = affiliation_from_email(em.group(1))
+                if aff:
+                    affiliations = [aff]
+                    break
+
         authors.append({
             "author": author,
             "affiliation": affiliations,
@@ -260,7 +272,7 @@ def _flip_ref_author(name):
 def _parse_references(html):
     """Extract the reference list.
 
-    Returns list of {"": {journal, volume, issue, year, title, pages, doi, authors}}.
+    Returns list of {"": {title, journal, year, volume, issue, pages, doi, authors}}.
     Each reference dict uses the same field formats as the main paper, with
     one exception: authors is a list of "LastName IN" strings (plain strings,
     not dicts with affiliation). Empty fields are "". Empty authors is [].
@@ -324,9 +336,9 @@ def _parse_references(html):
             ref = {
                 "title": params.get("title", [""])[0],
                 "journal": params.get("journal", [""])[0],
+                "year": params.get("publication_year", [""])[0],
                 "volume": params.get("volume", [""])[0],
                 "issue": issue,
-                "year": params.get("publication_year", [""])[0],
                 "pages": params.get("pages", [""])[0].replace("\u2013", "-"),
                 "doi": ref_doi,
                 "authors": [
@@ -340,9 +352,9 @@ def _parse_references(html):
             ref = {
                 "title": cite_text,
                 "journal": "",
+                "year": "",
                 "volume": "",
                 "issue": "",
-                "year": "",
                 "pages": "",
                 "doi": ref_doi,
                 "authors": [],
@@ -469,19 +481,17 @@ def _parse_main_text(html):
 # ---------------------------------------------------------------------------
 
 def parse_article(html):
-    """Parse tandfonline HTML into a refs.json-format dict plus main_text."""
+    """Parse tandfonline HTML into a papers/*.json-format dict."""
     meta = _parse_metadata(html)
     return {
-        "stem": "",
+        "title": meta["title"],
         "journal": meta["journal"],
+        "year": meta["year"],
         "volume": meta["volume"],
         "issue": meta["issue"],
-        "year": meta["year"],
-        "title": meta["title"],
         "pages": meta["pages"],
         "doi": meta["doi"],
         "authors": _parse_authors(html),
-        "publication_types": [],
-        "references": _parse_references(html),
         "main_text": _parse_main_text(html),
+        "references": _parse_references(html),
     }

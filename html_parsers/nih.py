@@ -92,13 +92,13 @@ def _parse_cite_line(html):
 
 
 def _parse_metadata(html):
-    """Extract bundled metadata: title, journal, volume, issue, year, pages, doi.
+    """Extract bundled metadata: title, journal, year, volume, issue, pages, doi.
 
     Returns dict with those 7 keys. Each field's output format:
       - title: str
       - journal: ISO abbreviation without trailing period
-      - volume, issue: str (may be empty)
       - year: 4-digit string
+      - volume, issue: str (may be empty)
       - pages: "firstpage-lastpage" or firstpage alone
       - doi: "https://doi.org/..." URL
     PMC-specific: journal and pages fall back to the inline citation line
@@ -124,9 +124,9 @@ def _parse_metadata(html):
     return {
         "title": get_meta(html, "citation_title"),
         "journal": journal,
+        "year": year,
         "volume": get_meta(html, "citation_volume"),
         "issue": get_meta(html, "citation_issue"),
-        "year": year,
         "pages": pages,
         "doi": format_doi(get_meta(html, "citation_doi")),
     }
@@ -327,8 +327,8 @@ def _parse_cite(cite_text):
 
     Uses the full <cite> text so author lists aren't truncated (Scholar
     URLs carry only the first 5 author params and can cross reference
-    boundaries). Returns dict with authors/title/journal/year/volume/
-    issue/pages/doi; missing fields are empty.
+    boundaries). Returns dict with title/journal/year/volume/issue/
+    pages/doi/authors; missing fields are empty.
     """
     text = re.sub(r"\s+", " ", cite_text.strip())
     doi = ""
@@ -405,17 +405,17 @@ def _parse_cite(cite_text):
     else:
         return {
             "title": text.rstrip("."),
-            "journal": "", "volume": "", "issue": "", "year": "",
-            "pages": "", "doi": format_doi(doi) if doi else "",
+            "journal": "", "year": "",
+            "volume": "", "issue": "", "pages": "", "doi": format_doi(doi) if doi else "",
             "authors": [],
         }
 
     return {
         "title": title,
         "journal": journal,
+        "year": year,
         "volume": volume,
         "issue": issue,
-        "year": year,
         "pages": pages,
         "doi": format_doi(doi) if doi else "",
         "authors": _parse_cite_authors(author_section),
@@ -430,13 +430,13 @@ def _flip_scholar_author(name):
 def _parse_references(html):
     """Extract the reference list.
 
-    Returns list of {"": {journal, volume, issue, year, title, pages, doi, authors}}.
+    Returns list of {"": {title, journal, year, volume, issue, pages, doi, authors}}.
     Each reference dict uses the same field formats as the main paper, with
     one exception: authors is a list of "LastName IN" strings (plain strings,
     not dicts with affiliation). Empty fields are "". Empty authors is [].
 
     Hybrid source strategy:
-    - Structured fields (title, journal, volume, issue, year, pages, doi)
+    - Structured fields (title, journal, year, volume, issue, pages, doi)
       prefer Google Scholar lookup URL when present (well-formed and
       scoped per <li>). Fall back to <cite> parsing.
     - Authors always pulled from <cite> first because Scholar URLs cap
@@ -500,9 +500,9 @@ def _parse_references(html):
             ref = {
                 "title": params.get("title", [""])[0],
                 "journal": journal,
+                "year": params.get("publication_year", [""])[0],
                 "volume": params.get("volume", [""])[0],
                 "issue": params.get("issue", [""])[0],
-                "year": params.get("publication_year", [""])[0],
                 "pages": params.get("pages", [""])[0],
                 "doi": format_doi(params.get("doi", [""])[0]),
                 "authors": authors,
@@ -511,8 +511,8 @@ def _parse_references(html):
             ref = cite_parsed
         else:
             ref = {
-                "title": "", "journal": "", "volume": "", "issue": "",
-                "year": "", "pages": "", "doi": "", "authors": [],
+                "title": "", "journal": "", "year": "", "volume": "", "issue": "",
+                "pages": "", "doi": "", "authors": [],
             }
 
         refs.append({"": ref})
@@ -628,19 +628,17 @@ def _parse_main_text(html):
 # ---------------------------------------------------------------------------
 
 def parse_article(html):
-    """Parse PMC HTML into a refs.json-format dict plus main_text."""
+    """Parse PMC HTML into a papers/*.json-format dict."""
     meta = _parse_metadata(html)
     return {
-        "stem": "",
+        "title": meta["title"],
         "journal": meta["journal"],
+        "year": meta["year"],
         "volume": meta["volume"],
         "issue": meta["issue"],
-        "year": meta["year"],
-        "title": meta["title"],
         "pages": meta["pages"],
         "doi": meta["doi"],
         "authors": _parse_authors(html),
-        "publication_types": [],
-        "references": _parse_references(html),
         "main_text": _parse_main_text(html),
+        "references": _parse_references(html),
     }

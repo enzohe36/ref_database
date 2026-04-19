@@ -5,6 +5,7 @@ from html import unescape
 
 from ._helpers import (
     _remove_nested_element,
+    affiliation_from_email,
     drop_noise,
     extract_captions,
     format_author_name,
@@ -60,7 +61,7 @@ def remove_banners(html):
 # ---------------------------------------------------------------------------
 
 def _parse_metadata(html):
-    """Extract bundled metadata: title, journal, volume, issue, year, pages, doi.
+    """Extract bundled metadata: title, journal, year, volume, issue, pages, doi.
 
     Uses standard citation_* meta tags.
     """
@@ -92,9 +93,9 @@ def _parse_metadata(html):
     return {
         "title": get_meta(html, "citation_title"),
         "journal": journal,
+        "year": year,
         "volume": get_meta(html, "citation_volume"),
         "issue": issue,
-        "year": year,
         "pages": pages,
         "doi": format_doi(get_meta(html, "citation_doi")),
     }
@@ -113,6 +114,9 @@ def _display_to_initials(name):
     return format_author_name(name)
 
 
+_CURRENT_ADDRESS_RE = re.compile(r"^\W*\d*\s*current\s*address\s*:", re.IGNORECASE)
+
+
 def _parse_authors(html):
     """Extract authors with affiliations.
 
@@ -121,14 +125,37 @@ def _parse_authors(html):
     Reviews stores names as "Given Last" (first-last), not "Last, Given",
     so convert via display-to-initials helper instead of format_author_name
     directly (which expects a comma).
+
+    Drops 'Current address:' note-style institutions that publishers
+    sometimes emit in place of the primary affiliation — for these,
+    falls back to email-domain inference so the primary lab is
+    attributed instead of a post-publication relocation note.
     """
-    return [
-        {
+    authors = []
+    for a in parse_meta_authors(html):
+        affs = [
+            af for af in a.get("affiliations", [])
+            if not _CURRENT_ADDRESS_RE.match(af)
+        ]
+        authors.append({
             "author": _display_to_initials(a["name"]),
-            "affiliation": a.get("affiliations", []),
-        }
-        for a in parse_meta_authors(html)
-    ]
+            "affiliation": affs,
+        })
+    # Email-domain inference for authors left with no aff after the
+    # current-address filter. Pulls the correspondence email from the
+    # HTML body (mailto: links) since Annual Reviews rarely sets
+    # citation_author_email meta.
+    if any(not a["affiliation"] for a in authors):
+        body_email = ""
+        em = re.search(r"mailto:([^\"'\s>]+)", html)
+        if em:
+            body_email = em.group(1)
+        aff = affiliation_from_email(body_email)
+        if aff:
+            for a in authors:
+                if not a["affiliation"]:
+                    a["affiliation"] = [aff]
+    return authors
 
 
 # ---------------------------------------------------------------------------
@@ -228,9 +255,9 @@ def _parse_references(html):
         refs.append({"": {
             "title": title,
             "journal": journal,
+            "year": year,
             "volume": volume,
             "issue": "",
-            "year": year,
             "pages": pages,
             "doi": doi,
             "authors": authors,
@@ -293,19 +320,17 @@ def _parse_main_text(html):
 # ---------------------------------------------------------------------------
 
 def parse_article(html):
-    """Parse Annual Reviews HTML into a refs.json-format dict plus main_text."""
+    """Parse Annual Reviews HTML into a papers/*.json-format dict."""
     meta = _parse_metadata(html)
     return {
-        "stem": "",
+        "title": meta["title"],
         "journal": meta["journal"],
+        "year": meta["year"],
         "volume": meta["volume"],
         "issue": meta["issue"],
-        "year": meta["year"],
-        "title": meta["title"],
         "pages": meta["pages"],
         "doi": meta["doi"],
         "authors": _parse_authors(html),
-        "publication_types": [],
-        "references": _parse_references(html),
         "main_text": _parse_main_text(html),
+        "references": _parse_references(html),
     }
