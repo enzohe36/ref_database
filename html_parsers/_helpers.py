@@ -252,10 +252,20 @@ def _remove_nested_element(html, start_pattern):
 
 
 def remove_elements_by_id(html, *ids):
-    """Remove HTML elements by id. Handles nested content."""
+    """Remove HTML elements by id. Handles nested content.
+
+    Requires a word-or-quote boundary after the id value so that
+    `remove_elements_by_id(html, "footer")` does not also match
+    `id=footersearch` (unquoted ids where the target is a prefix of
+    the actual id). Quoted ids are anchored by the closing quote;
+    unquoted ids are anchored by a word boundary (which also covers
+    trailing whitespace, `>`, or attribute separators).
+    """
     for eid in ids:
         html = _remove_nested_element(
-            html, rf'<\w+[^>]*\bid=["\']?{re.escape(eid)}["\']?[^>]*>'
+            html,
+            rf'<\w+[^>]*\bid=(?:"{re.escape(eid)}"|\'{re.escape(eid)}\'|'
+            rf'{re.escape(eid)}\b)[^>]*>',
         )
     return html
 
@@ -272,26 +282,30 @@ def remove_elements_by_selector(html, *selectors):
 def _meta_content_pattern(name):
     """Build regex patterns for <meta name=X content=Y> in both orders,
     handling quoted and unquoted attribute values, and other attributes
-    interleaved between name and content (e.g. scheme=WTN8601)."""
+    interleaved between name and content (e.g. scheme=WTN8601).
+
+    Quoted values use separate patterns per quote type so that an inner
+    apostrophe inside a double-quoted value (e.g. content="Slice'N'Dice")
+    is not mistaken for the closing quote.
+    """
     esc = re.escape(name)
-    # content value: quoted or unquoted (ends at space or >)
-    val_q = r'["\']([^"\']*)["\']'
+    # content value: double- or single-quoted (match only the same quote on
+    # both sides), or unquoted (ends at space or >).
+    val_qd = r'"([^"]*)"'
+    val_qs = r"'([^']*)'"
     val_u = r'([^\s>]+)'
     # name can be quoted or unquoted; require word boundary at end so
     # "dc.Date" doesn't also match "dc.DateAccepted".
     name_pat = rf'["\']?{esc}\b["\']?'
     # Inter-attribute separator: any chars not breaking out of the tag
     sep = r'[^>]*?\s'
-    return [
-        # name then content, quoted
-        rf'<meta[^>]*name={name_pat}{sep}content={val_q}',
-        # content then name, quoted
-        rf'<meta[^>]*content={val_q}{sep}name={name_pat}',
-        # name then content, unquoted
-        rf'<meta[^>]*name={name_pat}{sep}content={val_u}',
-        # content then name, unquoted
-        rf'<meta[^>]*content={val_u}{sep}name={name_pat}',
-    ]
+    pats = []
+    for vq in (val_qd, val_qs):
+        pats.append(rf'<meta[^>]*name={name_pat}{sep}content={vq}')
+        pats.append(rf'<meta[^>]*content={vq}{sep}name={name_pat}')
+    pats.append(rf'<meta[^>]*name={name_pat}{sep}content={val_u}')
+    pats.append(rf'<meta[^>]*content={val_u}{sep}name={name_pat}')
+    return pats
 
 
 def get_meta(html, name):
@@ -308,14 +322,17 @@ def get_all_meta(html, name):
 
     Only uses quoted-value patterns to avoid false matches from
     unquoted patterns re-matching inside quoted attribute values.
+    Double- and single-quoted patterns are tried separately so apostrophes
+    inside double-quoted values are not treated as closing quotes.
     """
     esc = re.escape(name)
     name_pat = rf'["\']?{esc}["\']?'
-    val_q = r'["\']([^"\']*)["\']'
-    patterns = [
-        rf'<meta[^>]*name={name_pat}\s+content={val_q}',
-        rf'<meta[^>]*content={val_q}[^>]*name={name_pat}',
-    ]
+    val_qd = r'"([^"]*)"'
+    val_qs = r"'([^']*)'"
+    patterns = []
+    for vq in (val_qd, val_qs):
+        patterns.append(rf'<meta[^>]*name={name_pat}\s+content={vq}')
+        patterns.append(rf'<meta[^>]*content={vq}[^>]*name={name_pat}')
     values = []
     seen = set()
     for pat in patterns:
@@ -354,11 +371,20 @@ _SURNAME_PREFIXES = frozenset({
 
 # Generational suffixes and titles stripped from the tail of combined
 # names before surname detection ("JR Yates III" -> surname "Yates",
-# "Smith Jr." -> surname "Smith").
+# "Smith Jr." -> surname "Smith", "Yates 3rd" -> surname "Yates").
 _NAME_SUFFIXES = frozenset({
     "jr", "sr", "ii", "iii", "iv", "v",
     "phd", "md", "dr",
 })
+# Ordinal digit suffixes ("2nd", "3rd", "4th", ...) matched via regex so
+# arbitrary values are covered without enumerating them.
+_ORDINAL_SUFFIX_RE = re.compile(r"^\d+(?:st|nd|rd|th)$")
+
+
+def _is_name_suffix(tok):
+    """True if tok is a generational suffix (Jr, Sr, III, 3rd, PhD, ...)."""
+    norm = tok.rstrip(".").lower()
+    return norm in _NAME_SUFFIXES or bool(_ORDINAL_SUFFIX_RE.match(norm))
 
 # Academic honorifics stripped from the head of combined names so they
 # don't leak into initials ("Prof. Ming-De Li" -> "Ming-De Li" -> "Li MD",
@@ -393,13 +419,14 @@ def _is_surname_prefix(tok):
     return False
 
 
-def format_name(given, surname):
-    """Build canonical 'Surname IN' from an explicit given/surname pair.
+def format_name(given, surname, suffix=""):
+    """Build canonical 'Surname IN [Suffix]' from an explicit given/surname pair.
 
     This is the only function in the codebase that builds initials.
     Given is split on whitespace, ASCII hyphen, Unicode hyphens
     (U+2010–U+2013), and periods; the first alphabetic character of
-    each part contributes one initial.
+    each part contributes one initial. Optional suffix (Jr, III, 3rd,
+    ...) is appended verbatim after the initials.
 
     Examples:
       format_name("Jean-Baptiste", "Boulé")      -> "Boulé JB"
@@ -408,11 +435,15 @@ def format_name(given, surname):
       format_name("Mariarosaria", "de Rosa")     -> "de Rosa M"
       format_name("", "Smith")                   -> "Smith"
       format_name("JA", "Smith")                 -> "Smith JA"
+      format_name("John", "Smith", "Jr")         -> "Smith J Jr"
+      format_name("JR", "Yates", "III")          -> "Yates JR III"
     """
     given = _normalize_unicode(given or "").strip()
     surname = _normalize_unicode(surname or "").strip().rstrip(",")
+    suffix = (suffix or "").strip().rstrip(",.").strip()
+    tail = f" {suffix}" if suffix else ""
     if not given:
-        return surname
+        return surname + tail if surname else tail.lstrip()
 
     # Whitespace-separated tokens only count when they start with a
     # capital (so surname particles like 'de'/'van' in 'Mary de Rosa'
@@ -441,14 +472,14 @@ def format_name(given, surname):
     # aligned with refs.json.
     initials = initials[:2]
     if not initials:
-        return surname
+        return surname + tail if surname else tail.lstrip()
     if not surname:
-        return initials
-    return f"{surname} {initials}"
+        return initials + tail
+    return f"{surname} {initials}{tail}"
 
 
 def parse_combined_name(name):
-    """Split a combined author-name string into (given, surname).
+    """Split a combined author-name string into (given, surname, suffix).
 
     Handles three input shapes:
       - 'Last, Given'      -> unambiguous comma split
@@ -459,25 +490,25 @@ def parse_combined_name(name):
                               token is a known surname prefix (de, van,
                               nick, d', etc.)
 
-    Trailing suffixes (Jr., III, PhD, ...) are stripped before surname
-    detection. Returns ('', '') for empty input, ('', name) for a
+    Trailing/interior suffixes (Jr., III, PhD, 3rd, ...) are stripped
+    before surname detection and returned as the third element.
+    Returns ('', '', '') for empty input, ('', name, '') for a
     single-token input.
 
     Examples:
-      parse_combined_name("Barnes, Ryan P.")       -> ("Ryan P.", "Barnes")
-      parse_combined_name("Jean-Baptiste Boulé")   -> ("Jean-Baptiste", "Boulé")
-      parse_combined_name("Titia de Lange")        -> ("Titia", "de Lange")
-      parse_combined_name("Aziz El Hage")          -> ("Aziz", "El Hage")
-      parse_combined_name("Scott A. Nick McElhinny") -> ("Scott A.", "Nick McElhinny")
-      parse_combined_name("Fabrizio d'Adda di Fagagna") -> ("Fabrizio", "d'Adda di Fagagna")
-      parse_combined_name("JD Griffith")           -> ("JD", "Griffith")
-      parse_combined_name("JR Yates III")          -> ("JR", "Yates")
+      parse_combined_name("Barnes, Ryan P.")       -> ("Ryan P.", "Barnes", "")
+      parse_combined_name("Jean-Baptiste Boulé")   -> ("Jean-Baptiste", "Boulé", "")
+      parse_combined_name("Titia de Lange")        -> ("Titia", "de Lange", "")
+      parse_combined_name("JR Yates III")          -> ("JR", "Yates", "III")
+      parse_combined_name("Smith, John Jr.")       -> ("John", "Smith", "Jr")
+      parse_combined_name("Yates 3rd JR")          -> ("JR", "Yates", "3rd")
     """
     if not name:
-        return ("", "")
+        return ("", "", "")
     name = _normalize_unicode(name).strip().strip(",").strip()
     if not name:
-        return ("", "")
+        return ("", "", "")
+    suffix = ""
 
     # Strip trailing suffix tokens from the whole string before shape
     # detection. Handles the 'Given Last, Suffix' form ('Thomas E.
@@ -490,12 +521,27 @@ def parse_combined_name(name):
         tok_m = re.search(r"[\s,]+(\S+)$", stripped)
         if not tok_m:
             break
-        tok = tok_m.group(1).rstrip(".").lower()
-        if tok not in _NAME_SUFFIXES:
+        raw_tok = tok_m.group(1)
+        # Single letter followed by a period is an initial, not a suffix
+        # ("Grishin N. V.", "Uski V." — trailing "V." is initial V, not
+        # Roman V).
+        if (len(raw_tok.rstrip(".")) == 1 and raw_tok.endswith(".")
+                and raw_tok[0].isalpha()):
             break
+        # All-caps 1-2 letter tokens without a period are canonical
+        # initials on already-formatted names ("Lakey JR", author MD
+        # pair), not Jr./MD. suffixes. Real word suffixes carry a
+        # period or are longer (Jr. / PhD. / III).
+        if (raw_tok.isalpha() and raw_tok.isupper()
+                and 1 <= len(raw_tok) <= 2):
+            break
+        if not _is_name_suffix(raw_tok):
+            break
+        if not suffix:
+            suffix = raw_tok.rstrip(",.").strip()
         name = stripped[:tok_m.start()].rstrip().rstrip(",").rstrip()
     if not name:
-        return ("", "")
+        return ("", "", "")
 
     # Shape 1: 'Last, Given' — comma is unambiguous. Dutch/Portuguese
     # convention trails the surname prefix on the given side (e.g.
@@ -511,10 +557,14 @@ def parse_combined_name(name):
         # Jr.' puts it in the given. Either way it shouldn't leak
         # into the initials or surname output.
         last_tokens = last.split()
-        while last_tokens and last_tokens[-1].rstrip(".").lower() in _NAME_SUFFIXES:
+        while last_tokens and _is_name_suffix(last_tokens[-1]):
+            if not suffix:
+                suffix = last_tokens[-1].rstrip(",.").strip()
             last_tokens.pop()
         last = " ".join(last_tokens)
-        while given_tokens and given_tokens[-1].rstrip(".").lower() in _NAME_SUFFIXES:
+        while given_tokens and _is_name_suffix(given_tokens[-1]):
+            if not suffix:
+                suffix = given_tokens[-1].rstrip(",.").strip()
             given_tokens.pop()
         # Absorb trailing particle tokens back into the surname, but only
         # if a given name would remain. Without this guard, 'Gui, Bin'
@@ -540,22 +590,52 @@ def parse_combined_name(name):
                 given_tokens.extend(last_tokens[:i])
                 last = " ".join(last_tokens[i:])
                 break
-        return (" ".join(given_tokens), last)
+        return (" ".join(given_tokens), last, suffix)
 
     tokens = name.split()
     if not tokens:
-        return ("", "")
+        return ("", "", suffix)
     if len(tokens) == 1:
-        return ("", tokens[0])
+        return ("", tokens[0], suffix)
 
     # Strip leading honorifics (Prof., Dr., Mr., ...) and trailing
-    # suffix tokens (Jr., III, PhD, ...).
+    # suffix tokens (Jr., III, PhD, ...). Single-letter-with-period tokens
+    # ("N.", "V.") are initials, not Roman-numeral suffixes, so skip those.
     while len(tokens) > 1 and tokens[0].rstrip(".").lower() in _NAME_HONORIFICS:
         tokens.pop(0)
-    while len(tokens) > 1 and tokens[-1].rstrip(".").lower() in _NAME_SUFFIXES:
+    while len(tokens) > 1:
+        tail = tokens[-1]
+        if (len(tail.rstrip(".")) == 1 and tail.endswith(".")
+                and tail[0].isalpha()):
+            break
+        if (tail.isalpha() and tail.isupper() and 1 <= len(tail) <= 2):
+            break
+        if not _is_name_suffix(tail):
+            break
+        if not suffix:
+            suffix = tail.rstrip(",.").strip()
         tokens.pop()
+    # Also strip interior suffix tokens sandwiched between surname and
+    # initials ('Yates 3rd JR' → ['Yates','JR']). Ordinal/generational
+    # suffix tokens ("2nd", "3rd", "Jr", "III", "PhD", ...) are never
+    # part of the surname proper. Single-letter-with-period ("N.") and
+    # all-caps 1-2 letter tokens ("JR") are preserved via the same
+    # initials-vs-suffix tests used in the trailing loop above.
+    new_tokens = []
+    for t in tokens:
+        if (len(t.rstrip(".")) == 1 and t.endswith(".") and t[0].isalpha()):
+            new_tokens.append(t)
+        elif t.isalpha() and t.isupper() and 1 <= len(t) <= 2:
+            new_tokens.append(t)
+        elif not _is_name_suffix(t):
+            new_tokens.append(t)
+        elif not suffix:
+            suffix = t.rstrip(",.").strip()
+    tokens = new_tokens
     if len(tokens) == 1:
-        return ("", tokens[0])
+        return ("", tokens[0], suffix)
+    if not tokens:
+        return ("", "", suffix)
 
     # Shape 2a: 'Last Initials' — trailing tokens are initials
     # (e.g. 'Smith J A', 'Boulé F. M.', IUCr 'Last F. M.').
@@ -563,7 +643,7 @@ def parse_combined_name(name):
     while j > 0 and _is_initials_token(tokens[j - 1]):
         j -= 1
     if 0 < j < len(tokens):
-        return (" ".join(tokens[j:]), " ".join(tokens[:j]))
+        return (" ".join(tokens[j:]), " ".join(tokens[:j]), suffix)
 
     # Shape 2b: 'Initials Last' — leading tokens are all-upper initials
     # (e.g. 'JD Griffith', 'J.D. Griffith'). Only fires with exactly two
@@ -580,7 +660,7 @@ def parse_combined_name(name):
                 break
             i += 1
         if 0 < i < len(tokens) and (i >= 2 or len(tokens) == 2):
-            return (" ".join(tokens[:i]), " ".join(tokens[i:]))
+            return (" ".join(tokens[:i]), " ".join(tokens[i:]), suffix)
 
     # Shape 3: 'Given Last' — surname starts at the last token and
     # extends left across any compound-surname prefixes. Stop before
@@ -590,18 +670,18 @@ def parse_combined_name(name):
     i = len(tokens) - 1
     while i > 1 and _is_surname_prefix(tokens[i - 1]):
         i -= 1
-    return (" ".join(tokens[:i]), " ".join(tokens[i:]))
+    return (" ".join(tokens[:i]), " ".join(tokens[i:]), suffix)
 
 
 def format_author_name(name):
-    """Legacy adapter: format a single combined name string to 'Surname IN'.
+    """Legacy adapter: format a single combined name string to 'Surname IN [Suffix]'.
 
     Equivalent to: format_name(*parse_combined_name(name)).
     Prefer calling format_name directly when the parser has access to
     a separate given/surname pair from the HTML source.
     """
-    given, surname = parse_combined_name(name)
-    return format_name(given, surname)
+    given, surname, suffix = parse_combined_name(name)
+    return format_name(given, surname, suffix)
 
 
 # Mapping from academic email domains to the canonical institution name
@@ -689,3 +769,124 @@ def parse_meta_authors(html):
     if current is not None:
         authors.append(current)
     return authors
+
+
+# ---------------------------------------------------------------------------
+# Media-query neutralizer
+# ---------------------------------------------------------------------------
+# Lock the publisher's CSS to its narrow (≤ 1024 px) layout regardless of the
+# viewer's actual viewport. Two transforms applied to viewport-width @media:
+#   1. `@media (min-width: N) { rules }` for N ≥ 1025 — entire block deleted
+#      (desktop rules never fire).
+#   2. `@media (max-width: N) { rules }` for N ≥ 720 — `@media` wrapper
+#      stripped, leaving rules unconditional (narrow rules always fire).
+# Other media queries (orientation, prefers-color-scheme, print, mobile-only
+# breakpoints below MAX_NARROW, mixed-feature ranges) are left intact.
+#
+# Use when piecemeal CSS overrides multiply (display / padding / pseudo-content
+# rules per-element) — the neutralizer collapses all viewport-gated layout
+# differences into one transform. See
+# `.claude/skills/format-html/scripts/neutralize_media.py` for the standalone
+# reference implementation.
+
+# Threshold reasoning relative to the vw=720 reference (per format-html
+# target). `@media (min-width: N)` fires only when vw >= N — so MIN_DESKTOP=721
+# deletes every block whose threshold is above 720 (rule does NOT fire at the
+# reference). Catches publishers using 768 / 992 / 1024 as desktop breakpoint
+# in addition to the 1025+ ones. `@media (max-width: N)` fires when vw <= N —
+# so MAX_NARROW=720 unwraps every block at-or-above 720 (rule DOES fire at the
+# reference) so it applies unconditionally at wider viewports too.
+_MEDIA_THRESH_MIN_DESKTOP = 721
+_MEDIA_THRESH_MAX_NARROW = 720
+_MEDIA_RE = re.compile(r"@media\b([^{]+)\{", re.IGNORECASE)
+_STYLE_BLOCK_RE = re.compile(r"(<style\b[^>]*>)(.*?)(</style\s*>)", re.DOTALL | re.IGNORECASE)
+_FEATURE_NW_RE = re.compile(
+    r"\(\s*(min-width|max-width|min-device-width|max-device-width)"
+    r"\s*:\s*(\d+)(?:px|em|rem)?\s*\)",
+    re.IGNORECASE,
+)
+
+
+def _scan_balanced_block(text, open_idx):
+    """Return the index just past the matching `}` for `{` at open_idx."""
+    depth = 1
+    i = open_idx + 1
+    n = len(text)
+    while i < n:
+        c = text[i]
+        if c in '"\'':
+            quote = c
+            i += 1
+            while i < n and text[i] != quote:
+                i += 2 if text[i] == "\\" else 1
+            i += 1
+        elif c == "{":
+            depth += 1
+            i += 1
+        elif c == "}":
+            depth -= 1
+            i += 1
+            if depth == 0:
+                return i
+        else:
+            i += 1
+    return -1
+
+
+def _neutralize_css(css):
+    out = []
+    pos = 0
+    while True:
+        m = _MEDIA_RE.search(css, pos)
+        if not m:
+            out.append(css[pos:])
+            break
+        out.append(css[pos:m.start()])
+        feat = m.group(1)
+        body_start = m.end()
+        body_end = _scan_balanced_block(css, body_start - 1)
+        if body_end == -1:
+            out.append(css[m.start():])
+            break
+        rules = css[body_start:body_end - 1]
+        next_pos = body_end
+        # Strip width/device-width features (handled below) and ignorable
+        # features that don't affect viewport-width gating (orientation,
+        # prefers-*, print, pixel-ratio, hover). Whatever's left in
+        # feat_clean is an unrecognized feature; in that case leave the
+        # block alone to avoid breaking rules we don't understand.
+        feat_clean = _FEATURE_NW_RE.sub("", feat)
+        feat_clean = re.sub(
+            r"\(\s*(?:orientation|prefers-[\w-]+|hover|pointer|"
+            r"-webkit-min-device-pixel-ratio|min-resolution|max-resolution"
+            r")\s*:\s*[^)]+\)|"
+            r"\bprint\b|"
+            r"\b(?:and|only|or|not|screen|all)\b|,",
+            "", feat_clean, flags=re.IGNORECASE,
+        ).strip()
+        widths = _FEATURE_NW_RE.findall(feat)
+        # Combine all min-* and max-* features (treat min-device-width same
+        # as min-width for our viewport-targeting purposes).
+        mins = [int(v) for k, v in widths if k.lower().startswith("min-")]
+        maxs = [int(v) for k, v in widths if k.lower().startswith("max-")]
+        min_w = max(mins) if mins else None  # most-restrictive lower bound
+        max_w = min(maxs) if maxs else None  # most-restrictive upper bound
+        if feat_clean:
+            out.append(css[m.start():body_end])
+        elif min_w is not None and max_w is None and min_w >= _MEDIA_THRESH_MIN_DESKTOP:
+            pass
+        elif max_w is not None and min_w is None and max_w >= _MEDIA_THRESH_MAX_NARROW:
+            out.append(rules)
+        else:
+            out.append(css[m.start():body_end])
+        pos = next_pos
+    return "".join(out)
+
+
+def neutralize_media_queries(html):
+    """Rewrite every <style> block in html so the publisher's narrow @media
+    layout applies at any viewport. See module docstring above."""
+    return _STYLE_BLOCK_RE.sub(
+        lambda m: m.group(1) + _neutralize_css(m.group(2)) + m.group(3),
+        html,
+    )

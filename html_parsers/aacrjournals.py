@@ -12,6 +12,8 @@ from ._helpers import (
     format_name,
     get_meta,
     parse_meta_authors,
+    remove_elements_by_id,
+    remove_elements_by_selector,
     strip_common,
     strip_tags,
     tags_to_text,
@@ -48,28 +50,205 @@ _BACK_OTHER = "backacknowledgements-title"
 # ---------------------------------------------------------------------------
 
 def remove_banners(html):
-    """Remove floating banners, cookie consent dialogs, and overlays.
+    """Normalize AACR (Silverchair) HTML to a single centered text column.
 
-    - GdprCookieBanner widget ("This site uses cookies. By continuing to
-      use our website...") on aacrjournals and Silverchair siblings.
-    - ArticleJumpLinks widget (ashpublications / Silverchair "interactive
-      table of contents" bar with Abstract/Introduction/Methods/... links
-      that overlays the bottom of the article).
-    - OneTrust consent SDK wrapper (biologists' "By clicking 'Accept all
-      cookies'..." banner and its preference center).
+    Chrome stripped (Step 3):
+      - GDPR cookie consent banner (`.gdpr-cookie-wrapper`).
+      - Site masthead and footer (Silverchair uses
+        `<section class="master-header...">` and `<section class="footer_wrap...">`,
+        not <header>/<footer>).
+      - Left `#InfoColumn` and right `#Sidebar` page-grid columns.
+      - In-article mobile nav button (`.article-browse-top.article-browse-mobile-nav`)
+        which sits above the publication-type/date line at the start of the
+        reading column.
+      - Trailing `widget-ArticleLinks`/`toolbar-wrap`/comments/metrics
+        widgets that follow the copyright line at the end of the reading
+        column. The `.pub-history-wrap` citation block (journal-name +
+        volume/issue/pages + DOI link + "Article history" dropdown) is
+        kept — it is non-redundant article metadata and serves as the
+        canonical citation line at the top of the reading column.
+
+    Reading column wrapper: `.widget-ArticleMainView`. Cap it at 752 px with
+    56 px top/bottom + 16 px side padding. The "Author & Article
+    Information" accordion (`.js-metadata-wrap.metadata`) is force-
+    expanded — it contains the corresponding-author block, funding
+    awards, and the publication-history dates that aren't visible
+    anywhere else without JS.
     """
+    # -------------------------------------------------------------------
+    # Step 3 — strip chrome.
+    # -------------------------------------------------------------------
+    html = remove_elements_by_selector(html, "gdpr-cookie-wrapper")
+    # Silverchair uses <section> (not <header>/<footer>) for chrome.
     html = _remove_nested_element(
-        html,
-        r'<div[^>]*class="[^"]*widget-GdprCookieBanner[^"]*"[^>]*>',
+        html, r'<section\b[^>]*class="[^"]*master-header\b[^"]*"[^>]*>',
     )
     html = _remove_nested_element(
-        html,
-        r'<div[^>]*class="[^"]*widget-ArticleJumpLinks[^"]*"[^>]*>',
+        html, r'<section\b[^>]*class="[^"]*footer_wrap\b[^"]*"[^>]*>',
     )
+    html = remove_elements_by_id(html, "InfoColumn", "Sidebar")
+    # Mobile nav button above the article-info row.
+    html = remove_elements_by_selector(html, "article-browse-mobile-nav")
+    # Note: keep `.toolbar-wrap` — it holds the article-header tools
+    # row (Split-Screen, Views, PDF, Share, Tools, Cite, Versions)
+    # which renders inline with the metadata block at narrow vw.
+    # Trailing widgets: ArticleLinks (empty), then a chain of dynamic
+    # widget rails (Cited By, Metrics, comments, Related). Strip the whole
+    # trailing chain by id where stable, and by class for the rest.
     html = _remove_nested_element(
-        html,
-        r'<div[^>]*\bid=["\']?onetrust-consent-sdk["\']?[^>]*>',
+        html, r'<div\b[^>]*class="[^"]*widget-ArticleLinks\b[^"]*"[^>]*>',
     )
+    for cls in (
+        "widget-ArticleLevelMetrics", "widget-ArticleCitedBy",
+        "widget-ArticleListNewAndPopular", "widget-UserCommentBody",
+        "widget-UserComment", "widget-Lockss", "widget-VideoListAccess",
+        "widget-AdBlock",
+    ):
+        for _ in range(8):
+            before = html
+            html = _remove_nested_element(
+                html, rf'<div\b[^>]*class="[^"]*{cls}\b[^"]*"[^>]*>',
+            )
+            if html == before:
+                break
+
+    # -------------------------------------------------------------------
+    # Steps 2 + 4 — layout freeze + reading-column cap.
+    # -------------------------------------------------------------------
+    override = (
+        "<style>"
+        "html{width:100% !important;max-width:100% !important;"
+        "margin:0 !important;background:#fff !important}"
+        "body{width:100% !important;min-width:0 !important;"
+        "max-width:752px !important;margin:0 auto !important;"
+        "background:#fff !important;color:#000 !important}"
+        # Collapse the page-grid parent so #ContentColumn fills the body
+        # width regardless of viewport. The 3-col CSS grid
+        # (InfoColumn | ContentColumn | Sidebar) lives on
+        # .page-column-wrap.article-browse_content; with the two side
+        # tracks now empty, the surviving ContentColumn is still pinned
+        # to the center track unless the grid is flattened.
+        "#main,.master-main,.content-main_content,"
+        ".page-column-wrap,.article-browse_content,"
+        "#ContentColumn{display:block !important;"
+        "width:100% !important;max-width:100% !important;"
+        "margin:0 !important;padding:0 !important;float:none !important;"
+        "background:#fff !important;"
+        "grid-template-columns:none !important}"
+        # Capped reading-column wrapper.
+        ":root .widget-ArticleMainView{"
+        "float:none !important;display:block !important;"
+        "width:auto !important;max-width:752px !important;"
+        "margin:0 auto !important;padding:56px 16px !important;"
+        "box-sizing:border-box !important;background:#fff !important}"
+        ":root .widget-ArticleMainView *{"
+        "max-width:100% !important;min-width:0 !important;"
+        "box-sizing:border-box !important}"
+        # Tables ship inside <div class=table-overflow> which sets
+        # overflow:auto; the table itself uses table-layout:auto, so its
+        # natural min-content width can exceed the wrapper and force
+        # horizontal scrolling. Force fixed table layout + 100% width so
+        # cells wrap instead.
+        ":root .widget-ArticleMainView table{"
+        "width:100% !important;max-width:100% !important;"
+        "table-layout:fixed !important}"
+        ":root .widget-ArticleMainView .table-overflow{overflow:visible !important}"
+        ":root .widget-ArticleMainView td,:root .widget-ArticleMainView th{"
+        "word-break:break-all !important;overflow-wrap:anywhere !important;"
+        "white-space:normal !important}"
+        # Zero side padding/margin on every nested wrapper inside the cap
+        # so text sits flush with the wrapper's own 16-px gutter. Keep
+        # vertical margins (margin-top/bottom) intact so the publisher's
+        # native section rhythm — e.g. the 16-px margin-top that
+        # separates the body `.article-section-wrapper` from the
+        # abstract `.article-section-wrapper` — is preserved.
+        ":root .widget-ArticleMainView .article-browse_content-wrap,"
+        ":root .widget-ArticleMainView .content-inner-wrap,"
+        ":root .widget-ArticleMainView .module-widget,"
+        ":root .widget-ArticleMainView .article-top-widget,"
+        ":root .widget-ArticleMainView .content-metadata_wrap,"
+        ":root .widget-ArticleMainView .article-section-wrapper,"
+        ":root .widget-ArticleMainView section{"
+        "margin-left:0 !important;margin-right:0 !important;"
+        "padding-left:0 !important;padding-right:0 !important;"
+        "width:auto !important;max-width:100% !important}"
+        # First-/last-child margin reset — scoped to direct children of
+        # the wrapper only (via `>`). Blanket `*:first-child` was
+        # zeroing the natural margin/padding on every reference list
+        # item, collapsing the references against each other. Same
+        # caution applies to `*:last-child`: a descendant rule zeros
+        # the last <p>'s margin-bottom inside `section.abstract`, which
+        # the publisher uses to space the final paragraph away from the
+        # abstract section's bottom border.
+        ":root .widget-ArticleMainView>*:first-child{"
+        "margin-top:0 !important;padding-top:0 !important}"
+        ":root .widget-ArticleMainView>*:last-child,"
+        ":root .widget-ArticleMainView>*:last-child>*:last-child,"
+        ":root .widget-ArticleMainView>*:last-child>*:last-child>*:last-child,"
+        ":root .widget-ArticleMainView>*:last-child>*:last-child>*:last-child>*:last-child,"
+        ":root .widget-ArticleMainView>*:last-child>*:last-child>*:last-child>*:last-child>*:last-child,"
+        ":root .widget-ArticleMainView>*:last-child>*:last-child>*:last-child>*:last-child>*:last-child>*:last-child"
+        "{margin-bottom:0 !important;padding-bottom:0 !important}"
+        # Force-expand the "Author & Article Information" accordion —
+        # the publisher's stylesheet sets `.js-metadata-wrap{display:none}`
+        # and JS toggles it on click. Without JS the corresponding-
+        # author block, funding awards, and publication-history dates
+        # are invisible.
+        ":root .widget-ArticleMainView .js-metadata-wrap{"
+        "display:block !important}"
+        # The permissions/copyright block ships with a trailing 8px
+        # margin-bottom that isn't zeroed by *:last-child because its
+        # DOM siblings (copyright-year, copyright-holder) render as
+        # zero-height/hidden. Kill that residual bottom gap explicitly.
+        ":root .widget-ArticleMainView .permissionstatement-section-wrapper,"
+        ":root .widget-ArticleMainView .metadata-copyright{"
+        "margin-bottom:0 !important;padding-bottom:0 !important}"
+        # Figure action row (`.fig-orig` containing "View large" and
+        # "Download slide" buttons): the publisher's natural rule
+        # `.fig-orig{display:flex;...}` was being beaten by my generic
+        # descendant rules (`*:first-child{margin-top:0;padding-top:0}`
+        # zeroed the first <a>'s padding so the two buttons rendered
+        # back-to-back as "VIEW LARGEDOWNLOAD SLIDE"). Re-establish
+        # flex layout with explicit gap, restore button padding, and
+        # honor the publisher's `.fig-view-orig{display:none}` rule.
+        ":root .widget-ArticleMainView .fig-view-orig{display:none !important}"
+        ":root .widget-ArticleMainView .fig-orig{"
+        "display:flex !important;justify-content:center !important;"
+        "flex-wrap:wrap !important;gap:.5rem 1rem !important;"
+        "margin:1rem 0 !important}"
+        ":root .widget-ArticleMainView .fig-orig a{"
+        "display:inline-block !important;margin:0 !important;"
+        "padding:.5rem 1rem !important}"
+        # Figures: each `<div class="fig fig-section">` ships with a
+        # duplicate `<div class="fig fig-modal reveal-modal">` modal that
+        # the publisher hides via JS (`aria-hidden=true`, default
+        # `display:none` on `.reveal-modal`). Without JS the modal can
+        # leak as a duplicate figure block — hide it explicitly.
+        ":root .widget-ArticleMainView .fig.fig-modal{display:none !important}"
+        # The lazyload fix in get_refs.py swaps img.content-image src ←
+        # data-src to fetch the medium JPEG (~700–1000 px, ~150 KB) at
+        # capture time. Force the inline figure image to fill the column
+        # width above the caption. The parent `<a class=fig-link>` has
+        # no padding natively but its inline-block default leaves the
+        # image baseline-positioned; force block + zero margin.
+        ":root .widget-ArticleMainView .fig.fig-section .graphic-wrap{"
+        "margin:0 !important;padding:0 !important}"
+        ":root .widget-ArticleMainView .fig.fig-section a.fig-link{"
+        "display:block !important;margin:0 !important;padding:0 !important}"
+        ":root .widget-ArticleMainView .fig.fig-section img.content-image{"
+        "display:block !important;width:100% !important;"
+        "height:auto !important;max-width:100% !important;"
+        "margin:0 0 5px 0 !important}"
+        # Trailing display:inline canvas (`hiddenCanvasElement`) generates
+        # a baseline line-box at body bottom that adds ~16 px to docH
+        # below the wrapper. Hide it.
+        "canvas.hiddenCanvasElement{display:none !important}"
+        "</style>"
+    )
+    if "</head>" in html:
+        html = html.replace("</head>", override + "</head>", 1)
+    else:
+        html = re.sub(r"(<body\b)", override + r"\1", html, count=1)
     return html
 
 

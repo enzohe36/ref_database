@@ -4,11 +4,15 @@ import re
 from html import unescape
 
 from ._helpers import (
+    _remove_nested_element,
     drop_noise,
     extract_captions,
     format_doi,
     get_meta,
+    neutralize_media_queries,
     parse_meta_authors,
+    remove_elements_by_id,
+    remove_elements_by_selector,
     strip_common,
     strip_tags,
     tags_to_text,
@@ -54,11 +58,284 @@ _MAIN_SECTION_IDS = (
 # ---------------------------------------------------------------------------
 
 def remove_banners(html):
-    """Remove floating banners, cookie consent dialogs, and overlays.
+    """Normalize JoVE HTML to a single centered text column.
 
-    JoVE pages have no visually impairing elements; return unmodified.
+    JoVE uses Chakra UI with build-generated class names (e.g. css-xxxxx)
+    that change between deployments, so chrome targeting uses stable
+    `data-atm="..."` test-id attributes plus modern `:has()` selectors
+    to hide DOM subtrees without needing fragile regex cuts.
+
+    Chrome stripped:
+      - Cookie consent banner ("We value your privacy", class
+        `cky-consent-container`, plus Cookieyes modal overlay).
+      - Site header and footer + their sticky/flex wrappers
+        (`vector-layout_header`, `vector-layout_footer`) which would
+        otherwise remain as empty bands after <header>/<footer> removal.
+      - EqualWeb accessibility widget (`INDbtnWrap`).
+      - Outer Chakra flex column (`css-1kk26sq`) is collapsed from
+        100dvh flex to auto-height block so no empty space trails the
+        article.
+      - Left-side "In This Article" table of contents (the div that
+        directly contains the navigator h2 with data-atm=
+        "article-section-navigator-title"). Removing it lets the
+        sibling article-body column reclaim the flex space.
+      - "Reprints and Permissions" section and everything after it in
+        the article container (Explore More Articles tags, etc.).
+
+    Reading column: the `.chakra-container` element wraps the entire
+    article (breadcrumb + sticky header + body + references). Cap it at
+    752 px with 56 px top/bottom and 16 px side padding.
     """
+    # Lock layout to publisher's narrow (≤1024 px) form at any viewport.
+    html = neutralize_media_queries(html)
+    # -------------------------------------------------------------------
+    # Step 3 — strip chrome.
+    # -------------------------------------------------------------------
+    # Top-of-page chrome above the "Research Article" label the user
+    # identified as the reading-column start: site header (<header>),
+    # breadcrumb nav (<nav>, the only one on the page), and the
+    # "Scheduled Maintenance" aria-live announcement (<output>).
+    html = _remove_nested_element(html, r"<header\b[^>]*>")
+    html = _remove_nested_element(html, r"<nav\b[^>]*>")
+    html = _remove_nested_element(html, r"<output\b[^>]*aria-live\b[^>]*>")
+    html = _remove_nested_element(html, r"<footer\b[^>]*>")
+    # After <header>/<footer> are stripped, their sticky/flex wrappers
+    # remain as empty 57 px / footer-height bands. Drop them too.
+    html = remove_elements_by_id(
+        html, "vector-layout_header", "vector-layout_footer",
+    )
+    # EqualWeb/Interdeal floating accessibility widget ("Explore your
+    # accessibility options" circle button).
+    html = remove_elements_by_id(html, "INDbtnWrap")
+    # Scheduled-Maintenance banner wrapper: the <output aria-live> child
+    # is already stripped above, but its parent <div class=css-1ohckfi>
+    # keeps a light-blue background band at the top of __next. Drop it.
+    # class attr is unquoted, so use _remove_nested_element directly —
+    # remove_elements_by_selector requires double-quoted class values.
+    html = _remove_nested_element(
+        html,
+        r'<div\b[^>]*\bclass=["\']?[^"\'>]*css-1ohckfi[^"\'>]*["\']?[^>]*>',
+    )
+    # Action-buttons block (Cite / Download PDF / Download Materials
+    # List / English etc.). Layout was inconsistent across viewports
+    # (Materials List wrapping to its own line at some widths), and the
+    # actions aren't useful in an offline reading snapshot.
+    html = _remove_nested_element(
+        html,
+        r'<div\b[^>]*\bclass="[^"]*\btext-article-action-buttons-wrapper\b[^"]*"[^>]*>',
+    )
+    # Remove the empty text-to-speech button wrapper that JoVE places as
+    # the first child of the title-section flex row. It has w=h=0 so it
+    # doesn't render, but the flex gap on the parent adds a 16 px offset
+    # between it and the H1 — pushing the title right of its siblings.
+    # class attr is unquoted so remove_elements_by_selector (which
+    # requires class="...") misses it; match directly.
+    html = _remove_nested_element(
+        html,
+        r'<div\b[^>]*\bclass=["\']?[^"\'>]*text-article-header-tts-button-wrapper',
+    )
+    # Cookie banner: cookieyes uses several sibling containers sharing
+    # the `cky-` prefix. Strip each class variant.
+    for _ in range(10):
+        before = html
+        html = remove_elements_by_selector(
+            html, "cky-consent-container", "cky-modal", "cky-overlay",
+        )
+        if html == before:
+            break
+
+    # -------------------------------------------------------------------
+    # Steps 2 + 4 — layout freeze, column cap, and :has()-based hiding
+    # for the TOC and reprints-onward blocks.
+    # -------------------------------------------------------------------
+    override = (
+        "<style>"
+        # Layout freeze (Step 2). html fills the viewport; body fills
+        # the viewport up to 752 px, centered when wider. At vw ≤ 752
+        # body shrinks with the viewport; at vw > 752 body caps at
+        # 752 and the surrounding space becomes centering margin.
+        "html{width:100% !important;max-width:100% !important;"
+        "margin:0 !important;background:#fff !important}"
+        "body{width:100% !important;min-width:0 !important;"
+        "max-width:752px !important;margin:0 auto !important;"
+        "background:#fff !important;color:#000 !important}"
+        # Outer Chakra flex column (css-1kk26sq) ships with
+        # width:100dvw;height:100dvh;display:flex which leaves a tall
+        # empty band below the article when content is shorter than the
+        # viewport. Collapse it to a plain block that sizes to content.
+        ".css-1kk26sq{display:block !important;"
+        "width:100% !important;height:auto !important;"
+        "min-height:0 !important}"
+        # Inner scroller (#vector-fullpage-layout_scroller, class
+        # css-1jhsr8m) ships with min/max-height:calc(100dvh - ...) plus
+        # overflow-y:auto, so the article scrolls inside an internal
+        # ~90vh viewport instead of extending the document — leaving
+        # visible empty space below the text. Un-constrain height and
+        # disable the internal scroll. Same fix for the flex main-
+        # container and the inner vector-layout_main which has
+        # height:100%.
+        "#vector-fullpage-layout_scroller,"
+        ".vector-fullpage-layout_main-container,"
+        "#vector-layout_main{"
+        "display:block !important;flex:unset !important;"
+        "height:auto !important;min-height:0 !important;"
+        "max-height:none !important;overflow:visible !important;"
+        # Also zero their default padding: the scroller ships with
+        # `padding:0 5px` (5 px gutter for its scrollbar) and
+        # vector-layout_main ships with `padding:16px 0` (top/bottom
+        # band around the article). Both leak through and push the
+        # chakra-container inward, so its 56px/16px padding no longer
+        # measures from body edge.
+        "padding:0 !important;margin:0 !important}"
+        # Force white backgrounds on the wrapper chain. The site paints
+        # rgb(249,249,249) gray on css-u41yqu and var(--chakra-colors-
+        # background) on css-1kk26sq, which shows through behind the
+        # capped chakra-container.
+        ".css-1kk26sq,"
+        "#vector-fullpage-layout_scroller,"
+        ".vector-fullpage-layout_main-container,"
+        "#vector-layout_main,"
+        ".css-8atqhb,.css-u41yqu,.chakra-container{"
+        "background:#fff !important;background-color:#fff !important;"
+        "background-image:none !important}"
+        # Capped reading column (Step 4) on the outermost article wrapper.
+        ".chakra-container{"
+        "float:none !important;display:block !important;"
+        "width:auto !important;max-width:752px !important;"
+        "margin:0 auto !important;padding:56px 16px !important;"
+        "box-sizing:border-box !important}"
+        ".chakra-container *{max-width:100% !important;min-width:0 !important}"
+        # Zero all horizontal padding/margin on every descendant so the
+        # only horizontal whitespace is the chakra-container's own 16 px
+        # padding — text sits 16 px from the wrapper edge regardless of
+        # how many Chakra stacks (css-xxxx) are nested or which h1/h2/p
+        # tag the text is in. Explicitly EXEMPT buttons: the original
+        # "border-left/right:none" rule stripped their left/right borders
+        # while leaving top/bottom, giving a "broken border" look on
+        # Cite / Download PDF / Download Materials List / English etc.
+        ".chakra-container *:not(button):not(a.chakra-button){"
+        "padding-left:0 !important;padding-right:0 !important;"
+        "margin-left:0 !important;margin-right:0 !important;"
+        "border-left:none !important;border-right:none !important;"
+        "box-shadow:none !important}"
+        # Restore default 40-px padding-left on numbered/bulleted lists.
+        # The descendant zero above kills it, and with the publisher's
+        # `list-style-position:outside`, the marker (ref number) renders
+        # in a virtual column to the LEFT of the list — clipped off
+        # the page when pl=0. Triple `:root` to out-rank the
+        # `.chakra-container *:not(button):not(a.chakra-button)`
+        # selector (specificity 0,2,2). Also restore the publisher's
+        # native 16-px top/bottom margins on the list — the descendant
+        # `*:first-child{margin-top:0}` / `*:last-child{margin-bottom:0}`
+        # rules zero them, collapsing the gap between the "References"
+        # heading and the first list item.
+        ":root:root:root .chakra-container ol,"
+        ":root:root:root .chakra-container ul{"
+        "padding-left:40px !important;"
+        "margin-top:16px !important;margin-bottom:16px !important}"
+        # Un-float the article header: site CSS puts the title + metadata
+        # block in position:sticky so it pins to the viewport top as the
+        # reader scrolls. Force static so it flows with the rest of the
+        # column.
+        "#sticky-header{position:static !important}"
+        # Zero first/last-child margins (descendant form — reclaiming
+        # every trailing margin keeps the bottom flush with the wrapper
+        # padding; the direct-child form leaves deep last-children
+        # contributing ~30-230 px of trailing whitespace at vw=1280).
+        ".chakra-container *:first-child{margin-top:0 !important;padding-top:0 !important}"
+        ".chakra-container *:last-child{margin-bottom:0 !important;padding-bottom:0 !important}"
+        # Exempt Chakra popovers: their <section>/body/content uses the
+        # native 11 px padding-top to breathe around the email tooltip
+        # text. Zeroing it collapses the tooltip around its contents.
+        ".chakra-container .chakra-popover__content{"
+        "padding-top:11px !important;padding-bottom:11px !important}"
+        # Hide empty wrapper divs. The <nav> breadcrumb removal leaves an
+        # empty `<div class=css-11mgymx></div>` as the first child of
+        # `.css-old1by` with a baked 2.75rem (44 px) height — exactly the
+        # T-overshoot observed (101 px vs target 56 px). `:empty` matches
+        # divs with no child elements and no text, which is safe because
+        # Chakra's layout divs always carry content when in use.
+        ".chakra-container div:empty{display:none !important}"
+        # `#sticky-header` (text-article-header-wrapper) ships padding-
+        # top:24px to separate the sticky title bar from the content
+        # above it. After chrome stripping there is nothing above it, so
+        # that 24 px becomes extra T beyond the 56 px wrapper padding.
+        "#sticky-header{padding-top:0 !important}"
+        # Hide the "In This Article" TOC (the div that holds the nav h2).
+        "div:has(> [data-atm=\"article-section-navigator-title\"]){"
+        "display:none !important}"
+        # The article column (chakra-stack wrapping header + body) ships
+        # with width:70% inside a flex row shared with an empty 153-px
+        # sidebar sibling. After sibling is hidden the 70% cap still
+        # clamps content to ~510 px at any viewport. Two fixes:
+        #   1. Collapse the flex row parent to block layout so the
+        #      article column fills its full width (688 px inside the
+        #      chakra-container's 16-px side padding).
+        #   2. Drop the 70% width on the article column itself.
+        # Target via the stable `.text-article-header-wrapper` class
+        # rather than build-generated chakra css-xxxx ids.
+        "div:has(> div > .text-article-header-wrapper){"
+        "display:block !important}"
+        "div:has(> .text-article-header-wrapper){"
+        "width:100% !important;flex:1 1 auto !important}"
+        # The header wrapper carried padding-bottom:16px to space itself
+        # from the action-buttons block (now stripped). Reclaim it.
+        # Also drop the 1-px box border (top/bottom — left/right are
+        # already neutralized in the column-flat rule above) so the
+        # article header reads as plain inline copy without a card-style
+        # frame around it.
+        ".text-article-header-wrapper{"
+        "padding-bottom:0 !important;border:0 !important}"
+        # Parent of `.text-article-header-wrapper` is a flex column with
+        # `gap:24px` between siblings; that 24-px gap was visually
+        # absorbed by the header card's bottom border in raw, but with
+        # the border stripped it becomes 24 px of dead space between
+        # the last header text and the Summary section. Zero the flex
+        # gap on this specific stack so the only spacing above the
+        # Summary heading is the publisher's natural 32-px padding-top
+        # on the Summary's own chakra-stack (= raw's "summary to its
+        # own block border" gap).
+        ":root .chakra-stack:has(> .text-article-header-wrapper){"
+        "gap:0 !important}"
+        # Hide every sibling AFTER the "Reprints and Permissions" section
+        # (Explore More Articles, ads). The Reprints block itself is part
+        # of the main reading column and is kept.
+        "div:has(> [data-atm=\"article-content-label-reprints and permissions\"]) ~ *{"
+        "display:none !important}"
+        # Authors + DOI + published-date block is collapsed by default
+        # (.text-article-header-details-section gets max-height:0 +
+        # overflow:hidden from site CSS to force a click-to-expand UX).
+        # Force it open so readers see authors/affiliations + metadata.
+        ".text-article-header-details-section{"
+        "max-height:none !important;overflow:visible !important}"
+        # Figures: jove inlines each figure as
+        #   <p class=jove_content>
+        #     <img class=xfigimg src="data:image/jpeg;base64,..." (medium-res)>
+        #     <strong class=xfig>Figure N</strong>
+        #     <strong>: Caption text.</strong>
+        #     <a href=https://www.jove.com/files/ftp_upload/<id>/<id>fig<N>large.jpg>
+        #       Please click here to view a larger version of this figure.</a>
+        # Native rendering puts the image inline at intrinsic pixel
+        # dimensions — narrower than the column. Force the img to
+        # block-display at full column width above the inline caption.
+        # The high-res JPEG is on the sibling <a href ending in .jpg> —
+        # get_refs.py uses a browser-script to swap <img src> ← <a href>
+        # at capture time so the inlined image is full-res; this CSS
+        # handles the visual layout regardless.
+        "p.jove_content img.xfigimg{"
+        "display:block !important;width:100% !important;"
+        "height:auto !important;max-width:100% !important;"
+        "margin:0 0 5px 0 !important}"
+        "</style>"
+    )
+    if "</head>" in html:
+        html = html.replace("</head>", override + "</head>", 1)
+    else:
+        html = re.sub(r"(<body\b)", override + r"\1", html, count=1)
     return html
+
+
+
 
 
 # ---------------------------------------------------------------------------

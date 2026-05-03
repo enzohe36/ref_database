@@ -13,6 +13,8 @@ from ._helpers import (
     get_all_meta,
     get_meta,
     parse_meta_authors,
+    remove_elements_by_id,
+    remove_elements_by_selector,
     strip_common,
     strip_tags,
     tags_to_text,
@@ -53,60 +55,310 @@ _CHROME_RE = re.compile(
 # ---------------------------------------------------------------------------
 
 def remove_banners(html):
-    """Remove floating banners, cookie consent dialogs, and overlays.
+    """Normalize PNAS (Atypon) HTML to a single centered text column.
 
-    Targets PNAS floating navigation bar (section nav + Info/Metrics/Citations
-    collateral menu), "Open in Viewer" figure buttons, "Sign up for PNAS alerts"
-    promos, and collapsed-bibliography CSS rules. Also expands collapsed
-    contributor sections so affiliations are visible when rendered via CDP.
+    Per format-html-extra.md the reading column starts at "Research
+    Article" and ends before bottom chrome; the floating top bar
+    (Info / Metrics / Link / Share icons) is stripped and the
+    "Show all references" truncation stays collapsed. Removals fall
+    into (a) items format-html-extra.md names, (b) ads, (c) toolbars.
+    Content like "Cited By", related-articles carousels, and the
+    references pop-up wrapper stays in the DOM.
     """
-    # Floating bar: section nav + Info/Metrics/Citations collateral menu
+    # -------------------------------------------------------------------
+    # Step 3 — strip chrome.
+    # -------------------------------------------------------------------
+    # (a) instruction-doc items --------------------------------------
+    # Floating action-icon toolbar (Info / Metrics / Link / Share)
+    # that format-html-extra.md names as "the floating top bar".
     html = _remove_nested_element(
-        html, r'<div[^>]*class="[^"]*core-nav-wrapper[^"]*"[^>]*>'
+        html,
+        r'<div\b[^>]*\bclass="[^"]*\bcore-fv__toolbar\b[^"]*"',
     )
-    # Expand collapsed contributor sections inside core-collateral dialog
-    # so affiliations are visible when rendered via CDP.
-    html = re.sub(r'(id=con\d+_content)\s+style=display:none', r'\1', html)
-    # Remove "Open in Viewer" buttons inside figures
-    html = re.sub(r'<button[^>]*data-open=viewer[^>]*>.*?</button>', '', html, flags=re.DOTALL)
-    # Remove "Sign up for PNAS alerts" promo blocks
+    # (b) ads --------------------------------------------------------
+    # "Sign up for PNAS alerts" newsletter-signup promo. Two markup
+    # variants: `<section class=signup-ad>` (article-aside ad) and
+    # `<div class=signup-alert-ad>` (in-column ad above references).
     html = _remove_nested_element(
-        html, r'<div[^>]*class=["\']?signup-alert-ad["\']?[^>]*>'
+        html,
+        r'<section\b[^>]*\bclass=["\']?[^"\'>]*\bsignup-ad\b',
     )
-    # Expand collapsed bibliography. The static "Show all references"
-    # toggle lives in a truncation-wrapper div after the list; the same
-    # markup also appears inside <template id=citations_truncate_template>
-    # and <template id=coreProducts_truncate_template>, which JS can clone
-    # back into the DOM when the page is reopened. Strip every occurrence
-    # so no variant of the toggle renders.
-    while True:
-        stripped = _remove_nested_element(
-            html, r'<div[^>]*class="?truncation-wrapper[^>]*>'
+    for _ in range(3):
+        before = html
+        html = _remove_nested_element(
+            html,
+            r'<div\b[^>]*\bclass=["\']?[^"\'>]*\bsignup-alert-ad\b',
         )
-        if stripped == html:
+        if html == before:
             break
-        html = stripped
-    # A runtime CollapsibleText widget (embedded as a data: URI script)
-    # adds `data-method` on the list and `hidden` on listitems beyond the
-    # first few; CSS then hides them. Modifying the saved HTML cannot
-    # undo runtime attribute additions, so inject a style override with
-    # higher specificity + !important that forces listitems visible
-    # regardless of the hidden attribute added by JS.
+    # (c) toolbars ---------------------------------------------------
+    # Site <header class=main-header>: top nav / search / menu.
+    # Inner <header data-extent=frontmatter> is article content and
+    # stays.
+    html = _remove_nested_element(
+        html,
+        r'<header\b[^>]*\bclass="[^"]*\bmain-header\b[^"]*"',
+    )
+    # Site <footer> chain (legal / feedback / contact bars).
+    for _ in range(5):
+        before = html
+        html = _remove_nested_element(html, r"<footer\b[^>]*>")
+        if html == before:
+            break
+    # Scroll-triggered sticky top toolbar (class=st-header) with
+    # article title + PDF button.
+    html = _remove_nested_element(
+        html,
+        r'<div\b[^>]*\bclass=["\']?[^"\'>]*\bst-header\b(?!__)',
+    )
+    # Figure-viewer modal (<main class=core-fv__content>).
+    html = _remove_nested_element(
+        html,
+        r'<main\b[^>]*\bclass="[^"]*\bcore-fv__content\b[^"]*"',
+    )
+    # Offscreen duplicate mobile nav menu.
+    html = remove_elements_by_id(html, "main-menu")
+    # Section-nav hamburger rail (.core-sections-menu: hamburger +
+    # Abstract / Materials and Methods / ... TOC) and the collateral
+    # icon rail (nav#article_collateral_menu: info / metrics / eye /
+    # link / figures / table / play / share). The bell/bookmark/cite/
+    # PDF panel (.info-panel) and citation metrics are kept.
+    html = _remove_nested_element(
+        html,
+        r'<div\b[^>]*\bclass=(?:"[^"]*\bcore-sections-menu\b[^"]*"|core-sections-menu\b)',
+    )
+    html = _remove_nested_element(
+        html,
+        r'<nav\b[^>]*\bid=["\']?article_collateral_menu\b',
+    )
+    # Bottom chrome after the article body (per "ends before bottom
+    # chrome" in format-html-extra.md):
+    # - #cited-by__content: citation-metric block
+    # - .article-further-reading: related-articles carousel
+    # - .multi-search--grid: recommended-papers grid
+    # - <section class=mt-2x>: trailing recommended-content popup
+    html = remove_elements_by_id(html, "cited-by__content")
+    html = _remove_nested_element(
+        html,
+        r'<div\b[^>]*\bclass="[^"]*\barticle-further-reading\b[^"]*"',
+    )
+    for _ in range(5):
+        before = html
+        html = _remove_nested_element(
+            html,
+            r'<div\b[^>]*\bclass="[^"]*\bmulti-search--grid\b[^"]*"',
+        )
+        if html == before:
+            break
+    html = _remove_nested_element(
+        html,
+        r'<section\b[^>]*\bclass=["\']?mt-2x["\']?\s*>',
+    )
+    # References pop-up overlay widget (hover popup that shows when a
+    # reference link is hovered). Not visible on initial render, but
+    # its absolute-positioned container reports a bounding box below
+    # docH. Treat as UI chrome.
+    html = _remove_nested_element(
+        html,
+        r'<div\b[^>]*\bclass=["\']?[^"\'>]*\breferences-popup-wrapper\b',
+    )
+    # DOM patch: citation-metric counts. PNAS ships
+    # `<span class=total-text data-count=XXX>0</span>` and relies on
+    # client JS to replace the "0" with the `data-count` value at
+    # render time. SingleFile captures before JS runs, so both Views
+    # and Citations display "0". Substitute the real value (comma-
+    # formatted) at capture time.
+    def _patch_total_text(match):
+        open_tag = match.group(1)
+        count = int(match.group(2))
+        close_tag = match.group(3)
+        return f"{open_tag}{count:,}{close_tag}"
+    html = re.sub(
+        r'(<span\b[^>]*\bclass=["\']?[^"\'>]*\btotal-text\b[^"\'>]*["\']?[^>]*\bdata-count=["\']?(\d+)["\']?[^>]*>)'
+        r'\s*0\s*'
+        r'(</span>)',
+        _patch_total_text,
+        html,
+        flags=re.IGNORECASE,
+    )
+
+    # -------------------------------------------------------------------
+    # Steps 2 + 4 — layout freeze and reading-column cap.
+    # -------------------------------------------------------------------
     override = (
         "<style>"
-        "#bibliography-collapsible-text [role=listitem][hidden]"
-        "{display:flex!important}"
+        "html{width:100% !important;max-width:100% !important;"
+        "margin:0 !important;background:#fff !important}"
+        "body{width:100% !important;min-width:0 !important;"
+        "max-width:752px !important;margin:0 auto !important;"
+        "background:#fff !important;color:#000 !important}"
+        # Cap <main>.
+        "main{"
+        "float:none !important;display:block !important;"
+        "width:100% !important;max-width:752px !important;min-width:0 !important;"
+        # padding-bottom trimmed: the article ends in a reference list
+        # whose line-height leaves ~41 px of empty space below the last
+        # text baseline. Target B = 56 px.
+        "margin:0 auto !important;padding:56px 16px 15px 16px !important;"
+        "box-sizing:border-box !important;background:#fff !important}"
+        # Atypon's .article-container uses Bootstrap grid; collapse
+        # grid/flex to block so the article body fills the wrapper.
+        # All margins are zeroed (including mt-5's 3rem margin-top).
+        ":root main .article-container,"
+        ":root main .container,"
+        ":root main .core-container,"
+        ":root main .row,"
+        ":root main [class*=col-]{"
+        "display:block !important;float:none !important;"
+        "width:auto !important;max-width:100% !important;min-width:0 !important;"
+        "margin:0 !important;padding:0 !important;"
+        "flex:0 0 auto !important}"
+        # Header/core-container rule `header .core-container > *
+        # {padding-left:1.5rem !important}` with specificity (0,2,2)
+        # adds a 24-px inset on every direct child of the article
+        # header's .core-container (meta-panel, title, authors).
+        # Beat it with (1,2,3) to zero the left inset only — PNAS
+        # relies on padding-top/bottom of h1, .core-self-citation and
+        # .info-panel for the vertical rhythm between metadata rows.
+        ":root body main header .core-container>*{"
+        "padding-left:0 !important;padding-right:0 !important}"
+        # `.core-self-citation` (journal name / volume / page / date
+        # line) ships with margin-left:24px that pushes its contents
+        # (including "March 31, 1998") 24 px inward from the H1/article
+        # left edge, creating an uneven indent. Zero it.
+        ":root main header .core-self-citation{"
+        "margin-left:0 !important;margin-right:0 !important}"
+        # Override the native `@media (max-width:767px)` rules on
+        # `.info-panel__right-content` that overflow the container
+        # (margin:0-1.5rem; padding:0 1.5rem; width:calc(100%+3rem))
+        # and re-add a top border plus 0.75rem padding-top. At our
+        # capped 752-px body width the narrow breakpoint always fires,
+        # but we want the wide-viewport layout (side-by-side metrics +
+        # buttons, no border above buttons). Reset those properties so
+        # the base rules take over.
+        ":root main .info-panel__right-content{"
+        "border-block-start:0 !important;border-top:0 !important;"
+        "margin:0 !important;padding:0 !important;"
+        "padding-block-start:0 !important;width:auto !important}"
+        ":root main .info-panel__left-content{width:auto !important}"
+        # Override native `@media (max-width:575px){.info-panel{
+        # justify-content:flex-start}}` which left-aligns the row at
+        # very narrow viewports. Keep the default space-between so the
+        # button cluster stays right-aligned at every width.
+        ":root main .info-panel{justify-content:space-between !important}"
+        # Hide the entire right-content cluster of .meta-panel (share
+        # icons + crossmark badge). At narrow vw it wraps to its own
+        # row and adds ~30 px of height, pushing the first rendered
+        # text below target. Keep in DOM so parse_main_text output is
+        # unchanged.
+        ":root main .meta-panel__right-content{display:none !important}"
+        # core-collateral is a position:fixed dialog holding metadata,
+        # metrics, references, figures tabs that PNAS uses for the
+        # toolbar popouts. It sits at x=100vw off-screen, but keep
+        # display:none to guarantee it never appears visibly.
+        # parse_references reads it, so it must stay in the DOM.
+        ".core-collateral{display:none !important}"
+        # Expand the truncated references list. PNAS caps the <div id=
+        # bibliography-collapsible-text> at max-height:388px AND sets
+        # display:none on refs past ~4 until the user clicks "Show all
+        # references". Uncap, un-hide the hidden children, and hide the
+        # button.
+        "main #bibliography-collapsible-text{"
+        "max-height:none !important;overflow:visible !important}"
+        "main #bibliography-collapsible-text>*{display:flex !important}"
+        "main .truncation-wrapper{display:none !important}"
+        # `[data-method]::after` draws a 200-px gradient overlay at the
+        # bottom of the references list to fade out the truncated
+        # content. With max-height uncapped above, the overlay still
+        # renders, hiding the last ~200 px of visible references behind
+        # a semitransparent `#f6f6f6` panel.
+        "main #bibliography-collapsible-text::after{"
+        "content:none !important;display:none !important;"
+        "background:none !important}"
+        # "Open in Viewer" button overlaid on each figure. At narrow vw
+        # it overflows horizontally. Hide — figure viewer modal is
+        # already removed.
+        "main .figure-pop-btn{display:none !important}"
+        # Collapsed table wrappers (`<figure class=table><div class=
+        # collapsible-wrapper collapsed style="overflow:hidden">`) hide
+        # rows beyond the first ~280 px behind an "EXPAND FOR MORE"
+        # button. Force the wrapper open and hide the now-redundant
+        # button.
+        "main .collapsible-wrapper.collapsed,"
+        "main .collapsible-wrapper{"
+        "max-height:none !important;height:auto !important;"
+        "overflow:visible !important}"
+        "main .collapsible-figure-btn,"
+        "main .collapsible-figure-btn__wrapper{display:none !important}"
+        # Body sections (abstract / bodymatter / backmatter etc. inside
+        # `<article>`) get `padding:1.5rem` (24 px) horizontal under the
+        # publisher's narrow-viewport `@media (max-width: 831px)` rule,
+        # which the 752-px body cap forces unconditionally. `.figure-wrap`
+        # also has its own `padding:.75rem` (12 px). Zero both so content
+        # fills the column edge-to-edge.
+        ":root main article section,"
+        ":root main article .figure-wrap{"
+        "padding-left:0 !important;padding-right:0 !important}"
+        # Zero margin along the first-/last-descendant chain so
+        # collapsed margins don't leak through main's padding, while
+        # section titles deeper in the tree keep native margins
+        # (32 px in PNAS typography).
+        "main>*:first-child,"
+        "main>*:first-child>*:first-child,"
+        "main>*:first-child>*:first-child>*:first-child,"
+        "main>*:first-child>*:first-child>*:first-child>*:first-child,"
+        "main>*:first-child>*:first-child>*:first-child>*:first-child>*:first-child,"
+        "main>*:first-child>*:first-child>*:first-child>*:first-child>*:first-child>*:first-child"
+        "{margin-top:0 !important;padding-top:0 !important}"
+        "main>*:last-child,"
+        "main>*:last-child>*:last-child,"
+        "main>*:last-child>*:last-child>*:last-child,"
+        "main>*:last-child>*:last-child>*:last-child>*:last-child,"
+        "main>*:last-child>*:last-child>*:last-child>*:last-child>*:last-child,"
+        "main>*:last-child>*:last-child>*:last-child>*:last-child>*:last-child>*:last-child"
+        "{margin-bottom:0 !important;padding-bottom:0 !important}"
+        # Atypon applies a fixed 80-px margin-top to the <article> element
+        # inside .article-container. The element is not :first-child
+        # (there's a sibling <style> tag before it), so the rule above
+        # misses; zero explicitly.
+        "main .article-container>article{"
+        "margin-top:0 !important;padding-top:0 !important}"
+        # Clamp descendants so wide tables/figures don't overflow. Do
+        # not force min-width:0 globally — PNAS gives reference-list
+        # .label cells a 24-px min-width so numbers align, and blanket
+        # zeroing shrinks them to single-digit-character width.
+        "main *{max-width:100% !important}"
+        "main table{table-layout:fixed !important;width:100% !important}"
+        # Figures: pnas (Atypon) wraps each figure in
+        #   <div class=figure-wrap>
+        #     <header><div class=label>Fig. N.</div></header>
+        #     <button class=figure-pop-btn>Open in Viewer</button>  (already hidden above)
+        #     <figure id=fig<N> class=graphic>
+        #       <img src='data:image/svg+xml,<placeholder>'
+        #            style="background-image:var(--sf-img-N) ...">
+        #       <figcaption>...</figcaption>
+        #     </figure>
+        #   </div>
+        # The image is rendered via SingleFile's `background-image`
+        # CSS-var trick (foreground src is transparent SVG). Native
+        # `<figure>` has 40 px horizontal margin — zero it. Force the
+        # img to display:block at full column width with the standard
+        # 5 px caption gap. The background-image fills the box at
+        # `background-size:100% 100%` so it scales with width:100%.
+        ":root main article figure.graphic{"
+        "margin:1rem 0 !important;padding:0 !important;"
+        "width:100% !important;max-width:100% !important;"
+        "display:block !important}"
+        ":root main article figure.graphic > img{"
+        "display:block !important;width:100% !important;"
+        "height:auto !important;max-width:100% !important;"
+        "margin:0 0 5px 0 !important}"
         "</style>"
     )
     if "</head>" in html:
         html = html.replace("</head>", override + "</head>", 1)
-    # Legacy collapse (older PNAS HTMLs): CSS rules on [data-method=height]
-    # and the matching HTML attribute. No-op on current captures; kept as a
-    # safety net for older files in the wild.
-    html = re.sub(r'\[data-method=height\]\{max-height:[^}]*\}', '', html)
-    html = re.sub(r'\[data-method\]\{[^}]*overflow:hidden[^}]*\}', '', html)
-    html = re.sub(r'\[data-method\]:after\{[^}]*\}', '', html)
-    html = re.sub(r'(<[^>]*)\s+data-method=height', r'\1', html)
+    else:
+        html = re.sub(r"(<body\b)", override + r"\1", html, count=1)
     return html
 
 
@@ -285,6 +537,22 @@ def _parse_references(html):
         vm = re.search(r'<b>(\d+)</b>', raw_html)
         if vm:
             volume = vm.group(1)
+            # Article numbers / page ranges appear between </b> and "(YEAR)"
+            # in the modern Atypon layout: "<em>J</em> <b>10</b>, e66198 (2021)."
+            after_b = raw_html[vm.end():]
+            m_art = re.search(
+                r'^[,\s]*'
+                r'(?:\(([^)]+)\)[,\s]*)?'  # optional (issue)
+                r'([A-Za-z]?[\w.\-\u2010-\u2014]+?)'
+                r'\s*\(\d{4}\)',
+                after_b,
+            )
+            if m_art:
+                if m_art.group(1) and not issue:
+                    issue = m_art.group(1).strip()
+                tok = re.sub(r'[\u2010-\u2014]', '-', m_art.group(2)).strip('.,')
+                if re.match(r'^[A-Za-z]?[\w.]+(-[A-Za-z]?[\w.]+)?$', tok):
+                    post_pages = tok
         elif jm:
             after_journal = raw_html[jm.end():]
             after_text = strip_tags(after_journal).strip().lstrip(',').strip()

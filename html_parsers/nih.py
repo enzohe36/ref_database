@@ -5,12 +5,15 @@ import urllib.parse
 from html import unescape
 
 from ._helpers import (
+    _is_name_suffix,
+    _remove_nested_element,
     drop_noise,
     extract_captions,
     format_author_name,
     format_doi,
     get_meta,
     parse_meta_authors,
+    remove_elements_by_id,
     remove_elements_by_selector,
     strip_common,
     strip_tags,
@@ -43,11 +46,154 @@ _DROP_H2 = {
 # ---------------------------------------------------------------------------
 
 def remove_banners(html):
-    """Remove floating banners, cookie consent dialogs, and overlays.
+    """Normalize PMC HTML to a single centered text column.
 
-    Targets PMC floating action bar (View on publisher site, Download PDF, etc.).
+    Per format-html-extra.md the reading column starts after the
+    "Learn more: PMC Disclaimer | PMC Copyright Notice" banner and
+    ends before "Follow NCBI" inside the site <footer>. Removals fall
+    into three buckets: (a) items format-html-extra.md names, (b) ads,
+    (c) toolbars. Dialog overlays, the accessibility skip-link, and
+    similar non-chrome items stay in the DOM.
     """
-    return remove_elements_by_selector(html, "pmc-actions-bar")
+    # -------------------------------------------------------------------
+    # Step 3 — strip chrome.
+    # -------------------------------------------------------------------
+    # (a) instruction-doc items --------------------------------------
+    # Two outer <header> tags (USA official-site banner + PMC bar).
+    for _ in range(5):
+        before = html
+        html = _remove_nested_element(html, r"<header\b[^>]*>")
+        if html == before:
+            break
+    # PMC disclaimer banner ("Learn more: PMC Disclaimer | PMC Copyright
+    # Notice"). Unquoted class attribute.
+    html = _remove_nested_element(
+        html,
+        r'<div\b[^>]*\bclass=["\']?[^"\'>]*\bpmc-layout__disclaimer\b',
+    )
+    # pmc-journal-banner (<section> with journal-logo <img>) is the
+    # first element immediately below the disclaimer in the flow and
+    # the user-specified start of the reading column. Keep it in the
+    # DOM (overrides the "Also strip .pmc-journal-banner" sentence in
+    # format-html-extra.md per follow-up feedback).
+    # NCBI site footer ("Follow NCBI" + copyright). Only the outer one;
+    # the in-article <footer class=courtesy-note> carries text that
+    # parse_main_text picks up and must stay.
+    html = _remove_nested_element(
+        html,
+        r'<footer\b[^>]*\bclass=["\']?[^"\'>]*\bncbi-footer\b',
+    )
+    # (c) toolbars ---------------------------------------------------
+    # PMC masthead toolbar (logo / search / menu) rendered as
+    # <section class=pmc-header> — not caught by the <header> loop.
+    html = _remove_nested_element(
+        html,
+        r'<section\b[^>]*\bclass=["\']?[^"\'>]*\bpmc-header\b',
+    )
+    # Right-side article-resources navigation panel
+    # (Sections / Figures / References / Similar articles tabs).
+    html = _remove_nested_element(
+        html,
+        r'<div\b[^>]*\bclass=["\']?[^"\'>]*\bpmc-sidenav\b',
+    )
+    # PMC actions bar above the article (Back / PDF / Cite / Save).
+    html = _remove_nested_element(
+        html,
+        r'<div\b[^>]*\bclass=["\']?[^"\'>]*\bpmc-actions-bar\b',
+    )
+    # Floating "Back to top" sticky button.
+    html = _remove_nested_element(
+        html,
+        r'<button\b[^>]*\bclass=["\']?[^"\'>]*\bback-to-top\b',
+    )
+    # Scripts in the saved HTML re-fetch NCBI chrome (site footer with
+    # "HHS Vulnerability Disclosure", galert banners, etc.) at runtime
+    # via jQuery.getScript / direct CDN <script src>, re-adding the
+    # chrome the strips above removed. Drop all <script> tags (inline
+    # and external) so the saved HTML renders as a static snapshot.
+    html = re.sub(
+        r'<script\b[^>]*>.*?</script>',
+        "", html, flags=re.DOTALL,
+    )
+
+    # -------------------------------------------------------------------
+    # Steps 2 + 4 — layout freeze and reading-column cap.
+    # -------------------------------------------------------------------
+    override = (
+        "<style>"
+        "html{width:100% !important;max-width:100% !important;"
+        "margin:0 !important;background:#fff !important}"
+        "body{width:100% !important;min-width:0 !important;"
+        "max-width:752px !important;margin:0 auto !important;"
+        "background:#fff !important;color:#000 !important}"
+        # Cap <main id=main-content> — highest common ancestor of the
+        # article citation block, abstract, body sections, references.
+        "main#main-content{"
+        "float:none !important;display:block !important;"
+        "width:auto !important;max-width:752px !important;"
+        "margin:0 auto !important;"
+        "padding:56px 16px !important;"
+        "box-sizing:border-box !important;background:#fff !important}"
+        # PMC layout wraps <main> in a USWDS grid chain that caps the
+        # content at 8/12 of the grid parent and applies desktop
+        # padding-left-6 and negative row margins. Collapse the whole
+        # wrapper chain to plain block layout so <main> spans the body.
+        ":root body .grid-container,"
+        ":root body .grid-row,"
+        ":root body [class*=grid-col-],"
+        ":root body .usa-section,"
+        ":root body .pmc-article-section{"
+        "display:block !important;float:none !important;"
+        "flex:0 0 auto !important;"
+        "width:auto !important;max-width:100% !important;min-width:0 !important;"
+        "margin:0 !important;padding:0 !important;"
+        "box-sizing:border-box !important}"
+        # pmc-layout__content defaults to grid-col-8 desktop but once the
+        # grid is flattened, let it fill.
+        ".pmc-layout__content{width:100% !important;max-width:100% !important}"
+        "main#main-content>*{width:auto !important;max-width:100% !important;"
+        "margin-left:0 !important;margin-right:0 !important;"
+        "flex:0 0 auto !important}"
+        # Clamp every descendant so fixed-width tables, figures, or
+        # data-tables don't overflow the text column at narrow vw.
+        "main#main-content *{max-width:100% !important;min-width:0 !important}"
+        # PMC data tables carry explicit <col width> that ignores the
+        # wrapper cap. Force table-layout:fixed + width:100% so column
+        # widths scale down to the available space.
+        "main#main-content table{table-layout:fixed !important;"
+        "width:100% !important;max-width:100% !important}"
+        "main#main-content table colgroup,main#main-content table col{"
+        "width:auto !important}"
+        # Zero margin along the first-/last-descendant chain so
+        # collapsed margins don't leak through main's padding, while
+        # section titles deeper in the tree keep their native margins.
+        "main#main-content>*:first-child,"
+        "main#main-content>*:first-child>*:first-child,"
+        "main#main-content>*:first-child>*:first-child>*:first-child,"
+        "main#main-content>*:first-child>*:first-child>*:first-child>*:first-child,"
+        "main#main-content>*:first-child>*:first-child>*:first-child>*:first-child>*:first-child,"
+        "main#main-content>*:first-child>*:first-child>*:first-child>*:first-child>*:first-child>*:first-child"
+        "{margin-top:0 !important;padding-top:0 !important}"
+        "main#main-content>*:last-child,"
+        "main#main-content>*:last-child>*:last-child,"
+        "main#main-content>*:last-child>*:last-child>*:last-child,"
+        "main#main-content>*:last-child>*:last-child>*:last-child>*:last-child,"
+        "main#main-content>*:last-child>*:last-child>*:last-child>*:last-child>*:last-child,"
+        "main#main-content>*:last-child>*:last-child>*:last-child>*:last-child>*:last-child>*:last-child"
+        "{margin-bottom:0 !important;padding-bottom:0 !important}"
+        # Descendant *:last-child margin-bottom zero (safe per skill)
+        # catches the final 6 px residue from nested
+        # footnote/reference list padding the 6-deep direct-child
+        # chain above doesn't reach.
+        "main#main-content *:last-child{"
+        "margin-bottom:0 !important;padding-bottom:0 !important}"
+        "</style>"
+    )
+    if "</head>" in html:
+        html = html.replace("</head>", override + "</head>", 1)
+    else:
+        html = re.sub(r"(<body\b)", override + r"\1", html, count=1)
+    return html
 
 
 # ---------------------------------------------------------------------------
@@ -195,7 +341,8 @@ def _parse_authors(html):
 # References
 # ---------------------------------------------------------------------------
 
-_SUFFIXES = {"Jr", "Sr", "II", "III", "IV", "2nd", "3rd", "4th"}
+# Suffix detection delegated to _helpers._is_name_suffix (covers Jr, Sr,
+# II-V, PhD, MD, and any \d+(st|nd|rd|th) ordinal — case-insensitive).
 
 
 def _find_author_title_boundary(text):
@@ -285,11 +432,20 @@ def _parse_cite_authors(section):
     section = section.strip()
     if not section:
         return []
+    # Distinguish suffix from initials: all-caps 1-2 letter tokens
+    # ('JR', 'MD') are canonical initials in citation form, not suffixes
+    # — even though 'jr' / 'md' are registered suffixes. Mixed-case
+    # 'Jr' / 'Md' or longer 'III' / '3rd' are real suffixes.
+    def is_real_suffix(tok):
+        if tok.isalpha() and tok.isupper() and 1 <= len(tok) <= 2:
+            return False
+        return _is_name_suffix(tok)
+
     chunks = [c.strip() for c in re.split(r",\s*|\s*&(?:amp;)?\s+", section) if c.strip()]
     merged = []
     for c in chunks:
         c_clean = c.rstrip(".").strip()
-        if merged and (_is_initials_only(c) or c_clean in _SUFFIXES):
+        if merged and (_is_initials_only(c) or is_real_suffix(c_clean)):
             merged[-1] = merged[-1] + " " + c_clean
         else:
             merged.append(c)
@@ -299,7 +455,7 @@ def _parse_cite_authors(section):
         surnames, initials, suffix = [], [], ""
         for tok in tokens:
             tok_clean = tok.rstrip(",.")
-            if tok_clean in _SUFFIXES:
+            if is_real_suffix(tok_clean):
                 suffix = tok_clean
                 continue
             stripped = re.sub(r"[.\-]", "", tok_clean)
@@ -342,8 +498,10 @@ def _parse_cite(cite_text):
     # Allow either ". YYYY" or ") YYYY" (e.g. "DNA Repair (Amst) 2005;...")
     # and make the vol/issue/pages tail optional (some refs stop at year +
     # doi without a ;Vol block).
+    # Allow an optional period after the year ('Nat Cell Biol. 2004. Jul;6(7):673-80')
+    # before the month/volume continuation.
     ym_a = re.search(
-        r"(?:\.|\))\s+(\d{4})(?:\s+\w+(?:\s+\d+)?)?(?:\s*[;:](.*))?$",
+        r"(?:\.|\))\s+(\d{4})\.?(?:\s+\w+(?:\s+\d+)?)?(?:\s*[;:](.*))?$",
         text, re.DOTALL,
     )
     # Format B/C: "(YYYY)..." — author-section ends at the paren
@@ -376,31 +534,45 @@ def _parse_cite(cite_text):
     elif ym_b:
         year = ym_b.group(1)
         after = ym_b.group(2).strip(" .,")
-        vip = re.search(
-            r"(\d+[A-Za-z]*)\s*\(\s*([\w\d\-\u2013]+)\s*\)\s*:\s*([^.]+?)\s*(?:\.|$)",
-            after,
-        )
-        vp = re.search(
-            r"(\d+[A-Za-z]*)\s*[,:]\s*([\w\d]+[-\u2013][\w\d]+|\d+)\b",
-            after,
-        )
-        if vip:
-            volume = vip.group(1)
-            issue = vip.group(2).replace("\u2013", "-")
-            pages = vip.group(3).replace("\u2013", "-").strip()
-            before_vip = after[:vip.start()].rstrip(" ,.")
-        elif vp:
-            volume = vp.group(1)
-            pages = vp.group(2).replace("\u2013", "-")
-            before_vip = after[:vp.start()].rstrip(" ,.")
+        # Book chapter: "ChapterTitle. In: BookTitle. Publisher, pp X-Y"
+        in_m = re.search(r"\.\s*In:\s*", after)
+        if in_m:
+            title = after[:in_m.start()].strip().lstrip(". ").rstrip(". ")
+            rest = after[in_m.end():].strip(" .,")
+            pp_m = re.search(r",?\s*pp\.?\s*([\w\d]+\s*[-\u2013]\s*[\w\d]+)\s*\.?\s*$", rest)
+            if pp_m:
+                pages = pp_m.group(1).replace("\u2013", "-").replace(" ", "")
+                rest = rest[:pp_m.start()].rstrip(",. ")
+            # "BookTitle. Publisher" → keep BookTitle as journal (the
+            # reference's parent publication); drop the publisher.
+            journal = rest.split(". ", 1)[0].rstrip(",. ")
+            volume = issue = ""
         else:
-            before_vip = after
-        parts = before_vip.rsplit(". ", 1)
-        if len(parts) == 2:
-            title = parts[0].lstrip(". ")
-            journal = parts[1].rstrip(",. ")
-        else:
-            title, journal = "", before_vip.rstrip(",. ")
+            vip = re.search(
+                r"(\d+[A-Za-z]*)\s*\(\s*([\w\d\-\u2013]+)\s*\)\s*:\s*([^.]+?)\s*(?:\.|$)",
+                after,
+            )
+            vp = re.search(
+                r"(\d+[A-Za-z]*)\s*[,:]\s*([\w\d]+[-\u2013][\w\d]+|\d+)\b",
+                after,
+            )
+            if vip:
+                volume = vip.group(1)
+                issue = vip.group(2).replace("\u2013", "-")
+                pages = vip.group(3).replace("\u2013", "-").strip()
+                before_vip = after[:vip.start()].rstrip(" ,.")
+            elif vp:
+                volume = vp.group(1)
+                pages = vp.group(2).replace("\u2013", "-")
+                before_vip = after[:vp.start()].rstrip(" ,.")
+            else:
+                before_vip = after
+            parts = before_vip.rsplit(". ", 1)
+            if len(parts) == 2:
+                title = parts[0].lstrip(". ")
+                journal = parts[1].rstrip(",. ")
+            else:
+                title, journal = "", before_vip.rstrip(",. ")
         author_section = text[:ym_b.start()].rstrip(" ,")
     else:
         return {
@@ -480,9 +652,13 @@ def _parse_references(html):
             r"scholar\.google\.com/scholar_lookup\?([^\"']+)", entry_html,
         )
         if scholar_m:
-            params = urllib.parse.parse_qs(
-                unescape(scholar_m.group(1)).replace("&amp;", "&")
-            )
+            # PMC's Scholar lookup URLs encode spaces as %20, so a literal
+            # "+" in the source ("NAD(+)-mediated") is meant as a plus
+            # sign — but parse_qs follows form-encoding rules and would
+            # decode it as a space. Pre-escape "+" so parse_qs returns it
+            # verbatim.
+            raw = unescape(scholar_m.group(1)).replace("&amp;", "&").replace("+", "%2B")
+            params = urllib.parse.parse_qs(raw)
             journal = params.get("journal", [""])[0]
             # Scholar URLs with bare & in journal (e.g. "Genes & Development")
             # get truncated by parse_qs. Fall back to <cite>-parsed journal.
@@ -507,6 +683,40 @@ def _parse_references(html):
                 "doi": format_doi(params.get("doi", [""])[0]),
                 "authors": authors,
             }
+            # Scholar URL in PMC sometimes emits just `pages=<volume>` when
+            # the paper has an elocation ID instead of a page range (e.g.
+            # EMBO J. 2019;38(5). → pages=38, no volume/issue). When the
+            # Scholar URL lacks volume but <cite> parsing produced volume,
+            # prefer the cite-parsed volume/issue/pages.
+            if cite_parsed and not ref["volume"] and cite_parsed.get("volume"):
+                ref["volume"] = cite_parsed["volume"]
+                ref["issue"] = cite_parsed.get("issue", "") or ref["issue"]
+                # If Scholar's `pages` duplicates the volume, it's the
+                # elocation-ID placeholder — drop it unless cite has real
+                # pages.
+                if ref["pages"] == cite_parsed["volume"]:
+                    ref["pages"] = cite_parsed.get("pages", "")
+                elif cite_parsed.get("pages") and not ref["pages"]:
+                    ref["pages"] = cite_parsed["pages"]
+            # Book chapter: Scholar URL puts the BOOK title in `title=` and
+            # omits the chapter title entirely. <cite> parsing detects the
+            # "In: BookTitle" pattern and splits chapter title from book
+            # title correctly — prefer cite's fields when cite identifies
+            # a book chapter (journal set, volume empty, pages present).
+            if (cite_parsed and cite_text and re.search(r"\.\s*In:\s*", cite_text)
+                    and cite_parsed.get("title") and cite_parsed.get("journal")):
+                ref["title"] = cite_parsed["title"]
+                ref["journal"] = cite_parsed["journal"]
+                if cite_parsed.get("pages") and not ref["pages"]:
+                    ref["pages"] = cite_parsed["pages"]
+            # Scholar URL doesn't always include doi; fall back to the
+            # DOI anchor link in the entry HTML.
+            if not ref["doi"]:
+                dm = re.search(
+                    r"https?://(?:dx\.)?doi\.org/(10\.[^\s\"'<>]+)", entry_html
+                )
+                if dm:
+                    ref["doi"] = format_doi(dm.group(1))
         elif cite_parsed:
             ref = cite_parsed
         else:

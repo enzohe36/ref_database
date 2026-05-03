@@ -11,7 +11,10 @@ from ._helpers import (
     format_doi,
     format_name,
     get_meta,
+    neutralize_media_queries,
     parse_meta_authors,
+    remove_elements_by_id,
+    remove_elements_by_selector,
     strip_common,
     strip_tags,
     tags_to_text,
@@ -48,46 +51,325 @@ _ABSTRACT_HEADING = "abstract-title"
 # Banner removal
 # ---------------------------------------------------------------------------
 
-def remove_banners(html):
-    """Remove floating banners, cookie consent dialogs, and overlays.
 
-    Targets OneTrust cookie consent banner and its dark overlay, and the
-    user-comments widget that lives inside article-body but is UI chrome
-    (h2 "Comments", "Add comment" button, etc.).
-
-    Portlandpress (Biochemical Society) papers additionally carry:
-    - widget-GdprCookieBanner: floating cookie notice ("This site uses
-      cookies. By continuing to use our website...").
-    - uwy userway_p1: UserWay accessibility menu floating button.
-
-    Rupress (rupress.org) papers carry Hypothes.is annotation widgets
-    (<hypothesis-sidebar>, -bucket-bar, -adder, -highlight-cluster-toolbar)
-    containing floating "Annotation sidebar" / "Show highlights" /
-    "New page note" buttons.
+def _extract_nested(html, start_pattern):
+    """Return (match_start, match_end, inner_html) for the first element
+    matching start_pattern, with the matching close tag located by
+    tracking same-tag nesting. Returns None when no match.
     """
-    html = _remove_nested_element(
-        html, r'<div[^>]*id=["\']?onetrust-banner-sdk[^>]*>'
+    m = re.search(start_pattern, html, re.DOTALL)
+    if not m:
+        return None
+    tag_m = re.match(r"<(\w+)", m.group())
+    if not tag_m:
+        return None
+    tag = tag_m.group(1)
+    pos = m.end()
+    depth = 1
+    open_pat = re.compile(rf"<{tag}[\s>]", re.IGNORECASE)
+    close_pat = re.compile(rf"</{tag}\s*>", re.IGNORECASE)
+    while depth > 0 and pos < len(html):
+        next_open = open_pat.search(html, pos)
+        next_close = close_pat.search(html, pos)
+        if next_close is None:
+            return None
+        if next_open and next_open.start() < next_close.start():
+            depth += 1
+            pos = next_open.end()
+        else:
+            depth -= 1
+            pos = next_close.end()
+    return m.start(), pos, html[m.start():pos]
+
+
+def _inline_metadata_widgets(html):
+    """Fill an empty `<div class="article-metadata-panel ...
+    at-ArticleMetadata">` placeholder with Keywords + Topic + Issue
+    Section so it renders as the single-box layout academic.oup.com
+    shows natively.
+
+    On oup.com, JS moves the three bands into that placeholder ~5–18 s
+    after load. When SingleFile captures before the JS settles (slow
+    network or cold cache) the placeholder is empty and the Topic /
+    Issue widgets still sit at the end of the article. This reproduces
+    the move statically. When the placeholder is already populated
+    (late-capture case) the function is a no-op.
+    """
+    # Locate the placeholder. Match both "clearfix at-ArticleMetadata"
+    # and "at-ArticleMetadata clearfix" orderings defensively.
+    ph = _extract_nested(
+        html,
+        r'<div[^>]*\bclass="[^"]*\bat-ArticleMetadata\b[^"]*"[^>]*>',
     )
-    html = re.sub(
-        r'<div[^>]*class="[^"]*onetrust-pc-dark-filter[^"]*"[^>]*></div>',
-        '', html,
+    if not ph:
+        return html
+    ph_start, ph_end, ph_full = ph
+    # Find the opening tag end to inspect inner HTML
+    ot_end = html.find(">", ph_start) + 1
+    inner = html[ot_end:ph_end - len("</div>")].strip()
+    if len(inner) > 100:
+        # Already populated by runtime JS — leave alone.
+        return html
+
+    # Extract Keywords, Topic, and the SolrResourceMetadata's inner
+    # panel (which holds article-metadata-taxonomies +
+    # article-metadata-tocSections as siblings). Use the INNER classes
+    # rather than the outer widget wrappers so the injected content
+    # sits as a direct child of the at-ArticleMetadata panel — matching
+    # what native academic.oup.com's JS does (it moves the children of
+    # .article-metadata-panel.solr-resource-metadata, not the panel
+    # itself, into the placeholder; and the outer .article-metadata-
+    # panel has `>div:first-of-type{border-top: ...}` which would
+    # render a line above Issue Section if any wrapper were kept).
+    kw = _extract_nested(
+        html,
+        r'<div\b[^>]*\bclass=["\']?kwd-group\b',
+    )
+    rt = _extract_nested(
+        html,
+        r'<div\b[^>]*\bclass=["\']?related-topic-tags\b',
+    )
+    # The inner SolrResourceMetadata panel — we pull its INNER HTML
+    # (its direct children: article-metadata-taxonomies, article-
+    # metadata-tocSections, and anything else the publisher adds on
+    # other papers) so they end up as siblings inside the placeholder.
+    rm_panel = _extract_nested(
+        html,
+        r'<div\b[^>]*\bclass="article-metadata-panel solr-resource-metadata[^"]*"',
+    )
+    if not (kw or rt or rm_panel):
+        return html
+
+    # Also remove the outer widget wrappers so Topic / Issue aren't
+    # duplicated at the end of the article body.
+    rt_widget = _extract_nested(
+        html,
+        r'<div\b[^>]*\bclass="widget widget-RelatedTags\b[^"]*"',
+    )
+    rm_widget = _extract_nested(
+        html,
+        r'<div\b[^>]*\bclass="widget widget-SolrResourceMetadata\b[^"]*"',
+    )
+
+    # Extract the rm_panel's inner-HTML (its direct children) rather
+    # than the panel wrapper itself.
+    rm_inner = ""
+    if rm_panel:
+        rm_start, rm_end, rm_full = rm_panel
+        rm_open_end = rm_full.find(">") + 1
+        rm_inner = rm_full[rm_open_end:-len("</div>")]
+
+    # Remove originals (highest offset first so earlier removals don't
+    # shift later offsets). Remove widget wrappers rather than just
+    # the inner divs to drop all the related chrome at the end.
+    found = [x for x in (kw, rt_widget, rm_widget) if x]
+    found.sort(key=lambda x: x[0], reverse=True)
+    kw_html = kw[2] if kw else ""
+    rt_html = rt[2] if rt else ""
+    for start, end, _inner in found:
+        html = html[:start] + html[end:]
+
+    # After removing, re-locate the placeholder (its offset may have
+    # shifted if any of the removed blocks preceded it).
+    ph2 = _extract_nested(
+        html,
+        r'<div[^>]*\bclass="[^"]*\bat-ArticleMetadata\b[^"]*"[^>]*>',
+    )
+    if not ph2:
+        return html
+    ph2_start, ph2_end, _ = ph2
+    ph2_ot_end = html.find(">", ph2_start) + 1
+
+    # Build the populated placeholder: Keywords → Topic →
+    # (taxonomies + Issue Section, etc. — whatever the inner solr panel
+    # held as siblings).
+    filled = kw_html + rt_html + rm_inner
+    return (
+        html[:ph2_ot_end]
+        + filled
+        + html[ph2_end - len("</div>"):]
+    )
+
+
+def remove_banners(html):
+    """Normalize OUP (Silverchair) HTML to a single centered text column.
+
+    Per format-html-extra.md the reading column spans "Journal Article"
+    through the last content before "Comments". Removals fall into
+    three buckets: (a) items format-html-extra.md names (cookie
+    consent, opacity overlay, reading-column anchors), (b) ads,
+    (c) toolbars. The right-side #Sidebar (related-taxonomies panel)
+    stays in the DOM.
+    """
+    # Lock layout to publisher's narrow (≤1024 px) form at any viewport.
+    html = neutralize_media_queries(html)
+    # -------------------------------------------------------------------
+    # Step 3 — strip chrome.
+    # -------------------------------------------------------------------
+    # (a) instruction-doc items --------------------------------------
+    # OneTrust cookie consent (banner + overlay + preference modal).
+    html = remove_elements_by_id(html, "onetrust-consent-sdk")
+    # Semi-transparent grey full-viewport blocker inline style.
+    html = _remove_nested_element(
+        html,
+        r'<div\b[^>]*\bstyle="[^"]*\bz-index:2000000000[^"]*\bopacity:0\.05',
+    )
+    # <section class=master-header>: site nav / journal banner above
+    # "Journal Article" start anchor.
+    html = _remove_nested_element(
+        html,
+        r'<section\b[^>]*\bclass="[^"]*\bmaster-header\b[^"]*"',
+    )
+    # <section class=footer_wrap>: site footer (below the "Comments"
+    # end anchor).
+    html = _remove_nested_element(
+        html,
+        r'<section\b[^>]*\bclass="[^"]*\bfooter_wrap\b[^"]*"',
+    )
+    # Bottom #Comment section: left in the DOM and hidden via CSS
+    # below. parse_main_text picks up the comment-modal boilerplate
+    # ("Add comment / ..."), so removing the DOM would break parity.
+    # (b) ads --------------------------------------------------------
+    html = remove_elements_by_id(
+        html,
+        "adBlockHeader", "adBlockMainBodyTop", "adBlockMainBodyBottom",
+        "adBlockFooter", "adBlockStickyFooter",
     )
     html = _remove_nested_element(
         html,
-        r'<div\s+class=(?:"[^"]*\bcomments\b[^"]*"|comments)(?=[\s>])',
+        r'<div\b[^>]*\bclass="[^"]*\bHeaderRevealerAd\b[^"]*"',
     )
-    html = _remove_nested_element(
-        html,
-        r'<div class="widget-GdprCookieBanner\b[^"]*"[^>]*>',
+    # (c) toolbars ---------------------------------------------------
+    # Left sidebar (#InfoColumn): issue info, Download/Cite/Share
+    # panel, article-section nav, sticky toolbar.
+    # Right sidebar (#Sidebar): related-taxonomies panel. Reflows
+    # BELOW ContentColumn once the layout is frozen to 720 px, so it
+    # becomes bottom chrome in the capped layout and honors the
+    # "ends before Comments" anchor.
+    html = remove_elements_by_id(html, "InfoColumn", "Sidebar")
+    # "Article Navigation" mobile toggle box that sits above the
+    # article body at narrow viewport widths.
+    for _ in range(5):
+        before = html
+        html = _remove_nested_element(
+            html,
+            r'<div\b[^>]*\bclass="[^"]*\barticle-browse-top\b[^"]*"',
+        )
+        if html == before:
+            break
+
+    # Fill the article-metadata box (Keywords / Topic / Issue Section)
+    # with the three widgets from the end of the article body. No-op
+    # when the retrieval already captured the post-JS state.
+    html = _inline_metadata_widgets(html)
+
+
+    # -------------------------------------------------------------------
+    # Steps 2 + 4 — layout freeze and reading-column cap.
+    # -------------------------------------------------------------------
+    override = (
+        "<style>"
+        "html{width:100% !important;max-width:100% !important;"
+        "margin:0 !important;background:#fff !important}"
+        "body{width:100% !important;min-width:0 !important;"
+        "max-width:752px !important;margin:0 auto !important;"
+        "background:#fff !important;color:#000 !important}"
+        # Cap ContentColumn — the article body lives here. With
+        # InfoColumn removed, it stands alone and can fill the wrapper.
+        "div#ContentColumn{"
+        "float:none !important;display:block !important;"
+        "width:auto !important;max-width:752px !important;"
+        "margin:0 auto !important;padding:56px 16px !important;"
+        "box-sizing:border-box !important;background:#fff !important}"
+        # Silverchair's .center-inner-row and .master-main apply a
+        # display:grid with named columns for InfoColumn + ContentColumn
+        # + Sidebar. With the siblings removed, collapse the grid so
+        # ContentColumn is placed at full width.
+        ":root body .master-main,"
+        ":root body .center-inner-row,"
+        ":root body .content-main,"
+        ":root body .master-container{"
+        "display:block !important;float:none !important;"
+        "width:auto !important;max-width:100% !important;"
+        "margin:0 !important;padding:0 !important}"
+        # Zero margin along the first-/last-descendant chain so
+        # collapsed margins don't leak through the wrapper's padding,
+        # while section titles deeper in the tree keep native margins.
+        "div#ContentColumn>*:first-child,"
+        "div#ContentColumn>*:first-child>*:first-child,"
+        "div#ContentColumn>*:first-child>*:first-child>*:first-child,"
+        "div#ContentColumn>*:first-child>*:first-child>*:first-child>*:first-child,"
+        "div#ContentColumn>*:first-child>*:first-child>*:first-child>*:first-child>*:first-child,"
+        "div#ContentColumn>*:first-child>*:first-child>*:first-child>*:first-child>*:first-child>*:first-child"
+        "{margin-top:0 !important}"
+        "div#ContentColumn>*:last-child,"
+        "div#ContentColumn>*:last-child>*:last-child,"
+        "div#ContentColumn>*:last-child>*:last-child>*:last-child,"
+        "div#ContentColumn>*:last-child>*:last-child>*:last-child>*:last-child,"
+        "div#ContentColumn>*:last-child>*:last-child>*:last-child>*:last-child>*:last-child,"
+        "div#ContentColumn>*:last-child>*:last-child>*:last-child>*:last-child>*:last-child>*:last-child"
+        "{margin-bottom:0 !important}"
+        # Clamp every descendant so fixed-width tables or figures don't
+        # overflow at narrow vw.
+        "div#ContentColumn *{max-width:100% !important;min-width:0 !important}"
+        "div#ContentColumn table{table-layout:fixed !important;"
+        "width:100% !important}"
+        # Hide the Comments section, modal, and "Add comment" button —
+        # must stay in the DOM so parse_main_text picks up the same
+        # strings it did before remove_banners, but should not render.
+        # The actual markup uses <div class=comments> with inner
+        # #usercomments, plus #divCommentModal and #comment-modal-opener.
+        "div#ContentColumn div.comments,"
+        "div#divCommentModal,div#Comment,"
+        "a#comment-modal-opener,#comment-modal-opener{display:none !important}"
+        # Figures: oup (Silverchair, same family as aacrjournals) wraps
+        # each figure in
+        #   <div data-id=<doi>-f<N> class="fig fig-section js-fig-section">
+        #     <div class=graphic-wrap>
+        #       <img class=content-image src="data:..." data-path-from-xml=<file>.tif>
+        #     </div>
+        #     <div class=graphic-bottom>
+        #       <div class="label fig-label">Figure N.</div>
+        #       <div class="caption fig-caption">...</div>
+        #       <div class="fig-orig original-slide figure-button-wrap">
+        #         <a class=fig-view-orig href=https://academic.oup.com/view-large/figure/...>
+        #            View Large</a>
+        #         <a class=ppt>Download Slide</a>
+        #       </div>
+        #     </div>
+        #   </div>
+        # Native order: image above caption (correct). The img is
+        # inlined directly — no separate hi-res link reachable as a
+        # direct image URL (view-large is a sub-page); get_refs.py
+        # extension deferred. Visual fixes: force img full-width above
+        # caption, hide JS-only "View Large" / "Download Slide" buttons
+        # (non-functional inside saved HTML).
+        "div#ContentColumn div.fig.fig-section{"
+        "margin:1rem 0 !important;padding:0 !important;"
+        "width:100% !important;max-width:100% !important;"
+        "display:block !important}"
+        "div#ContentColumn div.fig.fig-section .graphic-wrap{"
+        "margin:0 !important;padding:0 !important;"
+        "width:100% !important;max-width:100% !important}"
+        "div#ContentColumn div.fig.fig-section img.content-image{"
+        "display:block !important;width:100% !important;"
+        "height:auto !important;max-width:100% !important;"
+        "margin:0 0 5px 0 !important}"
+        # Drop the JS-only "View Large" / "Download Slide" button row
+        # inside .fig-orig.
+        "div#ContentColumn div.fig.fig-section .fig-orig.figure-button-wrap{"
+        "display:none !important}"
+        # Hide the modal-clone copy of the figure that Silverchair
+        # appends after each .fig-section (`<div class='fig fig-modal
+        # reveal-modal'>` — same fingerprint as aacrjournals — hidden
+        # via JS `aria-hidden=true`).
+        "div#ContentColumn div.fig.fig-modal{display:none !important}"
+        "</style>"
     )
-    html = _remove_nested_element(
-        html,
-        r'<div class="uwy userway_p1"[^>]*>',
-    )
-    html = re.sub(
-        r'<(hypothesis-[\w-]+)\b[^>]*>.*?</\1>',
-        '', html, flags=re.DOTALL,
-    )
+    if "</head>" in html:
+        html = html.replace("</head>", override + "</head>", 1)
+    else:
+        html = re.sub(r"(<body\b)", override + r"\1", html, count=1)
     return html
 
 

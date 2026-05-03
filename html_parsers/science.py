@@ -11,7 +11,9 @@ from ._helpers import (
     format_author_name,
     format_doi,
     get_meta,
+    neutralize_media_queries,
     remove_elements_by_id,
+    remove_elements_by_selector,
     strip_common,
     strip_tags,
     tags_to_text,
@@ -53,41 +55,421 @@ _SCIENCEADVISER_SIDEBAR_RE = re.compile(
 
 
 def remove_banners(html):
-    """Remove floating banners, cookie consent dialogs, and overlays.
+    """Normalize Science / AAAS HTML to a single centered text column.
 
-    - onetrust-consent-sdk: OneTrust cookie banner ("Accept Non-Essential
-      Cookies") on sagepub.com.
-    - main-header: site-wide top bar (dark navbar with hamburger menu,
-      header ads, quick search) on science.org.
-    - header fixed: site-wide top bar (Sage Journals logo, Search,
-      Access, Cart, nav) on sagepub.com.
-    - data-core-nav=header: floating article nav bar (Contents menu
-      button + section list + "Information & Authors" /
-      "Metrics & Citations" icon pills) on science.org. The collateral
-      panel content outside this bar is kept because _parse_authors
-      reads affiliations from it.
-    - alert-donation--visible: ScienceAdviser subscribe modal overlay.
-    - mb-2x/d-flex sidebar block containing the "Sign up for
-      ScienceAdviser" heading.
+    Chrome stripped (Step 3):
+      - <header> (main navigation, header--compact) and its #mainNavbar.
+      - "Get Science's award-winning newsletter" donation banner
+        (class "alert-donation").
+      - "eLetters" and everything below it inside <article> is hidden via
+        CSS (no stable id; stripped by section index).
+      - <footer> site chrome.
+      - Left-side collapsible menu (#header-side-menu), breadcrumbs nav,
+        article_sections_menu / article_collateral_menu floating nav bars,
+        right-rail <aside> (core-collateral, current-issue-aside,
+        multi-search, news-feature cards).
+
+    Reading column: <article typeof=ScholarlyArticle>. Science's layout
+    ships <article> as `display:grid` with a multi-column template that
+    confines body content to ~656 px of a 688-wide grid area. Force
+    `grid-template-columns: 1fr` and cap the article to 752 px.
     """
-    html = remove_elements_by_id(html, "onetrust-consent-sdk")
+    # Lock layout to publisher's narrow (≤1024 px) form at any viewport.
+    html = neutralize_media_queries(html)
+    # -------------------------------------------------------------------
+    # Step 3 — strip chrome.
+    # -------------------------------------------------------------------
+    # Outer site <header class="main-header ...">. The article uses
+    # nested <header data-extent=frontmatter> elements for title /
+    # authors / affiliations which must stay; keying on class=main-header
+    # avoids those.
+    html = _remove_nested_element(
+        html, r'<header\b[^>]*class="[^"]*main-header[^"]*"[^>]*>'
+    )
+    # Siblings of the outer header (literatum leaderboard ad, secondary
+    # header bar, main-menu dropdowns) live OUTSIDE the <header> wrapper
+    # above — strip each by distinguishing class/id. Multiple pb-ad
+    # blocks may appear; loop.
+    for _ in range(6):
+        before = html
+        html = _remove_nested_element(
+            html, r'<div\b[^>]*class="[^"]*\bheader-ads\b[^"]*"[^>]*>'
+        )
+        if html == before:
+            break
+    for cls_pat in (
+        r'header-sidebar',
+        r'main-header__secondary',
+        r'secondary-dropdown',
+        r'st-header',  # fixed-position article sticky toolbar
+    ):
+        html = _remove_nested_element(
+            html, rf'<div\b[^>]*\bclass=["\']?[^"\'>]*\b{cls_pat}\b[^>]*>'
+        )
+    html = remove_elements_by_id(html, "main-menu")
+    for _ in range(6):
+        before = html
+        html = _remove_nested_element(html, r"<footer\b[^>]*>")
+        if html == before:
+            break
+    # After-credits row (Share / Download PDF) trailing the article.
+    # Class is unquoted so match permissively. Don't target
+    # `core-container` — that class also wraps lots of in-article
+    # material (sections / figures / tables).
+    html = _remove_nested_element(
+        html, r'<div\b[^>]*\bclass=["\']?[^"\'>]*\bafter-credits\b[^>]*>'
+    )
+    # Left side menu + floating nav chrome (class strings are double
+    # quoted on these; selector helper matches).
+    html = remove_elements_by_id(
+        html,
+        "header-side-menu",
+        "mainNavbar",
+        "article_sections_menu",
+        "article_collateral_menu",
+        "CybotCookiebotDialog",
+        "CybotCookiebotDialogBodyUnderlay",
+    )
+    html = remove_elements_by_selector(html, "alert-donation")
+    # "SIGN UP FOR THE AWARD-WINNING SCIENCEADVISER NEWSLETTER" promo
+    # form (`<form class="news-article__newsletter ...">`) that renders
+    # in the article body.
+    for _ in range(3):
+        before = html
+        html = _remove_nested_element(
+            html,
+            r'<form\b[^>]*\bclass=["\']?[^"\'>]*\bnews-article__newsletter\b',
+        )
+        if html == before:
+            break
+    # "Sign up for ScienceAdviser" newsletter-promo box that renders
+    # between Abstract and INTRODUCTION. No stable semantic class —
+    # the outer wrapper is a utility-class chain (`.mt-2x` >
+    # `.mb-2x.mb-xl-3x` > `.d-flex...`). Strip the `.mt-2x` div that
+    # contains the ScienceAdviser heading.
+    m = re.search(r"Sign up for ScienceAdviser", html)
+    if m:
+        # Walk backward to the last `<div class="mt-2x">` before this
+        # text, then use _remove_nested_element to strip it.
+        back = html.rfind('<div class=mt-2x>', 0, m.start())
+        if back < 0:
+            back = html.rfind('<div class="mt-2x">', 0, m.start())
+        if back >= 0:
+            # Find matching </div> via nesting counter starting after <div>
+            depth = 1
+            pos = back + html[back:].find('>') + 1
+            while depth > 0 and pos < len(html):
+                nopen = html.find('<div', pos)
+                nclose = html.find('</div>', pos)
+                if nclose < 0:
+                    break
+                if 0 <= nopen < nclose:
+                    depth += 1
+                    pos = nopen + 4
+                else:
+                    depth -= 1
+                    pos = nclose + 6
+            if depth == 0:
+                html = html[:back] + html[pos:]
+    # Breadcrumb and content-navigation are <nav> (not <div>), so
+    # remove_elements_by_selector misses them. Strip directly. Loop —
+    # multiple copies exist.
+    for cls_pat in ("breadcrumbs", "content-navigation"):
+        for _ in range(4):
+            before = html
+            html = _remove_nested_element(
+                html,
+                rf'<nav\b[^>]*\bclass=["\']?[^"\'>]*\b{cls_pat}\b[^>]*>',
+            )
+            if html == before:
+                break
+    # Right-rail aside (core-collateral, current issue, news-feature).
+    html = _remove_nested_element(
+        html, r'<aside\b[^>]*data-core-aside=["\']?right-rail'
+    )
+    # Article sections toolbar (black bar with hamburger + article-nav
+    # icons, position:sticky in native). Strip from DOM entirely — the
+    # user's "no floating menu hamburger" request implies the bar
+    # itself shouldn't show either, and keeping a DOM shell only leaves
+    # unused vertical whitespace.
+    html = _remove_nested_element(
+        html, r'<div\b[^>]*\bdata-core-nav=["\']?header'
+    )
+    # Strip the `hidden` attribute from every <div role=listitem>
+    # inside the references [data-method=clamp] wrapper. These trailing
+    # entries are hidden by default and revealed on clicking
+    # "Show all references"; stripping the attribute leaves them
+    # rendered with native layout. The `hidden` attribute can be
+    # double-quoted, unquoted, or a bare attribute — match all.
+    html = re.sub(
+        r'(<div\b[^>]*role=listitem[^>]*?)\s+hidden(?=[\s>])',
+        r'\1',
+        html,
+    )
+    html = re.sub(
+        r'(<div\b[^>]*role=listitem[^>]*?)\s+hidden="[^"]*"',
+        r'\1',
+        html,
+    )
+    # Remove `.references-popup-wrapper` from the DOM (not just CSS hide).
+    # It ships as a `position:sticky; top:80px` hover-tooltip helper —
+    # offline rendering doesn't need it and its sticky positioning adds
+    # a ghost 24-px offset to the article's first-rendered child even
+    # when hidden with display:none in some browsers.
     html = _remove_nested_element(
         html,
-        r'<header class="main-header\b[^"]*"[^>]*>',
+        r'<div\b[^>]*\bclass=["\']?[^"\'>]*\breferences-popup-wrapper\b',
     )
-    html = _remove_nested_element(
+    # DOM patch: Atypon ships citation metrics as
+    # `<span class=total-text data-count=XXX>0</span>` and relies on
+    # client JS to replace the "0" with the real count at render time.
+    # SingleFile captures before JS runs, so both Downloads and
+    # Citations render as "0". Substitute the real value (comma-
+    # formatted) at capture time. Same pattern as the pnas parser.
+    def _patch_total_text(match):
+        open_tag = match.group(1)
+        count = int(match.group(2))
+        close_tag = match.group(3)
+        return f"{open_tag}{count:,}{close_tag}"
+    html = re.sub(
+        r'(<span\b[^>]*\bclass=["\']?[^"\'>]*\btotal-text\b[^"\'>]*["\']?[^>]*\bdata-count=["\']?(\d+)["\']?[^>]*>)'
+        r'\s*0\s*'
+        r'(</span>)',
+        _patch_total_text,
         html,
-        r'<header class="header fixed"[^>]*>',
+        flags=re.IGNORECASE,
     )
-    html = _remove_nested_element(
-        html,
-        r'<div data-core-nav=header\b[^>]*>',
+
+    # -------------------------------------------------------------------
+    # Steps 2 + 4 — layout freeze and reading-column cap.
+    # -------------------------------------------------------------------
+    override = (
+        "<style>"
+        "html{width:100% !important;max-width:100% !important;"
+        "margin:0 !important;background:#fff !important;"
+        "overflow-y:overlay !important}"
+        "html::-webkit-scrollbar{width:0 !important;height:0 !important}"
+        "body{width:100% !important;min-width:0 !important;"
+        "max-width:752px !important;margin:0 auto !important;"
+        "background:#fff !important;color:#000 !important}"
+        # Collapse wrappers between body and the article.
+        "main,#main,#main-content,.page,.container,.container-fluid,"
+        ".row,.col,[class*=col-]{"
+        "display:block !important;float:none !important;"
+        "width:100% !important;max-width:100% !important;"
+        "min-width:0 !important;flex:0 0 auto !important;"
+        "margin:0 !important;padding:0 !important;"
+        "box-sizing:border-box !important;background:#fff !important}"
+        # Cap the article wrapper and neutralize its grid template.
+        "article[typeof=ScholarlyArticle]{"
+        "float:none !important;display:block !important;"
+        "width:auto !important;max-width:752px !important;"
+        "margin:0 auto !important;padding:56px 16px !important;"
+        "box-sizing:border-box !important;background:#fff !important;"
+        "grid-template-columns:1fr !important;"
+        "grid-template-areas:none !important}"
+        "article[typeof=ScholarlyArticle] *{"
+        "max-width:100% !important;min-width:0 !important;"
+        "grid-area:auto !important}"
+        # Exempt the info-panel action buttons (Notifications / Bookmark
+        # / Cite / PDF) from the `min-width:0` sweep — native sets them
+        # to 40×40 px icon buttons with ~8 px padding around the 24-px
+        # icon. Zeroing min-width collapsed them to ~26 px (icon width +
+        # hairline padding), making them look horizontally squashed.
+        "article[typeof=ScholarlyArticle] .info-panel a.btn--slim,"
+        "article[typeof=ScholarlyArticle] .info-panel .btn--pdf,"
+        "article[typeof=ScholarlyArticle] .info-panel .btn{"
+        "min-width:40px !important;"
+        # Enforce a consistent 40×40 square across viewport widths. A
+        # native media query shortens .btn--slim to 32 px height at
+        # ≥992 px viewports, which makes the icon boxes look
+        # horizontally stretched at wider pages. Force 40.
+        "height:40px !important;min-height:40px !important}"
+        # `.info-panel` is the metrics + action-buttons row between the
+        # article header and body, bracketed by a 1 px top border and a
+        # 1 px bottom border. Center contents vertically (symmetric
+        # 12 px padding) and put metrics on the left, buttons on the
+        # right (flex row, space-between) — matches the pnas layout.
+        ":root article[typeof=ScholarlyArticle] .info-panel{"
+        "display:flex !important;flex-direction:row !important;"
+        "flex-wrap:nowrap !important;"
+        "justify-content:space-between !important;"
+        "align-items:center !important;"
+        "padding-top:12px !important;padding-bottom:12px !important}"
+        ":root article[typeof=ScholarlyArticle] .info-panel__left-content,"
+        ":root article[typeof=ScholarlyArticle] .info-panel__right-content{"
+        "width:auto !important;max-width:none !important;"
+        "flex:0 1 auto !important;margin:0 !important;"
+        # Remove the stray top border on right-content (draws a spurious
+        # line above the action icons) and bottom border for symmetry.
+        "border-top:0 !important;border-bottom:0 !important;"
+        "padding-top:0 !important;padding-bottom:0 !important;"
+        # Flex-center the inner button row vertically (default column
+        # layout combined with the hidden dropdown sibling bottom-aligns
+        # the tools otherwise).
+        "justify-content:center !important;align-items:center !important}"
+        # Restore native min-width on reference numeric labels. The
+        # `*{min-width:0}` rule above collapses `[role=listitem]>.label`
+        # (24-px red circle number) to its text width (~5 px). The
+        # native stylesheet sets min-width:1.5rem/24px/height:1.5rem.
+        "article[typeof=ScholarlyArticle] [role=listitem]>.label{"
+        "min-width:1.5rem !important;height:1.5rem !important;"
+        "flex:0 0 1.5rem !important;flex-shrink:0 !important}"
+        # Zero margin/padding only on the wrapper's DIRECT first/last
+        # children so inner sections (e.g. "Editor's summary") keep
+        # their native top margin.
+        "article[typeof=ScholarlyArticle]>*:first-child{"
+        "margin-top:0 !important;padding-top:0 !important}"
+        "article[typeof=ScholarlyArticle]>*:last-child{"
+        "margin-bottom:0 !important;padding-bottom:0 !important}"
+        # Descendant *:last-child margin-bottom zero (safe per skill).
+        # Catches nested trailing margins (references list, eLetters
+        # sibling padding) that the direct-child form leaves behind.
+        # Margin-only — descendant padding-zero kills the bordered
+        # `Download` button's native pb=8 in the Supplementary Materials
+        # block, collapsing it to 26 → 34 px (loses bottom border).
+        "article[typeof=ScholarlyArticle] *:last-child{"
+        "margin-bottom:0 !important}"
+        # Author-list collapse — Atypon hides authors with
+        # `data-hidden-on=sm` / `sm md` / etc. at narrow viewports
+        # (replaced by a `[...]` truncation marker + "+N authors"
+        # button). The 752-px body cap triggers narrow mode; force
+        # all authors visible and hide the now-redundant truncation
+        # markers + count pill.
+        ":root .contributors .authors [data-hidden-on]{"
+        "display:inline !important}"
+        ".contributors .authors [data-displayed-on],"
+        ".contributors .extra-authors-list,"
+        ".contributors .authors__hidden-extra,"
+        ".contributors__count{display:none !important}"
+        # The "Show all references" button has internal vertical padding
+        # that pushes past the last rendered character. Zero its internal
+        # padding so the wrapper's own 56-px bottom padding is the only
+        # contributor to the bottom gap.
+        "article[typeof=ScholarlyArticle] .truncation-wrapper,"
+        "article[typeof=ScholarlyArticle] .truncation-wrapper *{"
+        "padding-top:0 !important;padding-bottom:0 !important;"
+        "margin-top:0 !important;margin-bottom:0 !important;"
+        "border-top:0 !important;border-bottom:0 !important}"
+        # Science nests sidebars (.core-collateral, .current-issue-aside,
+        # .multi-search, .card-do--news-feature) with negative margins
+        # inside the article — they snap to x=0. Hide them.
+        "article[typeof=ScholarlyArticle] .core-collateral,"
+        "article[typeof=ScholarlyArticle] .current-issue-aside,"
+        "article[typeof=ScholarlyArticle] .multi-search,"
+        "article[typeof=ScholarlyArticle] .card-do--news-feature{"
+        "display:none !important}"
+        # `.references-popup-wrapper` is a hover popup helper (shows a
+        # tooltip when you hover a reference number). Native renders it
+        # as `position:sticky; top:80px`, which in our non-grid cleaned
+        # layout pushes the whole article down by 24 px so first-text T
+        # becomes 80 instead of target 56. Offline rendering doesn't
+        # need hover popups — hide the wrapper.
+        "article[typeof=ScholarlyArticle] > .references-popup-wrapper{"
+        "display:none !important}"
+        # Empty placeholder div inside the article header for an optional
+        # news-feature badge: `<div class="mb-1_5x mt-3">` with no
+        # children. Its margins (mt:16, mb:24) collapse to 24 px and
+        # escape through the HEADER/core-container parents, pushing the
+        # first content 24 px below the article's content-top. Zero them.
+        "article[typeof=ScholarlyArticle] header .mb-1_5x.mt-3{"
+        "margin:0 !important}"
+        # `.meta-panel` is `display:flex; align-items:center` — the
+        # left-content (article-type label) is shorter than the right-
+        # content (action buttons) so flex centers it ~5 px below the
+        # meta-panel's content-top. Use flex-start so the article-type
+        # label aligns flush with the wrapper's padding-top edge.
+        "article[typeof=ScholarlyArticle] .meta-panel{"
+        "align-items:flex-start !important}"
+        # Hide eLetters comments section at the bottom of the article.
+        "article[typeof=ScholarlyArticle] section[data-extent=eletters],"
+        "article[typeof=ScholarlyArticle] #eletters,"
+        "article[typeof=ScholarlyArticle] section[id^=eletters]{"
+        "display:none !important}"
+        # Expand collapsed figure captions ("Expand for more") and the
+        # references truncation ("Show all references"). Native layout:
+        #   Captions:  <div class="collapsible-wrapper collapsed"
+        #              style="height:248px"> with
+        #              .collapsible-wrapper.collapsed { max-height:132px;
+        #              overflow:hidden } and a ::after white-gradient
+        #              overlay (140 px tall) that fades out the bottom.
+        #   References: .items-collapse__items.collapse with
+        #              height:510px and the same ::after gradient.
+        # Override both the height constraints and the gradient overlays,
+        # and hide the expand affordance buttons.
+        "article[typeof=ScholarlyArticle] .collapsible-wrapper,"
+        "article[typeof=ScholarlyArticle] .collapsible-wrapper.collapsed,"
+        "article[typeof=ScholarlyArticle] .items-collapse__items,"
+        "article[typeof=ScholarlyArticle] .items-collapse__items.collapse,"
+        "article[typeof=ScholarlyArticle] "
+        ".items-collapse:not(.hide-show-more) .items-collapse__items.collapse,"
+        "article[typeof=ScholarlyArticle] .collapse{"
+        "height:auto !important;max-height:none !important;"
+        "overflow:visible !important;display:block !important;"
+        "-webkit-line-clamp:unset !important;"
+        "-webkit-box-orient:horizontal !important}"
+        "article[typeof=ScholarlyArticle] .collapsible-wrapper.collapsed::after,"
+        "article[typeof=ScholarlyArticle] .items-collapse__items::after,"
+        "article[typeof=ScholarlyArticle] "
+        ".items-collapse:not(.hide-show-more) .items-collapse__items::after,"
+        "article[typeof=ScholarlyArticle] [data-method]::after{"
+        "display:none !important;content:none !important}"
+        # References list uses [data-method=clamp] on a div wrapper.
+        # Un-clip it (its `hidden` attributes on trailing listitems are
+        # also removed in the Step-3 DOM sweep below so items render
+        # with their native layout, same as after clicking
+        # "Show all references").
+        "article[typeof=ScholarlyArticle] [data-method]{"
+        "overflow:visible !important;max-height:none !important;"
+        "height:auto !important}"
+        "article[typeof=ScholarlyArticle] .collapsible-figure-btn__wrapper,"
+        "article[typeof=ScholarlyArticle] .truncation-wrapper,"
+        "article[typeof=ScholarlyArticle] .items-collapse__truncation{"
+        "display:none !important}"
+        # Figures / tables may ship with fixed pixel widths — clamp.
+        "article[typeof=ScholarlyArticle] figure,"
+        "article[typeof=ScholarlyArticle] table,"
+        "article[typeof=ScholarlyArticle] img,"
+        "article[typeof=ScholarlyArticle] iframe{"
+        "width:100% !important;max-width:100% !important;"
+        "height:auto !important}"
+        # Figures: science.org (Atypon, same family as nejm/pnas) wraps
+        # each figure in
+        #   <div class=figure-wrap>
+        #     <button class="figure-pop-btn">OPEN IN VIEWER</button>
+        #     <figure id=F<N> class=graphic>
+        #       <img src='data:image/svg+xml,<placeholder>'
+        #            style="background-image:var(--sf-img-N) ..."
+        #            height=<H> width=<W>>
+        #       <figcaption>
+        #         <div class=caption><span class=heading>Fig. N</span> title</div>
+        #         <div class=notes><div role=doc-footnote>...body...</div></div>
+        #       </figcaption>
+        #     </figure>
+        #   </div>
+        # The image is rendered via SingleFile's `background-image:
+        # var(--sf-img-N)` (foreground src is transparent SVG). Native
+        # `<figure>` margin and the JS-only "OPEN IN VIEWER" button
+        # cause visual chrome above the image. Force figure full-width
+        # block, hide the JS-only button, force img display:block at
+        # full width with 5 px caption gap.
+        ":root article[typeof=ScholarlyArticle] figure.graphic{"
+        "margin:1rem 0 !important;padding:0 !important;"
+        "display:block !important;"
+        "width:100% !important;max-width:100% !important}"
+        ":root article[typeof=ScholarlyArticle] figure.graphic > img{"
+        "display:block !important;width:100% !important;"
+        "height:auto !important;max-width:100% !important;"
+        "margin:0 0 5px 0 !important}"
+        # Hide the JS-only OPEN IN VIEWER button (lightbox is JS-only).
+        ":root article[typeof=ScholarlyArticle] .figure-wrap "
+        "button.figure-pop-btn{display:none !important}"
+        "</style>"
     )
-    html = _remove_nested_element(
-        html,
-        r'<div class="alert-donation bg-white alert-donation--visible"[^>]*>',
-    )
-    html = _SCIENCEADVISER_SIDEBAR_RE.sub("", html)
+    if "</head>" in html:
+        html = html.replace("</head>", override + "</head>", 1)
+    else:
+        html = re.sub(r"(<body\b)", override + r"\1", html, count=1)
     return html
 
 
@@ -421,6 +803,23 @@ def _parse_one_reference(block):
             volume = vm.group(1)
             if not issue and vm.group(2):
                 issue = vm.group(2)
+
+    # Pages missing from scholar_lookup/OpenURL on Science e-only papers
+    # (article numbers like "aab4070", "e2201662119") — pull the token
+    # between the volume </b> and the "(YEAR)" from the citation text.
+    if not pages:
+        pm = re.search(
+            r"</b>[,\s]*"
+            r"(?:\([^)]*\)[,\s]*)?"  # optional issue in parens
+            r"([A-Za-z]?[\w.\-\u2010-\u2014]+?)"
+            r"\s*\(\d{4}\)",
+            raw_html,
+        )
+        if pm:
+            tok = re.sub(r'[\u2010-\u2014]', '-', pm.group(1)).strip(".,")
+            # Accept article numbers, page ranges, or dotted numbering.
+            if re.match(r'^[A-Za-z]?[\w.]+(-[A-Za-z]?[\w.]+)?$', tok):
+                pages = tok
 
     # Reformat author strings: "R. J. O'Sullivan" -> "O'Sullivan RJ".
     # Treat ALL leading short uppercase tokens (with optional trailing dot)

@@ -12,8 +12,10 @@ from ._helpers import (
     format_name,
     get_all_meta,
     get_meta,
+    neutralize_media_queries,
     parse_meta_authors,
     remove_elements_by_id,
+    remove_elements_by_selector,
     strip_common,
     strip_tags,
     tags_to_text,
@@ -47,15 +49,189 @@ _SUPP_RE = re.compile(
 # ---------------------------------------------------------------------------
 
 def remove_banners(html):
-    """Remove floating banners, cookie consent dialogs, and overlays.
+    """Normalize Frontiers HTML to a single centered text column.
 
-    - onetrust-consent-sdk: OneTrust cookie banner ("We use cookies /
-      Our website uses cookies...") and its dark overlay.
-    - <nav class=Ibar>: floating top bar (Frontiers logo, menu
-      hamburger "Open Menu", Search, Login).
+    Frontiers renders articles as ``<div class=ArticleDetailsV4>`` (a
+    CSS grid with three tracks) holding
+    ``<aside ArticleDetailsV4__asideLeft>`` (outline / actions),
+    ``<main ArticleDetailsV4__main>`` (title + abstract + body +
+    references), and ``<aside ArticleDetailsV4__asideRight>`` (metrics
+    + download).
+
+    Chrome stripped (Step 3):
+      - ``<nav class=Ibar>`` top site bar and ``<footer class=Footer>``.
+      - OneTrust cookie banner (``#onetrust-consent-sdk``).
+      - Both ``ArticleDetailsV4__asideLeft`` and ``ArticleDetailsV4__asideRight``
+        aside columns.
+      - Trailing ``.Summary`` card (keywords / citation / received /
+        accepted / published metadata) that sits after References.
+
+    Reading column (Step 4): ``main.ArticleDetailsV4__main`` is the
+    wrapper. Because its parent is ``display:grid`` the wrapper must be
+    explicitly dropped to block layout so the 752 px cap applies.
     """
+    # Lock layout to publisher's narrow (≤1024 px) form at any viewport.
+    html = neutralize_media_queries(html)
+    # -------------------------------------------------------------------
+    # Step 3 — strip chrome.
+    # -------------------------------------------------------------------
+    html = _remove_nested_element(
+        html, r"<nav\b[^>]*\bclass=[\"\']?[^\"'>]*\bIbar\b[^\"'>]*[\"\']?[^>]*>",
+    )
+    html = _remove_nested_element(html, r"<footer\b[^>]*>")
+    html = _remove_nested_element(html, r"<header\b[^>]*>")
     html = remove_elements_by_id(html, "onetrust-consent-sdk")
-    html = _remove_nested_element(html, r"<nav class=Ibar\b[^>]*>")
+    html = _remove_nested_element(
+        html,
+        r"<aside\b[^>]*\bclass=[\"\']?[^\"'>]*ArticleDetailsV4__asideLeft[^\"'>]*[\"\']?[^>]*>",
+    )
+    html = _remove_nested_element(
+        html,
+        r"<aside\b[^>]*\bclass=[\"\']?[^\"'>]*ArticleDetailsV4__asideRight[^\"'>]*[\"\']?[^>]*>",
+    )
+    # KEEP the trailing `.Summary` card (keywords + citation + received
+    # / accepted / published + volume + edited-by + reviewed-by) and
+    # the `<div class=ArticleMetrics>` inside the main column — both
+    # are article metadata, not chrome.
+    # Social and misc floating widgets if present.
+    html = remove_elements_by_id(html, "SI_9ZuT94UT81FcRh4")
+
+    # -------------------------------------------------------------------
+    # Steps 2 + 4 — layout freeze and reading-column cap.
+    # The marker comment makes injection idempotent — re-running
+    # remove_banners on already-formatted HTML strips the previous block
+    # before injecting the new one (otherwise convert_html accumulates one
+    # duplicate style block per run on the same file).
+    # -------------------------------------------------------------------
+    _INJECT_MARKER = "<!--frontiersin-format-html-->"
+    html = re.sub(
+        re.escape(_INJECT_MARKER) + r"<style>.*?</style>",
+        "", html, flags=re.DOTALL,
+    )
+    override = (
+        _INJECT_MARKER
+        + "<style>"
+        "html{width:100% !important;max-width:100% !important;"
+        "margin:0 !important;background:#fff !important;"
+        "overflow-y:overlay}"
+        "html::-webkit-scrollbar{width:0}"
+        "body{width:100% !important;min-width:0 !important;"
+        "max-width:100% !important;margin:0 auto !important;"
+        "background:#fff !important;color:#000 !important}"
+        # `.ArticleDetailsV4` ships as `display:grid` with left-aside /
+        # main / right-aside tracks. After removing the asides the main
+        # still lives inside a grid cell that's narrower than the
+        # viewport; collapse the grid to plain block. Prefix `:root` to
+        # out-rank the publisher's Vue-scoped class selectors.
+        ":root .ArticleDetailsV4,:root .ArticlePage,"
+        ":root .ArticleContent,"
+        ":root .ArticleDetailsV4__main__content{"
+        "display:block !important;grid-template-columns:1fr !important;"
+        "grid-template-rows:none !important;"
+        "width:auto !important;max-width:100% !important;"
+        "margin:0 !important;padding:0 !important}"
+        # Capped reading column (Step 4) on the <main> wrapper.
+        "main.ArticleDetailsV4__main{"
+        "float:none !important;display:block !important;"
+        "width:auto !important;max-width:752px !important;"
+        "margin:0 auto !important;padding:56px 16px !important;"
+        "box-sizing:border-box !important;background:#fff !important}"
+        "main.ArticleDetailsV4__main *{"
+        "max-width:100% !important;min-width:0 !important}"
+        # InfoDrawer is a full-viewport sidebar overlay that re-opens
+        # whenever the main is wider than mobile; hide it (outside wrap,
+        # so `display:none` is fine here).
+        ".InfoDrawer{display:none !important}"
+        # Expand the collapsed author / affiliation lists so the full
+        # author info is visible without clicking "See more". Frontiers
+        # marks the collapsed variant with `PeopleList__list--hidden` /
+        # `AffiliationList--hidden` and uses width:0 / height:0 / etc.
+        # to hide items beyond the first 8.
+        ":root .PeopleList__list--hidden > li,"
+        ":root .AffiliationList--hidden li{"
+        "width:auto !important;height:auto !important;"
+        "margin-left:0 !important;opacity:1 !important;"
+        "visibility:visible !important;overflow:visible !important}"
+        ":root .PeopleList__list--hidden > li .PeopleListItem__name{"
+        "width:auto !important;height:auto !important;opacity:1 !important;"
+        "overflow:visible !important}"
+        # Hide the now-redundant "See more" triggers.
+        ".PeopleList__buttonWrapper,.AffiliationList__buttonWrapper{"
+        "display:none !important}"
+        # First-/last-child margin stacking — scope to the wrapper's
+        # direct children only. Deep-tree `*:first-child` flattens
+        # legitimate section-header spacing inside the article body.
+        "main.ArticleDetailsV4__main > *:first-child{"
+        "margin-top:0 !important;padding-top:0 !important}"
+        "main.ArticleDetailsV4__main > *:last-child{"
+        "margin-bottom:0 !important;padding-bottom:0 !important}"
+        # Descendant *:last-child margin-bottom zero (margin only —
+        # safe per skill pitfall #1; descendant padding-bottom:0 would
+        # collapse bordered-box interiors). The .Summary card's
+        # internal sections cascade ~74 px of margin-bottom below the
+        # last visible text to the wrapper's inner edge.
+        "main.ArticleDetailsV4__main *:last-child{"
+        "margin-bottom:0 !important}"
+        # `.AffiliationList` is the last child of `.PeopleList` — the
+        # descendant rule above zeros its publisher-native mb=16 px,
+        # collapsing the gap between the affiliation list and the
+        # following `.ArticleMetrics` pill. Restore it explicitly with
+        # higher specificity (more class tokens) than the descendant
+        # `*:last-child` rule (specificity 0,2,1).
+        ":root main.ArticleDetailsV4__main .AffiliationList{"
+        "margin-bottom:16px !important}"
+        # Empty visual divider after .ArticleContent injects 56 px of
+        # padding-bottom inside .ArticleDetailsV4__main__content.
+        ".ArticleDetailsV4__main__divider{display:none !important}"
+        # Figures: frontiersin wraps each figure in
+        #   <div class=ArticleFigure id=F<N>>
+        #     <div class=ArticleFigure__header>
+        #       <p class=ArticleFigure__title>FIGURE N</p>
+        #       <button>Download</button><button>Expand</button>
+        #     </div>
+        #     <button class=ArticleFigure__figureButton>
+        #       <figure class=FrontiersImage>
+        #         <picture class=FrontiersImage>
+        #           <img src="data:image/webp;base64,..." class=is-inside-mask>
+        #         </picture>
+        #         <figcaption><p>caption</p></figcaption>
+        #       </figure>
+        #     </button>
+        #   </div>
+        # The image is medium-res webp (~6-60 KB). No high-res URL is
+        # exposed in the saved DOM — get_refs.py extension deferred.
+        # Visual fixes: hide the JS-only Download/Expand buttons in
+        # the header (dead chrome without JS), neutralize the wrapping
+        # `<button>` (no native button styling), force the img to
+        # display:block at full column width above the figcaption.
+        ":root main.ArticleDetailsV4__main "
+        ".ArticleFigure__header button,"
+        ":root main.ArticleDetailsV4__main "
+        ".ArticleFigure__figureButton{"
+        "all:unset !important;display:block !important;"
+        "width:100% !important;cursor:default !important}"
+        ":root main.ArticleDetailsV4__main "
+        ".ArticleFigure__header button{display:none !important}"
+        ":root main.ArticleDetailsV4__main "
+        "div.ArticleFigure{margin:1rem 0 !important;padding:0 !important}"
+        ":root main.ArticleDetailsV4__main "
+        "figure.FrontiersImage,"
+        ":root main.ArticleDetailsV4__main "
+        "picture.FrontiersImage{"
+        "display:block !important;margin:0 !important;padding:0 !important}"
+        ":root main.ArticleDetailsV4__main "
+        "picture.FrontiersImage > img{"
+        "display:block !important;width:100% !important;"
+        "height:auto !important;max-width:100% !important;"
+        "margin:0 0 5px 0 !important}"
+        "</style>"
+    )
+    # Frontiers' HTML tucks the top-level ``</head>`` after two
+    # iframe ``srcdoc`` attributes that also embed ``</head>`` as text,
+    # so the first ``</head>`` match lands inside an attribute value
+    # and the injected CSS never reaches the real document head.
+    # Inject before the first top-level ``<body`` instead.
+    html = re.sub(r"(<body\b)", override + r"\1", html, count=1)
     return html
 
 
@@ -326,15 +502,21 @@ def _parse_ref_entry(entry_html):
         year = ym.group(1)
         tail_text = tail_text[ym.end():].strip(" .,")
 
-    # Title: up to journal name
+    # Title: up to journal name. Use rfind so the journal name isn't
+    # matched against a journal-name substring inside the title
+    # (e.g., "DNA repair" appearing in the title of a DNA Repair article).
     title = ""
     volume = issue = pages = ""
     if journal and journal in tail_text:
-        idx = tail_text.find(journal)
+        idx = tail_text.rfind(journal)
         title = tail_text[:idx].strip().rstrip(".,")
         after = tail_text[idx + len(journal):].strip(" ,.")
+        # Accept the Frontiers elocation form "VOL:ELOC" (no comma) and
+        # the standard "VOL[(ISSUE)], PAGES" shape. ELOC may be digits,
+        # letter-prefixed (e1003297), or long article IDs.
         vm = re.match(
-            r"(\d+)\s*(?:\(([^)]+)\))?\s*(?:,\s*([A-Za-z0-9\-\u2013]+))?",
+            r"(\d+)\s*(?:\(([^)]+)\))?"
+            r"\s*(?:[:,]\s*([A-Za-z]?[\w\-\u2013.]+))?",
             after,
         )
         if vm:

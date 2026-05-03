@@ -12,6 +12,9 @@ from ._helpers import (
     format_doi,
     format_name,
     get_meta,
+    neutralize_media_queries,
+    remove_elements_by_id,
+    remove_elements_by_selector,
     strip_common,
     strip_tags,
     tags_to_text,
@@ -58,19 +61,153 @@ _PRE_BODY = {
 # ---------------------------------------------------------------------------
 
 def remove_banners(html):
-    """Remove floating banners, cookie consent dialogs, and overlays.
+    """Normalize ScienceDirect HTML to a single centered text column.
 
-    Targets ScienceDirect floating feedback button (_pendo-badge) and the
-    OneTrust cookie consent SDK (banner + dark overlay + preference center).
+    Chrome stripped (Step 3):
+      - <header id=gh-cnt> (Elsevier top global header) and site footer.
+      - Full-viewport OneTrust cookie dialog (id=onetrust-consent-sdk).
+      - Floating "Feedback" side tab (Pendo badge button).
+      - Right-rail <aside class=RelatedContent> (Recommended articles,
+        Metrics, Substances, Related content).
+
+    Reading column: <article class="col-lg-12 ..."> wraps title,
+    byline, abstract, body, references. Expand the collapsed
+    author-affiliation accordion (hide #show-more-btn and force the
+    collapsed AuthorGroups parent to its full expanded height).
     """
-    # Feedback button
-    html = _remove_nested_element(
-        html, r'<button[^>]*class="[^"]*_pendo-badge[^"]*"[^>]*>'
+    # Lock layout to publisher's narrow (≤1024 px) form at any viewport.
+    html = neutralize_media_queries(html)
+    # -------------------------------------------------------------------
+    # Step 3 — strip chrome.
+    # -------------------------------------------------------------------
+    html = _remove_nested_element(html, r"<header\b[^>]*>")
+    html = _remove_nested_element(html, r"<footer\b[^>]*>")
+    html = remove_elements_by_id(html, "onetrust-consent-sdk")
+    # Pendo "Feedback" side tab is a <button> with class _pendo-badge_
+    # and `position:absolute` at a far-right offset; also a
+    # <div id=banner> SiteAlert wrapper near the top of body.
+    html = remove_elements_by_id(html, "banner")
+    # Reading-assistant floating panel + its drag boundary overlay.
+    html = remove_elements_by_id(
+        html, "RA-ReadingAssistantPanel", "drag-boundary"
     )
-    # OneTrust cookie consent (banner + dark overlay + preference center)
+    # Cited By section ("Cited by (N)" with a list of citing articles).
+    # Per note main text ends before "Cited by (N)".
+    html = remove_elements_by_id(html, "section-cited-by")
     html = _remove_nested_element(
-        html, r'<div[^>]*id=["\']?onetrust-consent-sdk[^>]*>'
+        html, r'<button\b[^>]*\bclass="[^"]*_pendo-badge[^"]*"[^>]*>'
     )
+    # Right-rail related content sidebar.
+    html = _remove_nested_element(
+        html, r'<aside\b[^>]*\bclass="[^"]*RelatedContent[^"]*"[^>]*>'
+    )
+    # Top sticky access bar (PDF / Save / Share buttons) and left-column
+    # table-of-contents panel. Classes are unquoted on these, so match
+    # tolerantly. Per note "Main text column starts: after 'Download
+    # full issue'" — stripping TableOfContents covers the issue download
+    # link and cover image above the article body.
+    for cls in ("accessbar-sticky", "TableOfContents"):
+        html = _remove_nested_element(
+            html, rf'<div\b[^>]*\bclass=["\']?{re.escape(cls)}\b[^>]*>'
+        )
+
+    # -------------------------------------------------------------------
+    # Steps 2 + 4 — layout freeze and reading-column cap.
+    # -------------------------------------------------------------------
+    override = (
+        "<style>"
+        "html{width:100% !important;max-width:100% !important;"
+        "margin:0 !important;background:#fff !important;"
+        "overflow-y:overlay !important}"
+        "html::-webkit-scrollbar{width:0 !important;height:0 !important}"
+        "body{width:100% !important;min-width:0 !important;"
+        "max-width:752px !important;margin:0 auto !important;"
+        "background:#fff !important}"
+        # Collapse layout grid wrappers so the article column fills the
+        # body. Elsevier uses Bootstrap-ish col-* and custom .row-wrap.
+        "main,#main_content,.Main,.ArticlePage,.ScienceDirect,"
+        ".container,.container-fluid,.row,.row-wrap,"
+        "[class*=col-]{"
+        "display:block !important;float:none !important;"
+        "width:100% !important;max-width:100% !important;"
+        "min-width:0 !important;flex:0 0 auto !important;"
+        "margin:0 !important;padding:0 !important;"
+        "box-sizing:border-box !important;background:#fff !important}"
+        # Capped reading column on the article. padding-bottom is
+        # trimmed by 6 px to compensate for the line-box descent below
+        # the last text glyph in `.Copyright` (native line-height adds
+        # ~6 px leading below the baseline). Without the trim, B
+        # measures 62 px between the last visible glyph and the wrapper
+        # bottom instead of the 56 px target.
+        'article[class*="col-lg-12"]{'
+        "float:none !important;display:block !important;"
+        "width:auto !important;max-width:752px !important;"
+        "margin:0 auto !important;padding:56px 16px 50px 16px !important;"
+        "box-sizing:border-box !important;background:#fff !important}"
+        'article[class*="col-lg-12"] *{'
+        "max-width:100% !important;min-width:0 !important}"
+        # Zero margin/padding only on the wrapper's DIRECT first/last
+        # children. Descendant *:first-child/:last-child zeros margins
+        # on every nested section heading, killing native vertical
+        # rhythm between sections.
+        'article[class*="col-lg-12"]>*:first-child{'
+        "margin-top:0 !important;padding-top:0 !important}"
+        'article[class*="col-lg-12"]>*:last-child{'
+        "margin-bottom:0 !important;padding-bottom:0 !important}"
+        # Expand the collapsed author-affiliation accordion. The HTML
+        # clamps #author-group to a 60-px strip with `overflow:hidden`
+        # and reveals the rest on clicking #show-more-btn. Force the
+        # parent to auto height and hide the button.
+        "#author-group{max-height:none !important;height:auto !important;"
+        "overflow:visible !important}"
+        "#show-more-btn{display:none !important}"
+        # Figures: sciencedirect (Elsevier) wraps each figure in
+        #   <figure class="figure text-xs" id=fig<N>>
+        #     <span>
+        #       <img src="data:..." height=N alt aria-describedby=cap<N>>
+        #       <ol class=u-margin-s-bottom>
+        #         <li><a class=download-link
+        #            href=https://ars.els-cdn.com/content/image/<id>-gr<N>_lrg.jpg>
+        #            Download high-res image</a></li>
+        #         <li><a class=download-link
+        #            href=https://ars.els-cdn.com/content/image/<id>-gr<N>.jpg>
+        #            Download full-size image</a></li>
+        #       </ol>
+        #     </span>
+        #     <span class="captions text-s">
+        #       <span id=cap<N>><p>Figure N. caption</p></span>
+        #     </span>
+        #   </figure>
+        # Native order: image above caption with a JS-only download list
+        # row in between. Hide the download list (non-functional inside
+        # the saved HTML), force img full-width above caption with the
+        # standard 5 px gap. The high-res `_lrg.jpg` URL is on the
+        # first `<a class=download-link>` — get_refs.py uses
+        # `_SCIENCEDIRECT_FIGURES_FIX_JS` to swap <img src> ← that <a>
+        # so SingleFile inlines the high-res image instead of the
+        # thumbnail.
+        'article[class*="col-lg-12"] figure.figure{'
+        "margin:1rem 0 !important;padding:0 !important;"
+        "display:block !important;"
+        "width:100% !important;max-width:100% !important}"
+        'article[class*="col-lg-12"] figure.figure > span{'
+        "display:block !important;width:100% !important;"
+        "max-width:100% !important;margin:0 !important;padding:0 !important}"
+        'article[class*="col-lg-12"] figure.figure img{'
+        "display:block !important;width:100% !important;"
+        "height:auto !important;max-width:100% !important;"
+        "margin:0 0 5px 0 !important}"
+        # Hide the JS-only download-link list (Download high-res /
+        # Download full-size buttons that don't function in the saved
+        # HTML).
+        'article[class*="col-lg-12"] figure.figure ol.u-margin-s-bottom{'
+        "display:none !important}"
+        "</style>"
+    )
+    if "</head>" in html:
+        html = html.replace("</head>", override + "</head>", 1)
+    else:
+        html = re.sub(r"(<body\b)", override + r"\1", html, count=1)
     return html
 
 
@@ -333,34 +470,147 @@ def _format_ref_author(name):
     return name
 
 
+def _tail_to_pages(tail):
+    """Convert the post-year tail of a host string into a pages value.
+
+    Recognizes:
+        'pp. 683-691' / 'p. e815' -> '683-691' / 'e815'
+        'Article 102906' / 'Article e2201662119' -> '102906' / 'e2201662119'
+    Returns '' when the tail is a DOI or other non-page content.
+    """
+    if not tail:
+        return ""
+    t = tail.strip().rstrip(".,").strip()
+    pm = re.match(
+        r'^pp?\.?\s*([^\s,]+(?:\s*[\-\u2010-\u2014]\s*[^\s,]+)?)',
+        t, re.I,
+    )
+    if pm:
+        return re.sub(r'[\u2010-\u2014]', '-', pm.group(1))
+    am = re.match(r'^Article\s+(\S+?)[.,]?$', t, re.I)
+    if am:
+        return am.group(1).rstrip('.,')
+    return ""
+
+
 def _parse_host(host_text):
     """Parse journal, volume, year, pages from host string.
 
     Typical formats:
         'Gut, 66 (2017), pp. 683-691'
-        'Nature, 543 (2017), pp. 676-680'
-        'Int J Cancer, 136 (2015), pp. E359-E386'
+        'Nature, 455 (7213) (2008), pp. 633-637'
+        'Cold Spring Harb. Perspect. Biol., 5 (2013), Article a012708'
+        'J. Biol. Chem. (2021), Article 100868'
+        'Nucleic Acids Symp. Ser. (1993), pp. 133-134'
     """
     journal = volume = year = pages = ""
-    # Try: journal, volume (year), pp. pages
+    host_text = host_text.strip()
+    # Strip a trailing standalone DOI (", 10.xxxx/xxx") — kept DOI is
+    # captured separately from the reference anchor elsewhere.
+    host_text = re.sub(r',\s*10\.\d{4,}/\S+\s*$', '', host_text).rstrip(",. ")
+
+    # Journal, vol [(issue)] (year) [, TAIL]
     m = re.match(
-        r'(.+?),\s*(\d+)\s*\((\d{4})\)(?:,\s*pp?\.\s*(.+))?',
-        host_text.strip(),
+        r'^(?P<journal>.+?),'
+        r'\s*(?P<vol>\d+)'
+        r'(?:\s*\([^)]+\))?'  # optional (issue)
+        r'\s*\((?P<year>\d{4})\)'
+        r'(?:,?\s*(?P<tail>.+))?$',
+        host_text,
     )
     if m:
-        journal = m.group(1).strip()
-        volume = m.group(2)
-        year = m.group(3)
-        pages = (m.group(4) or "").strip().rstrip(",. ")
-        # Strip trailing DOI that some host strings include after pages
-        pages = re.sub(r',\s*10\.\d{4,}/\S+$', '', pages).strip().rstrip(",. ")
-    else:
-        # Fallback: try to extract year
-        ym = re.search(r'\((\d{4})\)', host_text)
-        if ym:
-            year = ym.group(1)
-        journal = host_text.strip()
+        journal = m.group('journal').strip().rstrip(',')
+        volume = m.group('vol')
+        year = m.group('year')
+        pages = _tail_to_pages(m.group('tail') or "")
+        return journal, volume, year, pages
+
+    # Journal (year) [, TAIL] — no volume (e-only / preprint / book chapter)
+    m = re.match(
+        r'^(?P<journal>.+?)'
+        r'\s*\((?P<year>\d{4})\)'
+        r'(?:,?\s*(?P<tail>.+))?$',
+        host_text,
+    )
+    if m:
+        journal = m.group('journal').strip().rstrip(',')
+        year = m.group('year')
+        pages = _tail_to_pages(m.group('tail') or "")
+        return journal, volume, year, pages
+
+    # Fallback: try to extract year
+    ym = re.search(r'\((\d{4})\)', host_text)
+    if ym:
+        year = ym.group(1)
+    journal = host_text
     return journal, volume, year, pages
+
+
+_BOOK_PUBLISHER_RE = re.compile(
+    r'\b(?:'
+    r'Press|Publishers?|Publishing|Freeman|Wiley|Springer|Elsevier|'
+    r'Chapman(?:\s*&(?:amp;)?\s*Hall)?|Academic\s*Press|Cold\s*Spring\s*Harbor|'
+    r'ASM(?:\s+Press)?|INSERM|CRC(?:\s+Press)?|Gaussian|'
+    r'University\s+Science\s+Books|University\s+of\s+California|Duxbury|'
+    r'Oxford\s+University|Cambridge\s+University|CCLRC|Daresbury|Humana|'
+    r'Lawrence\s+Berkeley|Taylor\s+and\s+Francis|American\s+Society\s+for\s+Microbiology|'
+    r'Kluwer|Garland|Marcel\s+Dekker|Saunders|Mosby'
+    r')\b',
+    re.I,
+)
+
+
+def _book_host_split(host):
+    """Split ``BookName, Publisher, City (year)`` into (book, publisher).
+
+    Returns ('', host) when no publisher marker is found.
+    """
+    parts = [p.strip() for p in host.split(',')]
+    for idx in range(1, len(parts)):
+        if _BOOK_PUBLISHER_RE.search(parts[idx]):
+            book = ', '.join(parts[:idx]).strip()
+            pub = ', '.join(parts[idx:]).strip()
+            return book, pub
+    return '', host
+
+
+def _pages_from_comment(comment_text):
+    """Extract pages from a <div class=comment> block.
+
+    Sciencedirect stores several payloads in ``comment``. Only page-like
+    content is accepted:
+        '10.11.1\u201310.11.26' -> '10.11.1-10.11.26'  (chapter numbering)
+        '191\u2013191'          -> '191-191'
+        '1533033818767455'      -> '1533033818767455'  (article number)
+        '265\u2013295.pp'       -> '265-295'
+        'Chapter 18, Unit 18.6' -> 'Chapter 18, Unit 18.6'
+    Returns '' for 'Preprint at', 'Published online', 'Epub ahead of print',
+    'Available at', and similar non-page commentary.
+    """
+    if not comment_text:
+        return ""
+    t = re.sub(r'\s+', ' ', comment_text).strip().rstrip('.').strip()
+    if re.search(
+        r'(available at|preprint|epub|published online|in press|submitted)',
+        t, re.I,
+    ):
+        return ""
+    # "265-295.pp" -> strip trailing .pp
+    t = re.sub(r'\.?pp\.?$', '', t).strip()
+    # Chapter/Unit phrase
+    if re.match(r'^Chapter\s+\d+[,\s]+Unit\s+[\d.]+$', t, re.I):
+        return t
+    # Numeric range (plain or dotted like 10.11.1-10.11.26)
+    m = re.match(
+        r'^([A-Za-z]?[\d.]+)\s*[\-\u2010-\u2014]\s*([A-Za-z]?[\d.]+)$',
+        t,
+    )
+    if m:
+        return f"{m.group(1)}-{m.group(2)}"
+    # Bare article number (6+ digits)
+    if re.match(r'^\d{6,}$', t):
+        return t
+    return ""
 
 
 def _parse_other_ref_text(text):
@@ -502,6 +752,18 @@ def _parse_references(html):
             journal, volume, year, pages = _parse_host(host_text)
             issue = ""
 
+            # Fallback: pages sometimes live in a sibling <div class=comment>
+            # (book-chapter numbering, article IDs, etc.).
+            if not pages:
+                comment_m = re.search(
+                    r'<div[^>]*class="?comment"?[^>]*>(.*?)</div>',
+                    entry, re.DOTALL,
+                )
+                if comment_m:
+                    pages = _pages_from_comment(
+                        strip_tags(comment_m.group(1))
+                    )
+
             # Extract DOI
             doi = ""
             doi_m = re.search(r'href=["\']?(https?://doi\.org/[^"\'\s>]+)', entry)
@@ -529,6 +791,21 @@ def _parse_references(html):
                         title = other_text
                 else:
                     title = strip_tags(entry).strip()
+
+            # Book citations: ScienceDirect puts the book name either in
+            # the title div (chapter-less book) or as the first segment of
+            # the host string before the publisher. Neither fits the
+            # "journal = publisher" shape, so rewrite to journal = book
+            # name (per the project's book-citation convention).
+            if not volume and not pages and _BOOK_PUBLISHER_RE.search(journal):
+                if title:
+                    # "ASM Press, Washington, D.C (2005)" + title="DNA Repair..."
+                    journal = title
+                    title = ""
+                else:
+                    book, _pub = _book_host_split(journal)
+                    if book:
+                        journal = book
 
             refs.append({"": {
                 "title": title,

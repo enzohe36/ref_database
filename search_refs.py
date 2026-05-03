@@ -44,20 +44,17 @@ def load_references():
         return json.load(f)
 
 
-def get_citation_short(entry, pmid):
-    """Derive citation_short from a refs.json entry."""
-    cit = entry.get("citation_in_text", "")
-    journal = entry.get("journal", "")
-    return f"{cit} {journal} {pmid}"
-
-
-def load_paper_text(citation_short):
-    """Try to load full paper text from papers/ directory."""
-    path = os.path.join(PAPERS_DIR, citation_short + ".md")
-    if os.path.exists(path):
-        with open(path, encoding="utf-8") as f:
-            return f.read()
-    return None
+def load_main_text(stem):
+    """Load main_text from papers/<stem>.json. Returns None if missing or empty."""
+    path = os.path.join(PAPERS_DIR, stem + ".json")
+    if not os.path.exists(path):
+        return None
+    with open(path, encoding="utf-8") as f:
+        data = json.load(f)
+    text = data.get("main_text")
+    if not text:
+        return None
+    return text
 
 
 def chunk_text(text):
@@ -97,25 +94,26 @@ def do_build():
     )
 
     all_chunks, all_ids, all_metadata = [], [], []
-    full_text_count = 0
+    indexed_papers = 0
 
     for pmid, entry in refs.items():
-        citation_short = get_citation_short(entry, pmid)
-        full_text = load_paper_text(citation_short)
-
-        if full_text:
-            text = full_text
-            full_text_count += 1
-        else:
-            text = entry.get("title", "")
+        stem = entry.get("stem")
+        if not stem:
+            continue
+        text = load_main_text(stem)
+        if not text:
+            continue
 
         chunks = chunk_text(text)
+        if not chunks:
+            continue
+        indexed_papers += 1
         for i, chunk in enumerate(chunks):
             all_chunks.append(chunk)
             all_ids.append(f"{pmid}::chunk{i}")
             all_metadata.append({"pmid": pmid, "chunk_index": i})
 
-    print(f"Embedding {len(all_chunks)} chunks from {len(refs)} papers...")
+    print(f"Embedding {len(all_chunks)} chunks from {indexed_papers} papers...")
 
     BATCH = 256
     for batch_start in range(0, len(all_chunks), BATCH):
@@ -133,15 +131,17 @@ def do_build():
         )
         print(f"  {batch_end}/{len(all_chunks)} chunks indexed")
 
-    print(f"Built: {len(refs)} papers, {len(all_chunks)} chunks, "
-          f"{full_text_count} full_text, {len(refs) - full_text_count} abstract-only")
+    print(f"Built: {indexed_papers} papers, {len(all_chunks)} chunks "
+          f"({len(refs) - indexed_papers} skipped, no main_text)")
 
 
 def do_query(query_terms):
-    """Query the index and return ranked papers."""
+    """Query the index and return ranked papers with their best matching snippet."""
     if not os.path.exists(DB_PATH):
         print("Index not found. Run --build first.", file=sys.stderr)
         sys.exit(1)
+
+    refs = load_references()
 
     device = detect_device()
     model = SentenceTransformer(MODEL_NAME)
@@ -154,27 +154,33 @@ def do_query(query_terms):
     results = collection.query(
         query_embeddings=[embedding],
         n_results=30,
-        include=["metadatas", "distances"],
+        include=["metadatas", "distances", "documents"],
     )
 
     metas = results["metadatas"][0]
     distances = results["distances"][0]
+    documents = results["documents"][0]
 
-    # Deduplicate by PMID, keep best score per paper
+    # Deduplicate by PMID, keep best (score, snippet) per paper
     seen = {}
-    for meta, dist in zip(metas, distances):
+    for meta, dist, doc in zip(metas, distances, documents):
         pmid = meta["pmid"]
         score = round(1 - dist, 4)
-        if pmid not in seen or score > seen[pmid]:
-            seen[pmid] = score
+        if pmid not in seen or score > seen[pmid][0]:
+            seen[pmid] = (score, doc)
 
-    ranked = sorted(seen.items(), key=lambda x: -x[1])[:10]
+    ranked = sorted(seen.items(), key=lambda x: -x[1][0])[:10]
 
     output = []
-    for pmid, score in ranked:
+    for pmid, (score, snippet) in ranked:
         if score <= 0:
             break
-        output.append({"pmid": pmid, "score": score})
+        output.append({
+            "pmid": pmid,
+            "stem": refs.get(pmid, {}).get("stem", ""),
+            "score": score,
+            "snippet": snippet,
+        })
 
     print(json.dumps(output, indent=2, ensure_ascii=False))
 

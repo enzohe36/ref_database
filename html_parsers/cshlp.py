@@ -11,7 +11,9 @@ from ._helpers import (
     format_author_name,
     format_doi,
     get_meta,
+    neutralize_media_queries,
     parse_meta_authors,
+    remove_elements_by_id,
     strip_common,
     strip_tags,
     tags_to_text,
@@ -53,13 +55,144 @@ _CHROME_RE = re.compile(
 # ---------------------------------------------------------------------------
 
 def remove_banners(html):
-    """Remove floating banners, cookie consent dialogs, and overlays.
+    """Normalize CSHLP HTML to a single centered text column.
 
-    Targets CSHLP cookie consent banner.
+    CSHLP (HighWire JCore) wraps the article in
+    ``#pageid-content > #content-block`` with sibling columns ``#col-2``
+    (left sidebar: prev/next, This Article, Alert, Services) and
+    ``#col-3`` (right sidebar: Current Issue cover, ad, social media).
+    The outer grid pulls ``#pageid-content`` 240 px left via
+    ``margin-right:-240px`` so ``#col-2``/``#col-3`` overlay the right
+    side of the layout; at narrow viewports they disappear but the
+    negative margin still shifts ``#pageid-content`` off-center.
+
+    Chrome stripped (Step 3):
+      - ``#header`` and ``#footer`` (site branding / login / ads,
+        footer nav).
+      - ``#col-2`` and ``#col-3`` sidebar columns.
+      - ``#cited-by`` ("Articles citing this article") block inside
+        ``#content-block`` — end-anchor per the per-publisher note.
+
+    Reading column (Step 4): ``#content-block`` is capped at 752 px.
+    The publisher sheet clamps ``#content-block`` to ~518 px wide and
+    leaves ``#pageid-content`` with ``margin-right:-240px``; both are
+    overridden. Author affiliations accordion (``.hideaffil`` positions
+    the list at ``left:-9999px``) is expanded via CSS.
     """
-    html = _remove_nested_element(
-        html, r'<div[^>]*id=["\']?cookie-law[^>]*>'
+    # Lock layout to publisher's narrow (≤1024 px) form at any viewport.
+    html = neutralize_media_queries(html)
+    # -------------------------------------------------------------------
+    # Step 3 — strip chrome.
+    # -------------------------------------------------------------------
+    html = remove_elements_by_id(
+        html, "header", "footer", "col-2", "col-3", "cited-by",
     )
+    # "Add to" social-bookmarking strip (CiteULike / Delicious / Digg /
+    # Facebook / Reddit / Twitter) that sits after the references. Class
+    # attribute is unquoted in CSHLP markup.
+    html = _remove_nested_element(
+        html, r'<div\s+class=social-bookmarking\b[^>]*>',
+    )
+
+    # -------------------------------------------------------------------
+    # Steps 2 + 4 — layout freeze and reading-column cap.
+    # -------------------------------------------------------------------
+    override = (
+        "<style>"
+        "html{width:100% !important;max-width:100% !important;"
+        "margin:0 !important;background:#fff !important;"
+        "overflow-y:overlay}"
+        "html::-webkit-scrollbar{width:0}"
+        "body{width:100% !important;min-width:0 !important;"
+        "max-width:100% !important;margin:0 auto !important;"
+        "background:#fff !important;color:#000 !important}"
+        # Outer page wrapper ships with margin-right:-240px to let the
+        # sibling columns overlay; force it back to a symmetric flow
+        # block so nothing shifts off-center.
+        "#pageid-content{"
+        "width:100% !important;max-width:100% !important;"
+        "margin:0 auto !important;padding:0 !important;"
+        "float:none !important;display:block !important}"
+        # Capped reading column (Step 4). Site CSS pins #content-block
+        # to ~518 px for its three-column dance; override.
+        "#content-block{"
+        "float:none !important;display:block !important;"
+        "width:auto !important;min-width:0 !important;"
+        "max-width:752px !important;"
+        "margin:0 auto !important;padding:56px 16px !important;"
+        "box-sizing:border-box !important;height:auto !important;"
+        "background:#fff !important}"
+        "#content-block *{max-width:100% !important;min-width:0 !important}"
+        # The article frame and its inner section/figure wrappers carry
+        # horizontal padding that shrinks the effective text column — zero.
+        "#content-block .article,#content-block .fulltext-view,"
+        "#content-block .section,#content-block .cb-section,"
+        "#content-block .fig,#content-block .fig-inline,"
+        "#content-block .table,#content-block .table-inline{"
+        "float:none !important;width:auto !important;"
+        "margin-left:0 !important;margin-right:0 !important;"
+        "padding-left:0 !important;padding-right:0 !important}"
+        # Figures natively have `margin:1em 20px 1em 20px` for float-wrap
+        # spacing. With `float:none` set above, the vertical 1em margins
+        # compound around the now-full-width figure, growing F1 +235 px
+        # and F3 +89 px. Zero the top margin only — the bottom margin
+        # (publisher 0.8em ≈ 12.8 px) is preserved so the figure has
+        # natural breathing room above the next section heading.
+        "#content-block .fig,#content-block .fig-inline{"
+        "margin-top:0 !important}"
+        # Figure images: a get_refs.py browser-script transforms each
+        # `<a class=fig-inline-link href=...F<N>.expansion.html>`'s
+        # child `<img>` src to `F<N>.large.jpg` (~800-1500 px native).
+        # The publisher renders the small thumbnail at its native pixel
+        # dimensions (146-200 px) inside `.fig-inline`, leaving a
+        # tiny image vs the full-width caption. Force the large image
+        # to fill the inline container so figure aligns with caption.
+        # SingleFile inlines the large image as `--sf-img-N` referenced
+        # from `style="background-image:var(--sf-img-N)"` on the img;
+        # the rule below sets the displayed width regardless of which
+        # mechanism (src or background-image) carries the data.
+        ":root #content-block .fig-inline img{"
+        "display:block !important;width:100% !important;"
+        "height:auto !important;margin:0 !important;"
+        "background-size:100% auto !important}"
+        # Expand collapsed "Author Affiliations" accordion. The site
+        # class `hideaffil` moves the <ol> to `left:-9999px; width:5000px`
+        # to keep it out of the flow; reset both.
+        "#content-block .affiliation-list.hideaffil,"
+        "#content-block ol.affiliation-list{"
+        "position:static !important;left:auto !important;"
+        "width:auto !important;max-width:100% !important;"
+        "display:block !important;visibility:visible !important}"
+        # First-/last-child margin stacking. CSHLP's own stylesheet
+        # already ships `#content-block *:first-child{margin-top:0
+        # !important}` and `*:last-child{margin-bottom:0 !important}`
+        # (see the <style> block in the original HTML), which covers
+        # the wrapper-padding protection. Only add an explicit H1 zero
+        # because a preceding zero-height marker span pushes H1 out of
+        # the `*:first-child` cascade.
+        "#content-block .article > h1,"
+        "#content-block .article-title{"
+        "margin-top:0 !important;padding-top:0 !important}"
+        # Direct-child only — descendant `*:last-child{margin-bottom:0}`
+        # would collapse the abstract-section mb that creates the gap
+        # before the Keywords h3 (cshlp's native `h1-h6{margin:0 0 0.4em}`
+        # gives headings zero margin-top, so the preceding element's mb
+        # is the only section-to-section spacer).
+        "#content-block>*:last-child{"
+        "margin-bottom:0 !important;padding-bottom:0 !important}"
+        # The reference list's last `<li>` has padding-bottom:3.84 and
+        # its inner `.cit` has padding-bottom:6.4 — together a 10-px
+        # gap below the last citation text. Zero internal padding only
+        # on the last citation in the list.
+        "#content-block .ref-list ol.cit-list > li:last-child,"
+        "#content-block .ref-list ol.cit-list > li:last-child .cit{"
+        "padding-bottom:0 !important}"
+        "</style>"
+    )
+    if "</head>" in html:
+        html = html.replace("</head>", override + "</head>", 1)
+    else:
+        html = re.sub(r"(<body\b)", override + r"\1", html, count=1)
     return html
 
 
@@ -320,6 +453,36 @@ def _parse_references(html):
         dm = re.search(r'data-doi=([^\s>]+)', entry)
         if dm:
             doi = format_doi(unescape(dm.group(1).strip('"')))
+
+        # Pages fallback for article-number journals (CSH Perspectives,
+        # eLife, etc.): when no fpage/lpage spans exist, the article ID
+        # sits either in the ijlink ``resid=...`` URL or at the end of
+        # the DOI. Cover multiple ijlink and DOI tail shapes:
+        #   resid=6/9/a016428            -> a016428
+        #   resid=cshperspect.a016428v1  -> cshperspect.a016428
+        #   resid=2023.05.08.539880v1    -> 2023.05.08.539880
+        #   DOI tail "cshperspect.a016428", "eLife.66198", bioRxiv dated
+        #   "2023.05.08.539880", BMC "1471-2105-10-48", PO uppercase
+        #   prefixes like "PO.17.00298".
+        if not pages:
+            rid_m = re.search(
+                r'resid=(?:\d+/\d+/)?([A-Za-z][\w.\-]+?)(?:v\d+)?(?=["&\s>])',
+                entry,
+            )
+            if rid_m:
+                pages = rid_m.group(1)
+            elif doi:
+                tail_m = re.search(
+                    r'/([A-Za-z][\w.]*\d[\w.\-]*|\d[\d.\-]+\d)$',
+                    doi,
+                )
+                if tail_m:
+                    pages = tail_m.group(1)
+
+        # Old-layout fallback: some refs emit only cit-lpage with no
+        # cit-fpage span. Accept it as a single-page value.
+        if not pages and lpage:
+            pages = lpage
 
         # Fallback
         if not title and not authors:

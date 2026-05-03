@@ -10,8 +10,10 @@ from ._helpers import (
     format_author_name,
     format_doi,
     get_meta,
+    neutralize_media_queries,
     parse_meta_authors,
     remove_elements_by_id,
+    remove_elements_by_selector,
     strip_common,
     strip_tags,
     tags_to_text,
@@ -40,24 +42,248 @@ _SUPP_RE = re.compile(
 # ---------------------------------------------------------------------------
 
 def remove_banners(html):
-    """Remove floating banners, cookie consent dialogs, and overlays.
+    """Normalize MDPI HTML to a single centered text column.
 
-    - usercentrics-cmp-ui: Usercentrics consent manager containing the
-      floating cookie banner ("All MDPI websites use third-party website
-      tracking...") and its overlay.
-    - small_right / big_right / small_left / big_left: floating caret
-      arrows on page edges linking to previous / next article in journal
-      and in special issue.
-    - <div class=fixed>: floating top bar with MDPI logo, "Toggle
-      desktop layout" link, search, menu hamburger. Unique across the
-      MDPI corpus so safe to anchor by class alone.
+    MDPI article pages wrap the reading content in `<article class=bright>`
+    which sits inside `#middle-column` (the Foundation grid column).
+    Siblings include `#left-column` (share / download / author cards),
+    a `.middle-column__help` floating altmetric/figures panel, and the
+    site `<header>`/`<footer>` plus the bottom-fixed cookie banner.
+    `<div id=big_right|big_left|small_right|small_left>` are the
+    fixed-position previous/next-article arrows that bracket the viewport
+    on wide screens.
+
+    Chrome stripped (Step 3):
+      - #big_right / #big_left / #small_right / #small_left (prev/next).
+      - Site <header> and <footer>.
+      - #cookie-notification (bottom banner).
+      - #usercentrics-cmp-ui (user-consent shadow DOM wrapper).
+      - #left-column (share / download / author-card sidebar).
+      - .middle-column__help (altmetric donut + "jump to" side panel).
+      - Trailing `.webpymol-controls-template` block that renders as
+        inline text after the article close.
+
+    Reading column (Step 4): `article.bright`.
     """
+    # Lock layout to publisher's narrow (≤1024 px) form at any viewport.
+    html = neutralize_media_queries(html)
+    # Step 3 — strip chrome.
     html = remove_elements_by_id(
         html,
+        "big_right", "big_left", "small_right", "small_left",
+        "cookie-notification",
         "usercentrics-cmp-ui",
-        "small_right", "big_right", "small_left", "big_left",
+        "left-column",
+        # MDPI's site footer is `<div id=footer>`, not `<footer>` — the
+        # HTML5 footer strip below misses it.
+        "footer",
+        # Foundation reveal-modal popups. My `display:block !important`
+        # rules on `.content__container` (a class used both inside and
+        # outside the article) override Foundation's default
+        # `.reveal-modal{display:none}`, so the menu / captcha / share
+        # / cite / RSS modals all render as page text above the
+        # article. Strip them by id.
+        "menuModal", "captchaModal", "rssNotificationModal",
+        "main-help-modal", "main-share-modal",
+        "cite-modal", "author-biographies-modal",
+        "recommended-articles-modal", "weixin-share-modal",
     )
-    html = _remove_nested_element(html, r"<div class=fixed\b[^>]*>")
+    html = _remove_nested_element(html, r"<header\b[^>]*>")
+    html = _remove_nested_element(html, r"<footer\b[^>]*>")
+    # Mobile top bar (`<nav class="tab-bar show-for-medium-down">`):
+    # renders the MDPI logo, "toggle desktop layout", and "MDPI main
+    # page" hamburger. Sits OUTSIDE <header>/<section.main-section>.
+    html = _remove_nested_element(
+        html, r'<nav\b[^>]*\bclass="tab-bar show-for-medium-down"[^>]*>'
+    )
+    # .middle-column__help has its classes unquoted — helper can't
+    # target, so match directly.
+    for _ in range(3):
+        before = html
+        html = _remove_nested_element(
+            html,
+            r'<div\b[^>]*\bclass=middle-column__help\b[^>]*>',
+        )
+        if html == before:
+            break
+    # webpymol-controls template — UI affordance rendered as flowing text.
+    html = _remove_nested_element(
+        html,
+        r'<div\b[^>]*\bclass="webpymol-controls webpymol-controls-template"[^>]*>',
+    )
+    # Siblings of <article class=bright> inside the content container
+    # render above "Open Access Review" and break the start anchor:
+    #   .html-profile-nav — Download PDF / settings / Order Reprints
+    #   .html-article-menu — font/size/layout picker
+    # Both use unquoted class attrs; match each directly.
+    for cls in ("html-profile-nav", "html-article-menu"):
+        for _ in range(5):
+            before = html
+            html = _remove_nested_element(
+                html, rf'<div\b[^>]*\bclass=["\']?{cls}\b[^>]*>'
+            )
+            if html == before:
+                break
+    # JSmol modal (empty iframe wrapper) sits just before the article.
+    html = remove_elements_by_id(html, "jmolModal")
+    # `.highlight-box1` — the action-button row inside the article
+    # (Download / Browse Figures / Versions & Notes). All three require
+    # JavaScript dropdowns that don't work in a static snapshot; the
+    # row renders as broken bare text. Strip.
+    for _ in range(3):
+        before = html
+        html = _remove_nested_element(
+            html, r'<div\b[^>]*\bclass=highlight-box1\b[^>]*>'
+        )
+        if html == before:
+            break
+    # `.additional-content` sits inside article.bright after the copyright
+    # line and holds "Share and Cite" + article-stats charts (including
+    # the "Multiple requests from the same IP" disclaimer). Per the
+    # notes, main text ends at the copyright line, so drop it.
+    for _ in range(3):
+        before = html
+        html = _remove_nested_element(
+            html,
+            r'<div\b[^>]*\bclass=additional-content\b[^>]*>',
+        )
+        if html == before:
+            break
+
+    # Steps 2 + 4 — layout freeze and reading-column cap.
+    override = (
+        "<style>"
+        "html{overflow-y:overlay}"
+        "html::-webkit-scrollbar{width:0}"
+        "html{width:100% !important;max-width:100% !important;"
+        "margin:0 !important;background:#fff !important}"
+        "body{width:100% !important;min-width:0 !important;"
+        "max-width:752px !important;margin:0 auto !important;"
+        "padding:0 !important;"
+        "background:#fff !important;color:#000 !important}"
+        ":root body{padding:0 !important;margin:0 auto !important}"
+        # Collapse Foundation wrappers between body and article.bright.
+        # Use `:root` + the site's own selector chain for the middle
+        # column so we beat the @media(min-width:74.375em) rule that
+        # otherwise reserves 316 px of left-column space.
+        ".main-section,#main-content,#middle-column,"
+        ".middle-column__main,.content__container,"
+        "article.bright .row,article.bright [class*='columns']{"
+        "display:block !important;float:none !important;"
+        "width:100% !important;max-width:100% !important;"
+        "min-width:0 !important;margin:0 !important;padding:0 !important;"
+        "box-sizing:border-box !important;"
+        "background:#fff !important}"
+        ":root #main-content .row-fixed-left-column #middle-column,"
+        ":root #main-content .row-fixed-left-column #middle-column.large-9{"
+        "width:100% !important;float:none !important}"
+        # `.html-content__container content__container ...` (direct parent
+        # of article.bright) has `margin-bottom:16px` that extends docH
+        # past the 56-px wrapper padding. The site rule is
+        # `#main-content #middle-column .middle-column__main
+        # .content__container:last-of-type{margin-bottom:16px!important}`
+        # — match that exact specificity chain to beat it.
+        ":root #main-content #middle-column .middle-column__main .content__container:last-of-type,"
+        ":root div.html-content__container,"
+        ":root div.content__container,"
+        ":root [class*='content__container__combined-for-large']{"
+        "margin:0 !important;padding:0 !important}"
+        # #container ships `margin-top:50px` at vw < 1190 (to clear the
+        # site's fixed header); the header is removed, so zero it.
+        ":root #container{margin-top:0 !important}"
+        # Cap the reading column.
+        "article.bright{"
+        "float:none !important;display:block !important;"
+        "width:auto !important;max-width:752px !important;"
+        "margin:0 auto !important;"
+        "padding:56px 16px !important;"
+        "box-sizing:border-box !important;"
+        "background:#fff !important}"
+        "article.bright *{"
+        "max-width:100% !important;min-width:0 !important}"
+        "article.bright table{"
+        "table-layout:fixed !important;width:100% !important;"
+        "word-break:break-word !important}"
+        # `<section class=html-fn_group>` wraps the Disclaimer /
+        # Publisher's Note in a malformed 2-empty-td table. The native
+        # layout relies on auto table sizing — the first empty td
+        # collapses to ~0 and the second td (with the text) spans the
+        # full width. `table-layout:fixed` would split them 50/50.
+        # Re-enable auto layout specifically for this section.
+        "article.bright .html-fn_group table{"
+        "table-layout:auto !important;width:100% !important}"
+        # Direct-child only on both ends — the descendant
+        # `*:last-child{margin-bottom:0; padding-bottom:0}` form was
+        # zeroing the publisher's natural margin-bottom:20 on the
+        # disclaimer's inner table (which spaces it from the copyright
+        # block) and padding-bottom:5 on the TD that wraps the
+        # disclaimer text.
+        ":root article.bright > *:first-child{"
+        "margin-top:0 !important;padding-top:0 !important}"
+        # Structural last-child chain (6 levels) — zeros margin/padding-
+        # bottom only on the chain of "absolute last" descendants of the
+        # wrapper, not every nested last-child. Preserves publisher
+        # margins on middle sections (e.g. Disclaimer's table.mb=20)
+        # while still enforcing B=56 on the final trailing element.
+        ":root article.bright > *:last-child,"
+        ":root article.bright > *:last-child > *:last-child,"
+        ":root article.bright > *:last-child > *:last-child > *:last-child,"
+        ":root article.bright > *:last-child > *:last-child > *:last-child > *:last-child,"
+        ":root article.bright > *:last-child > *:last-child > *:last-child > *:last-child > *:last-child,"
+        ":root article.bright > *:last-child > *:last-child > *:last-child > *:last-child > *:last-child > *:last-child"
+        "{margin-bottom:0 !important;padding-bottom:0 !important}"
+        # h3.html-italic (subsection headings "2.2 ...") ships
+        # margin-top:7.15px. In the native HTML that margin doesn't
+        # collapse with the preceding section's margin-bottom (a site
+        # wrapper prevents collapsing via its padding), yielding a 14 px
+        # gap. After our container-zero pass the margins collapse to
+        # max=7 px. Bumping the heading's own margin-top to 14 px
+        # restores the raw visual rhythm regardless of collapsing.
+        ":root article.bright h3.html-italic{"
+        "margin-top:14px !important}"
+        # jQuery-UI inserts hundreds of `.ui-helper-hidden-accessible`
+        # stubs at absolute y≈docH-1; they're 1×1 but they extend the
+        # document height by ~10 px because position:absolute with
+        # non-zero top contributes to scrollHeight. Hide them.
+        ".ui-helper-hidden-accessible{display:none !important}"
+        # Figures: mdpi wraps each figure in
+        #   <div class=html-fig-wrap id=<journal>-<vol>-<id>-f<N>>
+        #     <div class=html-fig_img>
+        #       <div class=html-figpopup>
+        #         <img src="data:..." data-large=<HIRES_URL>
+        #              data-original=<HIRES_URL> data-lsrc=<MEDIUM_URL>>
+        #       </div>
+        #       <a class=html-expand html-figpopup>...</a>
+        #     </div>
+        #     <div class=html-fig_description><b>Figure N.</b>...</div>
+        # Native order: image above caption (correct). The interactive
+        # `.html-figpopup` overlay click-target adds chrome via JS
+        # (lightbox) — without JS the `<a class=html-expand>` corner is
+        # an empty pseudo-element box. Force the img to display:block
+        # at full column width and hide the expand corner.
+        ":root article.bright .html-fig-wrap{"
+        "margin:1rem 0 !important;padding:0 !important;"
+        "width:100% !important;max-width:100% !important;"
+        "float:none !important}"
+        ":root article.bright .html-fig_img{"
+        "display:block !important;margin:0 !important;padding:0 !important;"
+        "width:100% !important;max-width:100% !important}"
+        ":root article.bright .html-figpopup{"
+        "display:block !important;margin:0 !important;padding:0 !important;"
+        "width:100% !important;max-width:100% !important;"
+        "cursor:default !important}"
+        ":root article.bright .html-fig_img img{"
+        "display:block !important;width:100% !important;"
+        "height:auto !important;max-width:100% !important;"
+        "margin:0 0 5px 0 !important}"
+        # Expand-corner pseudo-button (non-functional without JS).
+        ":root article.bright a.html-expand{display:none !important}"
+        "</style>"
+    )
+    if "</head>" in html:
+        html = html.replace("</head>", override + "</head>", 1)
+    else:
+        html = re.sub(r"(<body\b)", override + r"\1", html, count=1)
     return html
 
 
@@ -320,6 +546,73 @@ def _parse_references(html):
             entry, maxsplit=1,
         )[0]
 
+        # Book-chapter layout: authors optional, chapter title, period,
+        # "In <span class=html-italic>Book</span>; editor, Ed.; Publisher:
+        # City, [Chapter N;] pp. X-Y."
+        # No <b>Year</b> — year appears as a bare 4-digit token near the end.
+        # Example entries:
+        #   "Pearson's Correlation Coefficient. In <i>Encyclopedia of Public
+        #    Health</i>; Kirch, W., Ed.; Springer: Dordrecht, 2008."
+        #   "Kessler, M.; Zietlow, R.; Meyer, T.F. Stem cells in the
+        #    reproductive system. In <i>Adults Stem Cell Niches</i>; ...,
+        #    2014; Chapter 6; pp. 139-169."
+        chap_m = re.search(
+            r'\.\s+In\s+<span\s+class=["\']?html-italic["\']?\s*>'
+            r'([^<]+)</span>',
+            citation,
+        )
+        if chap_m and not re.search(r"<b>\s*\d{4}", citation):
+            book = unescape(chap_m.group(1)).strip().rstrip(".").rstrip(",")
+            before = citation[:chap_m.start()]
+            after = citation[chap_m.end():]
+            before_plain = re.sub(r"\s+", " ", strip_tags(before)).strip()
+            after_plain = re.sub(r"\s+", " ", strip_tags(after)).strip()
+
+            # Year from a bare 4-digit token in the publisher portion.
+            year_chap = ""
+            yc = re.search(r"\b(19|20)\d{2}\b", after_plain)
+            if yc:
+                year_chap = yc.group(0)
+
+            pages_chap = ""
+            pm = re.search(
+                r"pp\.\s*([\w\d]+\s*[\-\u2013\u2014]\s*[\w\d]+)",
+                after_plain,
+            )
+            if pm:
+                pages_chap = re.sub(
+                    r"[\u2010-\u2014]", "-", pm.group(1).replace(" ", "")
+                )
+
+            # Split authors and title: last ". " in before_plain is the
+            # author/title boundary. If no period, the whole thing is the
+            # title (editor-only book, no chapter authors).
+            split_idx = before_plain.rfind(". ")
+            if split_idx > 0:
+                chap_authors_str = before_plain[:split_idx]
+                chap_title = before_plain[split_idx + 2:].strip().rstrip(".")
+            else:
+                chap_authors_str = ""
+                chap_title = before_plain.rstrip(".")
+
+            chap_authors = []
+            for part in re.split(r"\s*;\s*", chap_authors_str):
+                part = part.strip().rstrip(",").strip()
+                if part and not part.lower().startswith("et al"):
+                    chap_authors.append(format_author_name(part))
+
+            refs.append({"": {
+                "title": chap_title,
+                "journal": book,
+                "year": year_chap,
+                "volume": "",
+                "issue": "",
+                "pages": pages_chap,
+                "doi": doi,
+                "authors": chap_authors,
+            }})
+            continue
+
         # Journal from the first <span class=html-italic>
         journal = ""
         jm = re.search(
@@ -348,15 +641,30 @@ def _parse_references(html):
         plain = strip_tags(citation).strip()
         plain = re.sub(r"\s+", " ", plain)
 
-        # Pages: after the volume comes ", pages." — match numeric range
-        # or single elocator preceding the final period.
+        # Pages: after <b>Year</b> comes ", [Volume, ]Pages." — take the
+        # last comma-separated segment before the trailing period. Accept
+        # plain ranges ("683-691"), prefixed article numbers ("e00226-17",
+        # "eaax6366", "jcs234914"), Cell-style e-supplements
+        # ("117-130.e6"), and dotted chapter numbering ("12.29.11-12.29.19").
+        # If the last segment equals the already-captured volume, pages are
+        # genuinely absent.
         pages = ""
-        pm = re.search(
-            r",\s*(\d+\s*[-\u2013]\s*\d+|\d{3,}|[A-Za-z]\d+)\s*\.\s*$",
-            plain,
+        after_year = re.search(
+            r"<b>\s*\d{4}[a-z]?\s*</b>\s*,\s*(.+?)\s*$",
+            citation, re.DOTALL,
         )
-        if pm:
-            pages = re.sub(r"[\u2013\u2014]", "-", pm.group(1)).strip()
+        if after_year:
+            tail_plain = strip_tags(after_year.group(1)).strip()
+            tail_plain = re.sub(r"\s+", " ", tail_plain).rstrip(".").strip()
+            segs = [s.strip() for s in tail_plain.split(",") if s.strip()]
+            if len(segs) >= 2:
+                candidate = segs[-1]
+            elif len(segs) == 1 and segs[0] != volume:
+                candidate = segs[0]
+            else:
+                candidate = ""
+            if candidate:
+                pages = re.sub(r"[\u2010-\u2014]", "-", candidate).strip(". ")
 
         # Title: text between the author list and the journal span.
         # Authors end with "." before the title. Use structure: after

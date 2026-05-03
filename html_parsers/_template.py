@@ -16,6 +16,7 @@ import re
 from html import unescape
 
 from ._helpers import (
+    _remove_nested_element,
     drop_noise,
     extract_captions,
     format_author_name,
@@ -23,6 +24,8 @@ from ._helpers import (
     format_name,
     get_meta,
     parse_meta_authors,
+    remove_elements_by_id,
+    remove_elements_by_selector,
     strip_common,
     strip_tags,
     tags_to_text,
@@ -46,11 +49,86 @@ _SUPP_RE = re.compile(
 # ---------------------------------------------------------------------------
 
 def remove_banners(html):
-    """Remove floating banners, cookie consent dialogs, and overlays.
+    """Normalize the saved HTML to a single centered text column.
 
-    Return html unmodified if nothing needs removing. Ask the user to
-    identify visually impairing elements before implementing; do not guess.
+    Follow the 4-step workflow from the format-html skill
+    (.claude/skills/format-html/SKILL.md):
+
+        Step 1 — Render the raw HTML at vw = 720 to see the publisher's
+                 narrow layout. That is the baseline you will match.
+        Step 2 — Freeze that layout with a fluid-with-cap body (html 100%,
+                 body max-width 752 px) so desktop-layout media queries
+                 stop firing.
+        Step 3 — Remove chrome in five categories: top blocks, bottom
+                 blocks, side columns, floating blocks, colored backgrounds.
+                 Prefer DOM removal over CSS display:none.
+        Step 4 — Cap the main text column at 752 px, 56 px top/bottom +
+                 16 px side padding, centered, white background. Zero
+                 inner-wrapper paddings and first/last-child margins if
+                 they shrink or shift text.
+
+    Preserve native typography. Unless the user asks otherwise, do not
+    override the publisher's font family, font size, line height, letter
+    spacing, or paragraph spacing — inject layout/visibility CSS only.
+
+    Ask the user to identify visually impairing elements before implementing
+    — do not guess. Every change must preserve bit-identical parse_article
+    output.
     """
+    # -------------------------------------------------------------------
+    # Step 3 — strip chrome. Replace the placeholder selectors with the
+    # publisher's actual markers. Prefer the _helpers.py helpers over raw
+    # regex; anchor class patterns with \b.
+    # -------------------------------------------------------------------
+    # (3a) Top blocks: cookie banner, site header, leaderboard ad, breadcrumbs.
+    # html = remove_elements_by_id(html, "COOKIE_BANNER_ID")
+    # html = _remove_nested_element(html, r'<header\b[^>]*>')
+    # html = _remove_nested_element(html, r'<div[^>]*\bclass="[^"]*\bBREADCRUMB\b[^"]*"[^>]*>')
+    #
+    # (3b) Bottom blocks: site footer, related-articles, sign-up CTAs.
+    # html = _remove_nested_element(html, r'<footer\b[^>]*>')
+    #
+    # (3c) Side columns: left nav, right sidebar.
+    # html = remove_elements_by_id(html, "LEFT_SIDEBAR_ID", "RIGHT_SIDEBAR_ID")
+    #
+    # (3d) Floating blocks: sticky toolbars, dismiss buttons, overlays.
+    # html = _remove_nested_element(html, r'<div[^>]*\bclass="[^"]*\bFLOATING_TOOLBAR\b[^"]*"[^>]*>')
+    #
+    # (3e) Colored backgrounds: branded masthead strips. Usually caught
+    # above as top/bottom/side blocks; if a colored band survives, target
+    # it here.
+
+    # -------------------------------------------------------------------
+    # Steps 2 + 4 — inject layout-freeze CSS and cap the main wrapper.
+    # Replace MAIN_WRAPPER_SELECTOR with the highest common ancestor of
+    # title + authors + affiliations + abstract + body + references +
+    # figure captions.
+    # -------------------------------------------------------------------
+    override = (
+        "<style>"
+        # Layout freeze (Step 2): fluid html, body fluid with 752-px cap.
+        "html{width:100% !important;max-width:100% !important;"
+        "margin:0 !important;background:#fff !important}"
+        "body{width:100% !important;min-width:0 !important;"
+        "max-width:752px !important;margin:0 auto !important;"
+        "background:#fff !important;color:#000 !important}"
+        # Capped reading column (Step 4).
+        "MAIN_WRAPPER_SELECTOR{"
+        "float:none !important;display:block !important;"
+        "width:auto !important;max-width:752px !important;"
+        "margin:0 auto !important;padding:56px 16px !important;"
+        "box-sizing:border-box !important;background:#fff !important}"
+        # If T or B exceed ±4 tolerance after Step 4, see SKILL.md
+        # § Pitfalls for first-/last-child margin/padding resets.
+        # Use the direct-child combinator `>` (descendant `*:last-child
+        # { padding-bottom: 0 }` collapses nested bordered-box
+        # interiors). Conditional — drop entirely when not needed.
+        "</style>"
+    )
+    if "</head>" in html:
+        html = html.replace("</head>", override + "</head>", 1)
+    else:
+        html = re.sub(r"(<body\b)", override + r"\1", html, count=1)
     return html
 
 

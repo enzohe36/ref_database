@@ -10,6 +10,9 @@ from ._helpers import (
     extract_captions,
     format_author_name,
     format_doi,
+    neutralize_media_queries,
+    remove_elements_by_id,
+    remove_elements_by_selector,
     strip_common,
     strip_tags,
     tags_to_text,
@@ -47,17 +50,302 @@ _SUPP_RE = re.compile(
 # ---------------------------------------------------------------------------
 
 def remove_banners(html):
-    """Remove floating banners, cookie consent dialogs, and overlays.
+    """Normalize ACS HTML to a single centered text column.
 
-    Strips the <header class="header ..."> block that holds the ACS top
-    bar (ACS / ACS Publications / C&EN / CAS menu, institution/login
-    controls, "ACS Publications. Most Trusted. Most Cited. Most Read"
-    logo, and the quick-search widget).
+    Chrome stripped (Step 3):
+      - Site `<header>` and `<footer>`.
+      - Outer `<main id=main-desktop>` wrapper attributes are kept; the
+        article wrapper is the inner `<main class="content article">`
+        which holds `<article>`.
+      - Pre-title chrome inside `.article_header-left` (breadcrumbs,
+        mobile logo, access-icons, share dropdown) — strip via the
+        targeted classes so only the publication-type/date row + title
+        remain at the top of the reading column.
+      - "Cited By" section (`<div class=cited-by>`) and every following
+        post-article block (Citing/Recommended/Subjects/Comments).
+
+    Visibility tweaks (Step 4):
+      - Force-expand the "View Author Information" affiliations accordion
+        (`#affiliations-popup`).
+      - Hide the `.figure-viewer` modal via CSS only — its `cit-fg-*`
+        spans are read by `_parse_metadata`, so it must not be removed
+        from the DOM.
+
+    Reading column wrapper: `<main class="content article">`. Cap at
+    752 px with 56 px top/bottom + 16 px side padding.
     """
-    return _remove_nested_element(
-        html,
-        r'<header[^>]*class="[^"]*\bheader\b[^"]*"[^>]*>',
+    # Lock layout to publisher's narrow (≤1024 px) form at any viewport.
+    html = neutralize_media_queries(html)
+    # -------------------------------------------------------------------
+    # Step 3 — strip chrome.
+    # -------------------------------------------------------------------
+    # The site header is `<header class="header header_...">`. Inline
+    # sub-headers (`<header class=article__tags__header>` for the Subjects
+    # block, `<header class=...>` inside reference lists) must NOT be
+    # stripped — the parser captures their text. Match only on the
+    # site-header class prefix.
+    for _ in range(5):
+        before = html
+        html = _remove_nested_element(
+            html, r'<header\b[^>]*class="header(?:\s+|")',
+        )
+        if html == before:
+            break
+    # Footer: `<footer class=footer ...>`. Inline figshare-widget footer
+    # `<footer class=frontend-filesViewer-...>` carries the
+    # "Share / Download / figshare" caption that the parser emits into
+    # main_text — match only the site footer's `class=footer` token.
+    for _ in range(5):
+        before = html
+        html = _remove_nested_element(
+            html, r'<footer\b[^>]*\bclass=(?:"footer"|footer\b)',
+        )
+        if html == before:
+            break
+    # Cookie / CCPA / chat widgets that float over the article.
+    for sel in (
+        "onetrust-consent-sdk", "onetrust-banner-sdk",
+        "SnapABug_CMW", "SnapABug_CM",
+    ):
+        html = remove_elements_by_id(html, sel)
+    # Pre-title chrome inside article_header-left.
+    for cls in (
+        "article_header-dropzone-1", "article_header-logo",
+        "article_header-icons", "article_header-share",
+        # Mobile layout surfaces a headerLogo/e-alerts block at the very
+        # top of article_header-left (visible only below the desktop
+        # breakpoint). Strip so the publication-type line is the first
+        # rendered text at every viewport.
+        "headerLogo_e-alertsMobile_container",
+        "e-alertsMobile_container",
+    ):
+        for _ in range(8):
+            before = html
+            html = _remove_nested_element(
+                html, rf'<div\b[^>]*class="?{cls}\b[^>]*>',
+            )
+            if html == before:
+                break
+    # Sticky duplicate header that appears on scroll (article_stickyheader).
+    html = _remove_nested_element(
+        html, r'<div\b[^>]*class="?[^"]*\barticle_stickyheader\b[^"]*"?[^>]*>',
     )
+    # Right-rail content column (cover image, PDF buttons, alerts).
+    html = remove_elements_by_id(html, "article_content-right")
+    # Cited By + everything after (block has class=cited-by; the trailing
+    # widgets sit inside article-side panes the wrapper still contains).
+    html = _remove_nested_element(
+        html, r'<div\b[^>]*\bclass="?cited-by\b[^>]*>',
+    )
+    # Floating section-tab navigator (Abstract / Figures / References /
+    # Supporting Info shortcuts). It is position:absolute with a dummy
+    # body ~29,000 px tall that extends docH, and overlaps the article
+    # when pinned sticky. Drop the wrapper.
+    html = _remove_nested_element(
+        html, r'<nav\b[^>]*\bclass=[\'"]?tab-nav-shortcut__wrapper\b[^>]*>',
+    )
+    # Recommended-articles drawer. (Don't strip subjects__heading —
+    # Subjects sits before Cited By per the user's column-end anchor
+    # and feeds main_text. Don't strip #about-article-metrics — it's
+    # a hidden popup whose `margin-top:15px` participates in the
+    # margin cascade above the Abstract heading; removing it
+    # collapses 15 px of spacing.)
+    for sel in (
+        "show-recommended__list",
+        "article_drawer_RecommendedShowMore",
+        "article_drawer_RecommendedShowLess",
+    ):
+        html = remove_elements_by_id(html, sel)
+    # Skip-link anchors that occupy a line at the top of body.
+    html = remove_elements_by_id(html, "skip-to-article", "skip-to-sidebar")
+
+    # -------------------------------------------------------------------
+    # Steps 2 + 4 — layout freeze, column cap, expand author-info,
+    # hide figure-viewer modal (DOM-preserved for parser).
+    # -------------------------------------------------------------------
+    override = (
+        "<style>"
+        "html{width:100% !important;max-width:100% !important;"
+        "margin:0 !important;background:#fff !important}"
+        "body{width:100% !important;min-width:0 !important;"
+        "max-width:752px !important;margin:0 auto !important;"
+        "background:#fff !important;color:#000 !important}"
+        # Outer main wrapper + ancestor grids collapse to plain block.
+        # `.article-grid` ships as a 2-column CSS grid (article__left-side
+        # + article__right-side) that pins the left side to track 1 with
+        # track 2 reserved for the sidebar. Override to single-column so
+        # the left-side content takes the full wrapper width.
+        "#main-desktop,#pb-page-content,#pb-page-content>div,"
+        ".article__pubdate,.article-grid,"
+        "#article__left-side,.article__left-side,.article_fullPage{"
+        "display:block !important;"
+        "width:100% !important;max-width:100% !important;"
+        "margin:0 !important;padding:0 !important;float:none !important;"
+        "grid-template-columns:none !important;"
+        "grid-template-areas:none !important;"
+        "background:#fff !important}"
+        # Capped reading-column wrapper.
+        ":root main.content.article{"
+        "float:none !important;display:block !important;"
+        "width:auto !important;max-width:752px !important;"
+        "margin:0 auto !important;padding:56px 16px !important;"
+        "box-sizing:border-box !important;background:#fff !important}"
+        ":root main.content.article *{"
+        "max-width:100% !important;min-width:0 !important;"
+        "box-sizing:border-box !important}"
+        # The article header splits into a 2-col flex row at desktop
+        # widths (article_header-left ~ calc(100% - 16.25rem), right
+        # 16.25rem). After right column removal the left is calc-clamped
+        # to less than 100%. Force flex children to plain block + 100%
+        # width.
+        ":root main.content.article .article_header,"
+        ":root main.content.article .article_header-left,"
+        ":root main.content.article .article_header-meta,"
+        ":root main.content.article .article_header-meta-left,"
+        ":root main.content.article .article_header-meta-right,"
+        ":root main.content.article .article_header-meta-center,"
+        ":root main.content.article .article_header-footer,"
+        ":root main.content.article .article_header-footer-left,"
+        ":root main.content.article .article_header-footer-right,"
+        ":root main.content.article #articleBody,"
+        ":root main.content.article .NLM_sec,"
+        ":root main.content.article .article__content,"
+        ":root main.content.article article{"
+        "display:block !important;width:auto !important;"
+        "max-width:100% !important;min-width:0 !important;"
+        "margin-left:0 !important;margin-right:0 !important;"
+        "padding-left:0 !important;padding-right:0 !important;"
+        "float:none !important;clear:none !important}"
+        # `.article_header` has `padding-top: 32px` (publisher chrome
+        # to vertically separate the metadata block from the journal
+        # logo above), pushing T from 56 to 88. Zero — the wrapper's
+        # 56 px padding-top already provides the gap. Keep pb=16 —
+        # that's the publisher's natural gap between the metric block
+        # and the Abstract heading; zeroing it collapses 16 px of
+        # spacing before "Abstract" and other downstream sections.
+        ":root main.content.article .article_header{"
+        "padding-top:0 !important}"
+        # Force-expand the "View Author Information" affiliations accordion.
+        # Site CSS keeps it hidden via height:0 / display:none.
+        "#affiliations-popup{display:block !important;"
+        "max-height:none !important;height:auto !important;"
+        "overflow:visible !important;visibility:visible !important}"
+        # Hide the figure-viewer fullscreen modal (lives at fixed position
+        # over the page). Cannot DOM-remove: it carries cit-fg-* spans
+        # that _parse_metadata reads.
+        ".figure-viewer{display:none !important}"
+        # Figshare embedded-PDF loaders render below the article (~1200 px
+        # canvas) and add docH past the wrapper bottom on newer captures.
+        ".figshare-loader,.fs-page-wrapper,"
+        ".fs-figshare-loader-holder,.fs-canvas-document-container{"
+        "display:none !important}"
+        # Trailing display:inline canvas element generates a baseline
+        # line-box at the bottom of body (~16 px below wrapper).
+        "canvas.hiddenCanvasElement{display:none !important}"
+        # Tables: force fixed layout + word-break so wide DNA/sequence
+        # cells don't push past the wrapper.
+        ":root main.content.article table{"
+        "width:100% !important;max-width:100% !important;"
+        "table-layout:fixed !important}"
+        ":root main.content.article td,:root main.content.article th{"
+        "word-break:break-all !important;overflow-wrap:anywhere !important;"
+        "white-space:normal !important}"
+        # First-child margin reset — DIRECT children only (`>`) per the
+        # SKILL.md pitfall. Descendant `*:first-child{margin-top:0}`
+        # zeroes every section heading's top margin (headings are
+        # typically the first child of their section container),
+        # causing the body paragraph right below each heading to
+        # overlap the heading text. Descendant `*:last-child
+        # {margin-bottom:0}` is safe for the margin cascade; but
+        # descendant `padding-bottom:0` would zero the inner padding
+        # of nested last-children (e.g. the reference View button's
+        # `padding:4px 8px` collapses to `4px 8px 0`, cramming the
+        # text against the bottom border) — so keep padding-bottom
+        # on direct child only.
+        ":root main.content.article > *:first-child{"
+        "margin-top:0 !important;padding-top:0 !important}"
+        # Trailing margin-bottom reset — direct-child chain only.
+        # Descendant `*:last-child{margin-bottom:0}` zeros the
+        # publisher's intentional `.mb-4` (mb=24) and trailing
+        # paragraph mb=16 used to space between sections (e.g. the
+        # Terms & Conditions paragraph above "Author Information"),
+        # collapsing inter-section spacing. The 6-level direct-child
+        # chain reaches the actual last-leaf of the wrapper and zeros
+        # only that one's trailing margin.
+        ":root main.content.article > *:last-child,"
+        ":root main.content.article > *:last-child > *:last-child,"
+        ":root main.content.article > *:last-child > *:last-child > *:last-child,"
+        ":root main.content.article > *:last-child > *:last-child > *:last-child > *:last-child,"
+        ":root main.content.article > *:last-child > *:last-child > *:last-child > *:last-child > *:last-child,"
+        ":root main.content.article > *:last-child > *:last-child > *:last-child > *:last-child > *:last-child > *:last-child"
+        "{margin-bottom:0 !important;padding-bottom:0 !important}"
+        # Native ACS CSS sets `.article-grid .article_abstract h2
+        # {margin:0}`, leaving no separation between the "Abstract"
+        # heading block and the content (graphical abstract figure +
+        # paragraph) that immediately follows. Restore ~16 px of
+        # breathing room.
+        ":root main.content.article .article_abstract-content{"
+        "margin-top:16px !important}"
+        # The Funding Statement / articleNote blue box natively ships
+        # `padding:1rem` (16 px all around) but the previous descendant
+        # `*:first-child{padding-top:0}` zeroed padding-top on the h4
+        # inside, leaving the "Funding Statement" heading text flush
+        # against the box's upper edge. Restore the heading's natural
+        # padding-top so the text sits inside the padded box.
+        ":root main.content.article .extra-info-sec.articleNote,"
+        ":root main.content.article .extra-info-sec.fnGroup{"
+        "padding-top:16px !important}"
+        # Figures: ACS wraps each figure in
+        #   <figure id=f_<N> class="article__inlineFigure ...">
+        #     <button class=figure-viewer__trigger>
+        #       <img class="inline-fig internalNav"
+        #            src='data:image/svg+xml,<placeholder>'
+        #            style="background-image:var(--sf-img-N) ...">
+        #     </button>
+        #     <div class=figure-bottom-links>
+        #       <div class=download-hi-res-img>
+        #         <a href=https://pubs.acs.org/cms/<doi>/asset/images/large/<file>.jpeg>
+        #            High Resolution Image</a>
+        #       </div>
+        #       <div class=download-ppt><a>Download MS PowerPoint Slide</a></div>
+        #     </div>
+        #   </figure>
+        # The image is rendered via SingleFile's `--sf-img-<N>` CSS var
+        # (background-image on the <img> with a transparent SVG src).
+        # Native fixed style="width:405px;height:275px" caps the figure
+        # to the publisher's column width (narrower than the 720-px
+        # reading column). Force the figure-viewer button + img to
+        # full column width; the background-image fills the box at
+        # `background-size:contain`, preserving aspect ratio.
+        # get_refs.py uses `_ACS_FIGURES_FIX_JS` to swap the inline
+        # SVG src to the high-res JPEG URL pulled from the
+        # `.download-hi-res-img > a` link, so SingleFile inlines the
+        # full-resolution image. Also hide the JS-only download link
+        # row (PPT / Hi-Res) — non-functional inside the saved HTML.
+        ":root main.content.article figure.article__inlineFigure{"
+        "margin:1rem 0 !important;padding:0 !important;"
+        "width:100% !important;max-width:100% !important;"
+        "display:block !important}"
+        ":root main.content.article figure.article__inlineFigure "
+        "button.figure-viewer__trigger{"
+        "all:unset !important;display:block !important;"
+        "width:100% !important;max-width:100% !important;"
+        "margin:0 !important;padding:0 !important;cursor:default !important}"
+        ":root main.content.article figure.article__inlineFigure "
+        "img.inline-fig{"
+        "display:block !important;width:100% !important;"
+        "height:auto !important;max-width:100% !important;"
+        "margin:0 0 5px 0 !important}"
+        # Drop the JS-only download links row.
+        ":root main.content.article figure.article__inlineFigure "
+        ".figure-bottom-links{display:none !important}"
+        "</style>"
+    )
+    if "</head>" in html:
+        html = html.replace("</head>", override + "</head>", 1)
+    else:
+        html = re.sub(r"(<body\b)", override + r"\1", html, count=1)
+    return html
 
 
 # ---------------------------------------------------------------------------

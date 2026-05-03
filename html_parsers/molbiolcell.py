@@ -16,9 +16,11 @@ from ._helpers import (
     extract_captions,
     format_doi,
     get_meta,
+    remove_elements_by_id,
     strip_common,
     strip_tags,
     tags_to_text,
+    remove_elements_by_selector,
 )
 
 # Publisher-specific noise strings removed from main_text
@@ -51,21 +53,164 @@ _CHROME_RE = re.compile(
 # ---------------------------------------------------------------------------
 
 def remove_banners(html):
-    """Remove floating banners, cookie consent dialogs, and overlays.
+    """Normalize molbiolcell HTML to a single centered text column.
 
-    - header fixed base mboc-theme: site-wide floating top bar (MBoC
-      logo, Home, Current Issue, Archive, etc.).
-    - scroll-to-target fixed-element: article sticky bar (Sections,
-      View PDF, Tools, Share).
+    The article body lives in `.article__content` (a Bootstrap col-sm-8).
+    Its sibling `.col-sm-4.sticko__parent.fixed-element` hosts the
+    figures/references/related floating tabs panel. Site chrome
+    includes `<header class="header fixed ...">`, `<footer>`, a
+    `<nav class="coolBar stickybar">` floating action bar ("About /
+    Sections / Tools / Share"), plus `#figure-viewer` modal.
+
+    Chrome stripped (Step 3):
+      - <header>, <footer>, <nav> (coolBar stickybar).
+      - #main-menu (drawer nav, nested already inside header).
+      - .col-sm-4.sticko__parent.fixed-element (right tab sidebar).
+      - #figure-viewer (modal, hidden by default).
+
+    Reading column (Step 4): `.article__content`.
+    The inline script on the page calls
+    `.article__body:not(.show-references) .article__references { display:none }`
+    via JS at load time. Override by adding `.show-references` class to
+    `.article__body` via CSS so the visibility check never matches.
     """
+    # Step 3 — strip chrome.
+    # Purge all <script> tags: one SingleFile-embedded script hides
+    # `.article__references` at load via JS, and other embedded scripts
+    # push Edge into a memory-heavy render loop that crashes the tab
+    # on navigation. Scripts add nothing to a static reading snapshot.
+    html = re.sub(r"<script\b[^>]*>.*?</script>", "", html, flags=re.DOTALL)
+    html = _remove_nested_element(html, r"<header\b[^>]*>")
+    html = _remove_nested_element(html, r"<footer\b[^>]*>")
+    # Floating coolBar sticky action bar.
+    for _ in range(3):
+        before = html
+        html = _remove_nested_element(
+            html,
+            r'<nav\b[^>]*\bclass="[^"]*\bstickybar\b[^"]*"[^>]*>',
+        )
+        if html == before:
+            break
+    # Right-rail tabs panel (fixed-position sidebar).
+    for _ in range(3):
+        before = html
+        html = _remove_nested_element(
+            html,
+            r'<div\b[^>]*\bclass="col-sm-4 hidden-xs hidden-sm sticko__parent fixed-element"[^>]*>',
+        )
+        if html == before:
+            break
+    html = remove_elements_by_id(html, "figure-viewer", "main-menu")
+    # Fixed-position `<div class=w-slide>` sibling of </article>: the
+    # references/related-figure overlay. Empty until triggered, but its
+    # fixed-position div still fills the viewport.
     html = _remove_nested_element(
-        html,
-        r'<header [^>]*class="header fixed base mboc-theme"[^>]*>',
+        html, r'<div\b[^>]*\bclass=w-slide\b[^>]*>'
     )
+    # `<div class=response><div class=sub-article-title></div></div>`
+    # is an empty placeholder at the end of .article__body that renders
+    # as a 16-px trailing block (its computed-style defaults have no
+    # margin but the box still contributes to docH).
     html = _remove_nested_element(
-        html,
-        r'<div class="scroll-to-target fixed-element"[^>]*>',
+        html, r'<div\b[^>]*\bclass=response\b[^>]*>'
     )
+    # `.pb-widget-placeholder` blocks sit below the article and carry
+    # "Related articles" / "Cited by" h3 headings. The class attr is
+    # unquoted — match directly.
+    for _ in range(10):
+        before = html
+        html = _remove_nested_element(
+            html,
+            r'<div\b[^>]*\bclass=pb-widget-placeholder\b[^>]*>',
+        )
+        if html == before:
+            break
+
+    # Steps 2 + 4 — layout freeze and reading-column cap.
+    override = (
+        "<style>"
+        "html{overflow-y:overlay}"
+        "html::-webkit-scrollbar{width:0}"
+        "html{width:100% !important;max-width:100% !important;"
+        "margin:0 !important;background:#fff !important}"
+        "body{width:100% !important;min-width:0 !important;"
+        "max-width:752px !important;margin:0 auto !important;"
+        "padding:0 !important;"
+        "background:#fff !important;color:#000 !important}"
+        # Collapse the Bootstrap grid wrappers between body and
+        # .article__content so the cap rule isn't shrunk by the
+        # col-sm-8 two-thirds width.
+        "#pb-page-content,main.content,"
+        "article,article.container,article > .row,"
+        "article .container,article .row,"
+        ".col-sm-8,.col-md-8,.article__content{"
+        "display:block !important;float:none !important;"
+        "width:100% !important;max-width:100% !important;"
+        "min-width:0 !important;margin:0 !important;padding:0 !important;"
+        "box-sizing:border-box !important;"
+        "background:#fff !important}"
+        # Cap the reading column on .article__content. (The outer
+        # grid wrappers above are collapsed to full width, so this
+        # cap is the only width constraint left in the chain.)
+        "main.content{"
+        "max-width:752px !important;margin:0 auto !important;"
+        "padding:56px 16px !important;"
+        "box-sizing:border-box !important}"
+        "main.content *{"
+        "max-width:100% !important;min-width:0 !important}"
+        "main.content table{"
+        "table-layout:fixed !important;width:100% !important;"
+        "word-break:break-word !important}"
+        # Zero margin-top/margin-bottom only at the very top/bottom of
+        # the reading flow, NOT on every descendant last-child. The
+        # native abstract wrapper's margin-bottom creates the 16-px gap
+        # above "INTRODUCTION"; zeroing all descendant `*:last-child`
+        # margins collapses that inter-section break.
+        #
+        # Target the first-child chain from main.content down through
+        # article > .row > .article__content > .citation > .citation__top
+        # (the citation_top's native margin-top:.9375rem is the only
+        # spacer above the reading flow) plus the last-child of
+        # .article__content (the references block with margin-bottom).
+        ":root .article__content > *:first-child,"
+        ":root .citation > *:first-child,"
+        ":root .citation__top{"
+        "margin-top:0 !important;padding-top:0 !important}"
+        ":root .article__content > *:last-child{"
+        "margin-bottom:0 !important;padding-bottom:0 !important}"
+        # The reference list (`ul.references`) is the final content
+        # block and ships `margin-bottom:16px`; collapses through to
+        # extend docH past the 56-px wrapper padding. Zero it.
+        ":root ul.references{"
+        "margin-bottom:0 !important;padding-bottom:0 !important}"
+        # Override the inline script that hides references. The script
+        # queries `.article__body:not(.show-references) .article__references`
+        # and sets display:none. Force display:block regardless.
+        ":root .article__body .article__references{"
+        "display:block !important}"
+        # MathJax hover/tooltip absolutely-positioned helpers below
+        # the article extend docH by a couple of pixels.
+        ".MJX_HoverRegion,.MJX_ToolTip{display:none !important}"
+        # Figures: `<figure id=FIG<N> class=article__inlineFigure>` wraps
+        # `<img class=figure__image>` followed by `<figcaption>`.
+        # Native `<figure>` browser default has 40 px horizontal margin
+        # which shaves the image off the column edges, and the inlined
+        # JPEG is rendered at its intrinsic pixel dimensions (often
+        # narrower than the 720-px column). Force the wrapper to zero
+        # horizontal margin and the img to block + 100% width above the
+        # caption. Scoped via `:root` to beat `.figure__image` rules.
+        ":root .article__content figure.article__inlineFigure{"
+        "margin:1rem 0 !important;padding:0 !important}"
+        ":root .article__content figure.article__inlineFigure > img.figure__image{"
+        "display:block !important;width:100% !important;"
+        "height:auto !important;max-width:100% !important;"
+        "margin:0 0 5px 0 !important}"
+        "</style>"
+    )
+    if "</head>" in html:
+        html = html.replace("</head>", override + "</head>", 1)
+    else:
+        html = re.sub(r"(<body\b)", override + r"\1", html, count=1)
     return html
 
 

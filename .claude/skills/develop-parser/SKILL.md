@@ -70,16 +70,78 @@ Evaluation criteria for successful parser development:
   - "references" key: references + supplementary references.
   - "main_text" key: from abstract to before the first references section + supplementary materials
 
-Bootstrap process for a new publisher (requires at least 30 papers in `papers/<second_level_domain>/`; if fewer, confirm with user before proceeding):
+## Verification loop (mandatory)
+
+Static structure checks (header counts, chr totals, regex on HTML) are a first pass only. They cannot judge whether the JSON actually captures what a reader sees, because publisher HTMLs routinely hide content behind JS-rendered sections, collapsed accordions, or unusual markup that regex misses. Static checks pass while real bugs go unreported.
+
+Agent + browser-rendered text verification is therefore **required** before a parser can be considered done. After static checks look clean for a paper, run this loop:
+
+1. Open the paper's HTML in a real browser via CDP (reuse `get_refs.start_browser() / stop_browser()`), extract `document.body.innerText`.
+2. Spawn one agent per paper (Agent tool, Explore or general-purpose). Hand it the rendered text and the parser's JSON output. Ask it to report every field in the JSON that disagrees with the rendered text, and every chunk of rendered text missing from the JSON.
+3. Evaluate each reported bug. Decide: parser defect (fix), known caveat (e.g. affiliations hidden from rendered text — document), or agent false positive (ignore with justification).
+4. Fix every parser defect in the module.
+5. Re-run convert_html.py, then re-run the agent verification on the same papers.
+6. Repeat until an agent round reports no new parser defects.
+
+One clean round is not enough when a previous round found defects — changes can introduce regressions in unrelated fields, so the final pass must be a fresh one where nothing was changed since the verification started. Reporting a parser done after only static checks, or without a clean final agent round, is a protocol violation.
+
+## Capture-time image resolution
+
+`get_refs.py` runs single-file via Edge/CDP and inlines whatever `<img src>` resolves to at capture time. Some publishers serve a thumbnail by default (typically 100–600 px), with the high-res version one indirection away — a parent `<a href>`, a `data-large-src` attribute, a sub-page that hosts the full image, or a CDN URL pattern derivable from the article id. When this happens, the `<img>` data URL inlined in `papers/<stem>.html` is small (≈5–15 KB) and scales up blurry under the format-html skill's full-column-width figure CSS.
+
+The fix is in `get_refs.py`, wired into `_PUBLISHER_RULES` (around `get_refs.py:1008–1084`). Two implementation flavors:
+
+**Browser-script (pre-SingleFile DOM rewrite).** Use when the high-res URL is reachable from inside the captured page DOM (parent `<a>`, data attribute). Reference: plos / biorxiv / cshlp / jci entries.
+
+```python
+"<domain>": {
+    "wait_until": "networkidle0",
+    "wait_delay": 8000,
+    "browser_script": "<path>/highres_<domain>.js",
+}
+```
+
+The `.js` file walks every figure `<img>`, swaps `src` to the high-res URL pulled from the parent `<a>` / data attribute, and waits for the new images to load before SingleFile captures.
+
+**Post-capture server-side fetch.** Use when the high-res lives on a sub-page or behind logic the browser script can't reach (login redirect, client-side React rendering, derivable-from-id CDN URL). Reference: `_iucr_inline_figures` (`get_refs.py:567–703`), `_imrpress_inline_figures`, `_annualreviews_inline_figures`.
+
+```python
+"<domain>": {
+    "wait_until": "networkidle0",
+    "wait_delay": 8000,
+    "post_capture": lambda h, p: _<domain>_inline_figures(h, p),
+}
+```
+
+`_<domain>_inline_figures(html, output_path)` parses the saved HTML, derives high-res URLs (sub-page scrape, CDN pattern from article id), fetches via `urllib`, base64-encodes, and replaces the thumbnail `src` with a data URL.
+
+**Decision rule.** Browser-script is preferred when both are technically feasible — lower latency, no extra HTTP round-trips, no double-fetch. Reach for post-capture only when the high-res URL is unreachable from inside the page DOM.
+
+**Defer rule.** If the high-res URL pattern can't be confirmed from 1–2 sample papers (no parent `<a>`, no data attribute, no obvious sub-page link, no derivable CDN URL), do not ship a partial fix. Log the publisher to a deferred-image list (e.g. `temp/deferred_image_publishers.md`) with sample PMID and what was tried, and surface to the user. CSS-only changes still ship — thumbnails will display at full column width but be visibly blurry, which is no worse than the pre-change state.
+
+**Re-fetch + backup convention.** After extending `get_refs.py`:
+
+1. Re-run `python get_refs.py <pmid>` for the test paper to capture HTML through the modified pipeline.
+2. Confirm the new `papers/<stem>.html` has high-res image data URLs (data URL length > 50 KB per figure, vs ~5–15 KB for thumbnails).
+3. Copy the freshly-captured raw HTML to `papers_ref/<stem>.html` (raw-backup convention; mirror of `papers/` before `convert_html.py` runs).
+4. Run `python convert_html.py papers/<stem>.html` to apply `remove_banners` and regenerate the JSON. `convert_html.py` mutates the file in place — `papers_ref/<stem>.html` is the clean reset source if formatting needs to be re-derived later.
+
+**JSON parity caveat.** Most parsers strip `<img>` tags via `extract_captions()` + `strip_common()` before `tags_to_text()`, so changing the inlined image bytes does not affect parser output. Verify per parser that no field captures image URLs (rare). If JSON parity breaks, the parser is touching image markup and needs a tighter selector that ignores `src` content.
+
+## Bootstrap process for a new publisher
+
+Requires at least 30 papers in `papers/<second_level_domain>/`; if fewer, confirm with user before proceeding.
+
 1. Copy HTMLs from papers/ into `papers_test/<second_level_domain>/` subfolders by second-level domain extracted from the SingleFile URL comment. Replace punctuation with `_` in folder names. papers/ is not modified.
 2. Examine several htmls from `papers_test/<second_level_domain>/` as starting example.
 3. Extract rendered text from the htmls as content reference.
 4. Ask the user to identify visually impairing elements (cookie banners, consent overlays, login modals) for remove_banners. Do not assume what to remove.
-5. Implement parse_article, verifying each field against refs.json and the rendered text.
-6.  Run convert_html.py on the full `papers_test/<second_level_domain>/` directory.
-7.  Sample 3 papers. Spawn one agent per paper to extract text from rendered html and inspect converted json verify all content is correctly filled in.
-8.  If issues are detected, implement fixes, reset the test folder (see below), run convert_html.py, and spawn agents to verify.
-9.  Write main_text to `papers_test/<second_level_domain>/<stem>.md` for user inspection.
+5. Audit figure handling. For 1–2 sample papers with figures, inspect the saved HTML to determine: (a) whether the captured `<img src>` is high-res or a thumbnail, (b) the figure container selector and image selector, (c) the native layout (image above caption vs side-by-side). If thumbnail-only, decide on a `get_refs.py` strategy (browser-script vs post-capture) before implementing the parser, since capture-time inlining changes which `<img>` bytes end up in `papers/<stem>.html`. See § "Capture-time image resolution".
+6. Implement parse_article, verifying each field against refs.json and the rendered text.
+7. Run convert_html.py on the full `papers_test/<second_level_domain>/` directory.
+8. Sample 3 papers. Spawn one agent per paper to extract text from rendered html and inspect converted json verify all content is correctly filled in.
+9. If issues are detected, implement fixes, reset the test folder (see below), run convert_html.py, and spawn agents to verify.
+10. Write main_text to `papers_test/<second_level_domain>/<stem>.md` for user inspection.
 
 ## Resetting Test Folders
 

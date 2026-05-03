@@ -15,6 +15,7 @@
 - When writing in bullet points, DO NOT write more than one sentence per bullet point.
 - When summarizing content, DO NOT balance summary length across sections. write as much as necessary to cover each section.
 - When updating instructions, consider both CLAUDE.md and README.md for updates.
+- DO NOT write to the auto-memory system unless the user explicitly confirms. Do not save user/feedback/project/reference memories on your own initiative.
 
 ## File Structure
 
@@ -29,7 +30,7 @@
   - `papers/<stem>.pdf`: original PDF (fallback when HTML unavailable).
 - papers_test/<second_level_domain>/: working copies of HTMLs used during parser development. Modified in place by convert_html.py (banner removal, JSON output). Re-create from papers_test_ref/ when a parser change makes existing test output stale.
 - papers_test_ref/<second_level_domain>.zip: pristine reference copies of the HTMLs in papers_test/ at bootstrap time. Used to reset papers_test/ subfolders.
-- journals.json: not stored. NLM journal data is downloaded to a temp file by parse_citation.py on each run when full citation parsing is needed.
+- journals.json: cached NLM journal list (NlmId -> {JournalTitle, MedAbbr}). Written by convert_html.py's ensure_journals(); re-downloaded from ftp.ncbi.nlm.nih.gov when missing or older than 1 day.
 - refs.json: citation database. JSON dict keyed by PMID. Each entry has fields (in order):
   - "stem": filesystem-safe name for papers/ files. Use as in-text citation when drafting; convert_citation.py converts to readable format.
   - "pub_type": array of publication types (e.g., ["Journal Article", "Review"]).
@@ -52,9 +53,9 @@
 - `python get_refs.py --validate`: checks for Retracted Publications and published versions of preprints.
 - `python convert_html.py [<path> ...]`: parses HTML using publisher-specific logic (html_parsers/ package), fills author affiliations, structured references, and main_text into papers/<stem>.json. Each path can be an HTML file or a directory (all .html files in it are processed). Defaults to papers/ when no path is given. Skips files whose JSON already has non-empty main_text.
 - `python convert_pdf.py <path> [<path> ...]`: converts PDF to md (fallback when HTML unavailable).
-- `python merge_refs.py`: for every refs.json entry with a corresponding papers/<stem>.json, fills empty affiliations by matching author names, resolves unresolved structured references via PubMed (DOI shortcut, then author surnames + title chunks + journal + year with iterative relaxation), and unions resolved PMIDs into refs.json's references list. Existing refs.json field values are never overwritten; references is the only field augmented. Unresolved references go to refs_no_pmid.json.
+- `python merge_refs.py [<path> ...]`: for each paper JSON under the given paths (papers/ if no path is given), resolves unresolved structured references via PubMed (DOI shortcut, then author surnames + title chunks + journal + year with iterative relaxation) in phase 1, then matches the paper's stem to a refs.json entry and fills empty affiliations by matching author names + unions resolved PMIDs into refs.json's references list in phase 2. Existing refs.json field values are never overwritten; references is the only field augmented. Unresolved references go to refs_no_pmid.json. Each path can be a <stem>.json file or a directory; relative paths are resolved against the script's directory. Papers without a matching refs.json entry still get phase 1 (paper JSON updated) and a warning for phase 2.
 - `python merge_refs.py --patch`: copies manually resolved PMIDs from refs_no_pmid.json into papers/<stem>.json and refs.json (unioned), then removes them from refs_no_pmid.json.
-- `python merge_refs.py --add-refs`: citation-graph expansion. Collects every PMID cited in refs.json's references lists, subtracts PMIDs already keyed in refs.json, and invokes get_refs.py on the remainder to fetch metadata and HTML.
+- `python merge_refs.py --add-refs [<path> ...]`: citation-graph expansion. Collects every PMID cited in refs.json's references lists, subtracts PMIDs already keyed in refs.json, and invokes get_refs.py on the remainder to fetch metadata and HTML. When paths are given, only PMIDs cited in those papers' references are considered.
 - `python convert_citation.py <file>`: converts stem citations in a document to in-text citation format and adds a References section. Modifies the file in place.
 - `python search_refs.py <query>`: searches papers by semantic similarity.
 - `python search_refs.py --build`: rebuilds chroma_db/. Iterates refs.json, chunks and embeds papers/*.json main_text where available.
@@ -70,6 +71,7 @@
 ## Searching for Information
 
 1. Semantically enrich the user's query before searching. Expand abbreviations (e.g., TERT = telomerase reverse transcriptase), add synonyms (e.g., catalytic subunit), related terms (e.g., TERC, telomerase), and potential answer terms. Format the enriched query as a single string.
-2. Run `python search_refs.py <query>`. List all the papers from the output and their similarity score.
-3. Read papers/*.json main_text of top candidates.
-4. Cite sources using `<stem>` when referencing specific findings. The user will run convert_citation.py to convert stems to readable citations.
+2. Run `python search_refs.py <query>`. Output is a JSON array of {pmid, stem, score, snippet} for the top papers.
+3. Triage by snippet: drop papers whose snippet is clearly off-topic (e.g., generic background, citation list, unrelated section) before reading further.
+4. Read papers/<stem>.json main_text of the remaining candidates. DO NOT cite from the snippet alone, since a 400-word window may drop qualifiers that change a finding's meaning.
+5. Cite sources using `<stem>` when referencing specific findings. The user will run convert_citation.py to convert stems to readable citations.

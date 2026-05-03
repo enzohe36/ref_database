@@ -11,7 +11,10 @@ from ._helpers import (
     format_doi,
     format_name,
     get_meta,
+    neutralize_media_queries,
     parse_meta_authors,
+    remove_elements_by_id,
+    remove_elements_by_selector,
     strip_common,
     strip_tags,
     tags_to_text,
@@ -43,20 +46,264 @@ _PRE_BODY = {"inline recommendations"}
 # ---------------------------------------------------------------------------
 
 def remove_banners(html):
-    """Remove floating banners, cookie consent dialogs, and overlays.
+    """Normalize Nature HTML to a single centered text column.
 
-    Targets Springer Nature cookie consent dialog and status message
-    banners (e.g. "EMBO Press journals have moved...", "BMC journals
-    have moved...").
+    Per format-html-extra.md the reading column spans "Article /
+    Published: 26 August 2012" through the Subjects list at the bottom
+    of <div id=article-info-section>. Removed elements fall into three
+    buckets: (a) items format-html-extra.md names explicitly, (b) ads,
+    (c) toolbars. Non-chrome article content (Inline Recommendations,
+    article-info-section, rightslink-section, etc.) stays in the DOM.
     """
-    # Cookie consent dialog: <dialog class=cc-banner ...>...</dialog>
+    # Lock layout to publisher's narrow (≤1024 px) form at any viewport.
+    html = neutralize_media_queries(html)
+    # -------------------------------------------------------------------
+    # Step 3 — strip chrome.
+    # -------------------------------------------------------------------
+    # (a) instruction-doc items --------------------------------------
+    # "Your privacy, your choice" cookie banner (a <dialog>).
     html = _remove_nested_element(
-        html, r'<dialog[^>]*class=["\']?cc-banner[^>]*>'
+        html, r'<dialog\b[^>]*\bclass=["\']?[^"\'>]*\bcc-banner\b',
     )
-    # Status message banners
+    # (b) ads --------------------------------------------------------
+    # 728x90 leaderboard ad.
     html = _remove_nested_element(
-        html, r'<div[^>]*class="[^"]*c-status-message--banner[^"]*"[^>]*>'
+        html,
+        r'<aside\b[^>]*\bclass=["\']?[^"\'>]*\bc-ad--728x90\b',
     )
+    # Nature Briefing newsletter-signup promo banner.
+    for _ in range(5):
+        before = html
+        html = _remove_nested_element(
+            html,
+            r'<div\b[^>]*\bclass="[^"]*\bc-site-messages--nature-briefing\b[^"]*"[^>]*>',
+        )
+        if html == before:
+            break
+    # Cookie-consent ghost placeholder <div data-cc-ghost> that reserves
+    # space for a deferred ad load.
+    html = _remove_nested_element(
+        html, r'<div\b[^>]*\bdata-cc-ghost\b',
+    )
+    # "Similar content being viewed by others" inline-recommendations
+    # strip inside <main>. User-requested removal.
+    html = _remove_nested_element(
+        html,
+        r'<section\b[^>]*\bclass=["\']?[^"\'>]*\bc-article-recommendations\b',
+    )
+    # (c) toolbars ---------------------------------------------------
+    # Right-column reading-companion toolbar (<aside class=c-article-extras>):
+    # Download-PDF button, share icons, Sections/Figures/References tabs.
+    html = _remove_nested_element(
+        html,
+        r'<aside\b[^>]*\bclass=["\']?[^"\'>]*\bc-article-extras\b',
+    )
+    # Site footer (nature.com "About / Publish / Privacy" bar). The
+    # outer `<footer>` also wraps a journal-name + ISSN c-meta block,
+    # but that is publication-level metadata redundant with the
+    # article-header citation already inside the wrapper (journal
+    # abbreviation + volume/pages + DOI). Strip the whole footer for
+    # consistency with the other parsers' chrome-strip pattern and to
+    # keep the spec's `B=56` measurement well-defined against the
+    # last article paragraph (vs. against a sibling block outside the
+    # wrapper).
+    html = _remove_nested_element(html, r"<footer\b[^>]*>")
+    # Site header — nature.com uses `c-header` and Springer (link.springer
+    # .com, aliased to this parser) uses `eds-c-header`. Both render
+    # logo + nav + search at the top of the body, above the article
+    # masthead. Strip for consistency with the footer-strip pattern.
+    html = _remove_nested_element(html, r"<header\b[^>]*>")
+    # Springer's search/menu popup expanders (`.eds-c-header__expander`)
+    # are siblings of the `<header>`, not inside it — the header strip
+    # above misses them. They render visible search bars + nav menus
+    # above the article.
+    for _ in range(5):
+        before = html
+        html = _remove_nested_element(
+            html,
+            r'<div\b[^>]*\bclass=["\']?[^"\'>]*\beds-c-header__expander\b',
+        )
+        if html == before:
+            break
+    # Springer's `<a class=c-skip-link>` "Skip to main content" link
+    # and `<div class=c-status-message ...c-status-message--banner>`
+    # site-wide notice/cookie banner sit between the header and the
+    # article. The skip-link is normally hidden via `top:-45px` but
+    # SingleFile may capture it visible.
+    html = _remove_nested_element(
+        html, r'<a\b[^>]*\bclass=["\']?[^"\'>]*\bc-skip-link\b',
+    )
+    for _ in range(3):
+        before = html
+        html = _remove_nested_element(
+            html,
+            r'<div\b[^>]*\bclass="[^"]*\bc-status-message--banner\b[^"]*"[^>]*>',
+        )
+        if html == before:
+            break
+    # Springer wraps its 728x90 leaderboard ad in `<aside class="u-lazy-
+    # ad-wrapper ...">` (the existing `c-ad--728x90` strip above only
+    # handled the inner div, not the outer aside that holds the lazy
+    # placeholder). Strip the wrapper.
+    for _ in range(3):
+        before = html
+        html = _remove_nested_element(
+            html,
+            r'<aside\b[^>]*\bclass=["\']?[^"\'>]*\bu-lazy-ad-wrapper\b',
+        )
+        if html == before:
+            break
+    # Springer breadcrumbs nav: `<nav><ol class=c-breadcrumbs>...</ol></nav>`
+    # at the top of the article, above the masthead. Site-chrome.
+    for _ in range(3):
+        before = html
+        html = _remove_nested_element(
+            html,
+            r'<nav\b[^>]*>\s*<ol\b[^>]*\bclass=["\']?[^"\'>]*\bc-breadcrumbs\b',
+        )
+        if html == before:
+            break
+    # Content before "Article / Published: 26 August 2012" anchor ------
+    # Top-of-body chrome wrapper (<div data-test=top-containers>): holds
+    # grade-c browser notice, leaderboard ad slot, breadcrumb nav.
+    html = _remove_nested_element(
+        html, r'<div\b[^>]*\bdata-test=["\']?top-containers\b',
+    )
+    # DO NOT strip `c-status-message` — Erratum / "This article has
+    # been updated" notices sit BETWEEN the "Published: …" anchor and
+    # "Abstract" (verified by DOM position in raw), i.e. inside the
+    # reading column, not before it. They are content, not chrome.
+
+    # -------------------------------------------------------------------
+    # Steps 2 + 4 — layout freeze and reading-column cap.
+    # -------------------------------------------------------------------
+    override = (
+        "<style>"
+        # Layout freeze (Step 2).
+        "html{width:100% !important;max-width:100% !important;"
+        "margin:0 !important;background:#fff !important}"
+        "body{width:100% !important;min-width:0 !important;"
+        "max-width:752px !important;margin:0 auto !important;"
+        "background:#fff !important;color:#000 !important}"
+        # #content carries `padding:16px` which adds a gutter inside the
+        # body between the cap and the wrapper. Zero so the cap measures
+        # from the body edge.
+        "#content{padding:0 !important;margin:0 !important;"
+        "width:100% !important;max-width:100% !important}"
+        # <main> ships with float:left (u-float-left) so the sibling aside
+        # can dock to its right; with the aside removed, clear the float
+        # and let main fill its parent.
+        "main.c-article-main-column{"
+        "float:none !important;display:block !important;"
+        "width:auto !important;max-width:752px !important;"
+        "margin:0 auto !important;"
+        # padding-bottom trimmed to compensate line-box descent + the
+        # .c-article-section__content's native 40 px margin-bottom
+        # that sits below the last text inside the final section.
+        "padding:56px 16px 19px 16px !important;"
+        "box-sizing:border-box !important;background:#fff !important}"
+        # Zero margin-top along the wrapper's first-descendant chain
+        # (every level's first element child), so collapsed margins
+        # don't leak through main's top padding and push T past 56.
+        # Sections, headings, and elements deeper than the chain keep
+        # their native margins, preserving publisher typography.
+        "main.c-article-main-column>*:first-child,"
+        "main.c-article-main-column>*:first-child>*:first-child,"
+        "main.c-article-main-column>*:first-child>*:first-child>*:first-child,"
+        "main.c-article-main-column>*:first-child>*:first-child>*:first-child>*:first-child,"
+        "main.c-article-main-column>*:first-child>*:first-child>*:first-child>*:first-child>*:first-child,"
+        "main.c-article-main-column>*:first-child>*:first-child>*:first-child>*:first-child>*:first-child>*:first-child"
+        "{margin-top:0 !important;padding-top:0 !important}"
+        "main.c-article-main-column>*:last-child,"
+        "main.c-article-main-column>*:last-child>*:last-child,"
+        "main.c-article-main-column>*:last-child>*:last-child>*:last-child,"
+        "main.c-article-main-column>*:last-child>*:last-child>*:last-child>*:last-child,"
+        "main.c-article-main-column>*:last-child>*:last-child>*:last-child>*:last-child>*:last-child,"
+        "main.c-article-main-column>*:last-child>*:last-child>*:last-child>*:last-child>*:last-child>*:last-child"
+        "{margin-bottom:0 !important;padding-bottom:0 !important}"
+        # `<section class=c-article-recommendations>` ("Similar content
+        # being viewed by others") sat before each c-article-section
+        # with its native 48 px margin-bottom contributing to the gap
+        # above the section's H2 title. After chrome removal, the gap
+        # above "Main" (and every subsequent section title) collapses
+        # from 48 to 24 px. Bump the parent section's margin-top so
+        # the 48 px rhythm returns. Use `margin-top` (collapses with
+        # neighbors per CSS spec) rather than `padding-top` (would
+        # uniformly inflate every section's height by 24 px and shift
+        # all subsequent content down).
+        "main.c-article-main-column div.c-article-section{"
+        "margin-top:24px !important}"
+        # Author list collapse — Springer hides authors beyond the
+        # first few via `c-article-author-list__item--hide-small-screen`
+        # when the viewport is narrow. The 752-px body cap forces
+        # narrow mode, so the full author list is hidden behind a
+        # "Show authors" button that is JS-driven and dead in the
+        # static capture. Force every author item visible and hide
+        # the now-redundant button.
+        ":root .c-article-author-list__item--hide-small-screen{"
+        "display:inline !important}"
+        ".c-article-author-list__button{display:none !important}"
+        # Figures: nature wraps each figure in
+        #   <figure>
+        #     <figcaption>
+        #       <b class=c-article-section__figure-caption>Figure N: title</b>
+        #     </figcaption>
+        #     <div class=c-article-section__figure-content>
+        #       <div class=c-article-section__figure-item>
+        #         <picture class=c-article-section__figure-picture>
+        #           <img src="data:..." srcset sizes loading=lazy
+        #                width=685 height=N>
+        #         </picture>
+        #         <span class=u-visually-hidden>AI alt disclaimer</span>
+        #         <div class=c-article-section__figure-link>
+        #           <a class=c-article__pill-button data-track-action="view figure"
+        #              href=https://www.nature.com/articles/<id>/figures/<N>>
+        #              Full size image</a>
+        #         </div>
+        #       </div>
+        #       <div class=c-article-section__figure-description data-test=bottom-caption>
+        #         <p>caption body</p>
+        #       </div>
+        #     </div>
+        #   </figure>
+        # Native order: caption-title (figcaption) FIRST, image MIDDLE,
+        # description LAST. Per the figure layout contract, image must
+        # be ABOVE the entire caption. Use flex column with `order`:
+        # picture→1, figcaption→2, description→3, hide
+        # `.c-article-section__figure-link` (JS sub-page navigation,
+        # dead in static capture).
+        # The high-res JPEG URL pattern is `https://media.springernature.com/lw1200/.../<id>_Fig<N>_HTML.jpg` —
+        # exposed in the page's JSON-LD `image` array; get_refs.py uses
+        # `_NATURE_FIGURES_FIX_JS` to swap <img src> ← that URL.
+        ":root figure:has(.c-article-section__figure-content){"
+        "display:flex !important;flex-direction:column !important;"
+        "margin:1rem 0 !important;padding:0 !important;"
+        "width:100% !important;max-width:100% !important}"
+        ":root figure .c-article-section__figure-content{"
+        "display:flex !important;flex-direction:column !important;"
+        "width:100% !important;max-width:100% !important;"
+        "margin:0 !important;padding:0 !important}"
+        ":root figure .c-article-section__figure-item{"
+        "display:flex !important;flex-direction:column !important;"
+        "width:100% !important;max-width:100% !important;"
+        "margin:0 !important;padding:0 !important}"
+        ":root figure picture.c-article-section__figure-picture{"
+        "order:-1 !important;display:block !important;"
+        "width:100% !important;max-width:100% !important;"
+        "margin:0 0 5px 0 !important;padding:0 !important}"
+        ":root figure picture.c-article-section__figure-picture > img{"
+        "display:block !important;width:100% !important;"
+        "height:auto !important;max-width:100% !important;"
+        "margin:0 !important}"
+        # Hide the JS-only "Full size image" pill button (sub-page nav).
+        ":root figure .c-article-section__figure-link{"
+        "display:none !important}"
+        "</style>"
+    )
+    if "</head>" in html:
+        html = html.replace("</head>", override + "</head>", 1)
+    else:
+        html = re.sub(r"(<body\b)", override + r"\1", html, count=1)
     return html
 
 
@@ -216,8 +463,15 @@ def _parse_citation_reference(content):
     # Collapse multiple spaces after dot removal
     journal = re.sub(r"  +", " ", journal).strip()
 
+    title = fields.get("citation_title", "")
+    # Book citations carry citation_publisher instead of citation_journal_title;
+    # the book title plays the journal role per the project convention.
+    if not journal and fields.get("citation_publisher") and title:
+        journal = title
+        title = ""
+
     return {
-        "title": fields.get("citation_title", ""),
+        "title": title,
         "journal": journal,
         "year": fields.get("citation_publication_date", ""),
         "volume": fields.get("citation_volume", ""),
@@ -275,30 +529,31 @@ def _parse_body_reference(item_html):
     volume = re.sub(r"<[^>]+>", "", b_m.group(1)).strip()
 
     pre_b = item_html[:b_m.start()]
-    jm = re.search(
-        r"<i[^>]*>(.+?)</i>"
-        r"(?:\s*\(<i[^>]*>(.+?)</i>\.?\)\s*)?"
-        r"\s*\.?\s*,?\s*$",
-        pre_b,
-        re.DOTALL,
-    )
-    if jm:
-        main_j = unescape(re.sub(r"<[^>]+>", "", jm.group(1))).strip().rstrip(".").strip()
-        cont = jm.group(2)
-        if cont:
-            cont = unescape(re.sub(r"<[^>]+>", "", cont)).strip().rstrip(".").strip()
-            journal = f"{main_j} ({cont})"
-        else:
-            journal = main_j
-        head_html = pre_b[:jm.start()]
-    else:
-        last_i = None
-        for im in re.finditer(r"<i[^>]*>(.+?)</i>", pre_b, re.DOTALL):
-            last_i = im
-        if not last_i:
-            return _body_fallback(item_html, doi)
-        journal = unescape(re.sub(r"<[^>]+>", "", last_i.group(1))).strip().rstrip(".").strip()
-        head_html = pre_b[:last_i.start()]
+    # Find all <i>...</i> blocks individually (non-greedy $-anchored search
+    # can span TWO <i> tags when the regex engine expands .+? to reach the
+    # end — seen on refs like "Ludérus ... <i>et al</i>. ... <i>J. Cell
+    # Biol.</i>" where the `<i>et al</i>` author italic precedes the
+    # journal italic). Journal is the last <i> block before <b>; an
+    # optional "(<i>X</i>)" continuation right after (e.g. "DNA Repair
+    # (Amst)") folds into the journal name.
+    i_matches = list(re.finditer(r"<i[^>]*>(.+?)</i>", pre_b, re.DOTALL))
+    if not i_matches:
+        return _body_fallback(item_html, doi)
+    last_i = i_matches[-1]
+    # Check for a (<i>...</i>) continuation after the primary journal block —
+    # only applies when the last <i> is inside parens, with another <i>
+    # immediately before. e.g. "<i>DNA Repair</i> (<i>Amst</i>)".
+    journal = unescape(re.sub(r"<[^>]+>", "", last_i.group(1))).strip().rstrip(".").strip()
+    head_end = last_i.start()
+    if len(i_matches) >= 2:
+        prev_i = i_matches[-2]
+        between = pre_b[prev_i.end():last_i.start()]
+        after_last = pre_b[last_i.end():].rstrip(" .,")
+        if re.match(r"\s*\(\s*$", between) and after_last.startswith(")"):
+            cont = journal
+            journal = f"{unescape(re.sub(r'<[^>]+>', '', prev_i.group(1))).strip().rstrip('.').strip()} ({cont})"
+            head_end = prev_i.start()
+    head_html = pre_b[:head_end]
 
     year = ""
     pyrs = re.findall(r"\(\s*(\d{4})[a-z]?\s*\)", item_html)
@@ -362,11 +617,124 @@ def _body_fallback(item_html, doi):
     text = re.sub(r"<[^>]+>", "", text)
     text = unescape(text)
     text = re.sub(r"https?://doi\.org/\S+", "", text)
+    # BMC-style trailing bare DOI (no https://doi.org/ prefix): 'Science.
+    # 1991, 251: 1351-1355. 10.1126/science.1900642.' — strip so the tail
+    # anchors of the BMC/semicolon regexes below can match on pages.
+    bare_doi_m = re.search(r"\s+(10\.\d{4,}/\S+?)\s*\.?\s*$", text)
+    if bare_doi_m:
+        if not doi:
+            doi = format_doi(bare_doi_m.group(1).rstrip("."))
+        text = text[: bare_doi_m.start()].rstrip()
     text = re.sub(r"\s+", " ", text).strip().rstrip(".")
 
     year_end = _parse_year_at_end_plaintext(text, doi)
     if year_end is not None:
         return year_end
+
+    # Modern Springer/Nature plaintext refs use two compact pagination
+    # separators that lose <i>/<b> styling in the saved HTML:
+    #
+    # A. Semicolon:
+    #    "Authors. Title. Journal. YEAR;VOL[(Issue)]:PAGES."
+    # B. Colon-after-authors, comma-separated pagination (BMC/BioMed):
+    #    "Authors: Title. Journal. YEAR, VOL[(Issue)]: PAGES."
+    #
+    # Anchor on the pagination tail so prose-containing titles don't slip
+    # past. Run these before the book-chapter patterns because they're
+    # unambiguous.
+    for sep1, sep2, auth_delim in (
+        (";", ":", "."),      # Semicolon / Guterres / Oncogene
+        (",", ":", ":"),      # BMC / Wang / Waldner
+    ):
+        pat = (
+            r"^(?P<authors>.+?)" + re.escape(auth_delim)
+            + r"\s+(?P<title>.+?)[.?!]\s+"
+            + r"(?P<journal>[A-Z][^.]*?)\.\s+"
+            + r"(?P<year>\d{4})\s*" + re.escape(sep1) + r"\s*"
+            + r"(?P<vol>\d+)(?:\s*\((?P<issue>[^)]+)\))?\s*"
+            + re.escape(sep2) + r"\s*"
+            + r"(?P<pages>[\w.\-\u2013\u2014]+)\.?\s*$"
+        )
+        m = re.match(pat, text)
+        if m:
+            auth_str = m.group("authors")
+            if auth_delim == ".":
+                auth_str = auth_str.rstrip(",").strip()
+            authors = _parse_body_author_list(auth_str)
+            if not authors:
+                authors = [
+                    a.strip() for a in auth_str.split(",") if a.strip()
+                ]
+            return {
+                "title": m.group("title").strip().rstrip("."),
+                "journal": m.group("journal").strip().rstrip("."),
+                "year": m.group("year"),
+                "volume": m.group("vol"),
+                "issue": m.group("issue") or "",
+                "pages": re.sub(
+                    r"[\u2010-\u2014]", "-", m.group("pages")
+                ).rstrip("."),
+                "doi": doi,
+                "authors": authors,
+            }
+
+    # Nature body refs for book chapters in the Heim/Mitelman form:
+    # "Authors. in Book Title pages (Publisher, City, Year)."
+    # Anchor on "<authors ending in a period>. in <CapitalizedBookTitle>"
+    # so the "in" inside prose (e.g., "Python in Science Conference") does
+    # not hijack the match.
+    chap_m = re.match(
+        r"^(?P<authors>.+?\.)\s+in\s+(?P<book>[A-Z][^.]*?)\s+"
+        r"(?P<pages>\d+[\-\u2013\u2014]\d+|[A-Za-z]?\d+(?:[\-\u2013\u2014][A-Za-z]?\d+)?)?"
+        r"\s*\(([^)]*?)(?P<year>\d{4})\s*\)\.?\s*$",
+        text,
+    )
+    if not chap_m:
+        # Standalone book monograph:
+        # "Authors. Book Title (Publisher, City, Year)."
+        # Require the closing paren to carry a publisher-like token so
+        # regular journal refs don't get misread as books.
+        mono_m = re.match(
+            r"^(?P<authors>.+?\.)\s+(?P<book>[A-Z][^()]+?)\s+"
+            r"\((?P<paren>[^)]*?(?:Press|Publishers?|Publishing|Freeman|"
+            r"Wiley|Springer|Elsevier|Chapman\s*&\s*Hall|CRC|Academic|"
+            r"University|Laboratory|INSERM|Humana|Dekker|Garland|Saunders|"
+            r"Mosby|Kluwer|Blackwell|ASM)[^)]*?)"
+            r"(?P<year>\d{4})\s*\)\.?\s*$",
+            text,
+        )
+        if mono_m:
+            mono_authors = _parse_body_author_list(mono_m.group("authors").rstrip(","))
+            if not mono_authors:
+                mono_authors = [
+                    a.strip() for a in mono_m.group("authors").rstrip(",.").split(",") if a.strip()
+                ]
+            return {
+                "title": "",
+                "journal": mono_m.group("book").strip().rstrip(",.").strip(),
+                "year": mono_m.group("year"),
+                "volume": "",
+                "issue": "",
+                "pages": "",
+                "doi": doi,
+                "authors": mono_authors,
+            }
+    if chap_m:
+        chap_authors = _parse_body_author_list(chap_m.group("authors").rstrip(","))
+        if not chap_authors:
+            chap_authors = [
+                a.strip() for a in chap_m.group("authors").rstrip(",").split(",") if a.strip()
+            ]
+        return {
+            "title": "",
+            "journal": chap_m.group("book").strip().rstrip(",.").strip(),
+            "year": chap_m.group("year"),
+            "volume": "",
+            "issue": "",
+            "pages": re.sub(r"[\u2010-\u2014]", "-", chap_m.group("pages") or ""),
+            "doi": doi,
+            "authors": chap_authors,
+        }
 
     m = re.match(r"^(.+?)\s+\((\d{4})[a-z]?\)\.?\s+(.+)$", text)
     if not m:
@@ -385,7 +753,7 @@ def _body_fallback(item_html, doi):
     #   "Journal Vol[(Issue)][:Pages]"   (colon-separated, older style)
     #   "Journal, Vol[(Issue)], Pages"   (comma-separated, EMBO/Oxford style)
     tail = re.search(
-        r"\.\s+(.+?),\s*(\d+)(?:\((\d[\w\-]*)\))?,\s+([\w\-\u2013]+)\s*\.?\s*$",
+        r"[.?!]\s+(.+?),\s*(\d+)(?:\(([\d\w\-\u2013]+)\))?,\s+([\w\-\u2013]+)\s*\.?\s*$",
         rest,
     )
     if tail:
@@ -396,7 +764,7 @@ def _body_fallback(item_html, doi):
         pages = tail.group(4).replace("\u2013", "-").strip()
     else:
         tail = re.search(
-            r"\.\s+([^.]+?)\s+(\d+)(?:\((\d[\w\-]*)\))?(?::\s*(.+?))?$",
+            r"[.?!]\s+([^.?!]+?)\s+(\d+)(?:\(([\d\w\-\u2013]+)\))?(?::\s*(.+?))?$",
             rest,
         )
         if tail:
@@ -406,7 +774,22 @@ def _body_fallback(item_html, doi):
             issue = tail.group(3) or ""
             pages = (tail.group(4) or "").replace("\u2013", "-").strip()
         else:
-            title, journal, volume, issue, pages = rest.rstrip(".").strip(), "", "", "", ""
+            # Book-monograph fallback: "Book Title. City: Publisher" —
+            # the period before "City:" separates the book name (journal
+            # role) from the publisher metadata. Covers "ggplot2:
+            # elegant graphics for data analysis. Berlin: Springer".
+            book_m = re.match(
+                r"^(?P<book>.+?)\.\s+[^.]+?:\s+[A-Z].*$",
+                rest.rstrip("."),
+            )
+            if book_m:
+                title = ""
+                journal = book_m.group("book").strip().rstrip(".")
+                volume = issue = pages = ""
+            else:
+                title, journal, volume, issue, pages = (
+                    rest.rstrip(".").strip(), "", "", "", "",
+                )
 
     return {
         "title": title,
@@ -509,6 +892,11 @@ def _split_body_authors_title(head):
 
 def _parse_body_author_list(authors_str):
     """Extract "LastName IN" strings from the author section text."""
+    # Normalize " and " / ", and " / " & " separators into ", " so the
+    # greedy surname pattern below doesn't absorb the following author
+    # ("Prat S and Willmitzer L" → "Prat S, Willmitzer L"). Seen in old
+    # EMBO J reference lists.
+    authors_str = re.sub(r"\s*,?\s+(?:and|&)\s+", ", ", authors_str)
     authors = []
     for m in re.finditer(
         r"([A-Z][\w\-']+(?:\s[\w\-']+)*),\s+((?:[A-Z]\.\s*){1,5})",

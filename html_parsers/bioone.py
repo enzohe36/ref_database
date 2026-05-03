@@ -12,6 +12,8 @@ from ._helpers import (
     format_doi,
     get_meta,
     parse_meta_authors,
+    remove_elements_by_id,
+    remove_elements_by_selector,
     strip_common,
     strip_tags,
     tags_to_text,
@@ -37,40 +39,252 @@ _SUPP_RE = re.compile(
 # ---------------------------------------------------------------------------
 
 def remove_banners(html):
-    """Remove floating banners, cookie consent dialogs, and overlays.
+    """Normalize BioOne HTML to a single centered text column.
 
-    - <aside id=cookieConsentLandmark>: wraps the cookieconsent.js banner
-      ("This website uses cookies to provide you with a variety of
-      services..."), which the library builds inside at page load.
-    - <div id=accessByCopy>: "Access provided by <Institution>" panel
-      (populated by JS at runtime; stripped when captured).
-    - <div class="access hidden-print">: the black-bar wrapper that
-      holds the access-provided panel and its close button. The
-      institution text is injected by JS at page load and isn't
-      always captured by SingleFile, but the wrapper renders the
-      black bar regardless.
+    Chrome stripped (Step 3):
+      - Site `<header class=hidden-print role=banner>` and `<footer>`.
+      - "This website uses cookies to provide you with a variety of
+        services" CookieConsent banner (`.cc-window`).
+      - `#rightRail` sidebar with related articles and downloads.
 
-    Also rewrites every #e5e6e7 color to #fff. That hex is used
-    exclusively for background / background-color on `main` and on
-    every article panel (.SPIEPanel, .ArticleContentPanel,
-    .KeyWordsPanel, .RelatedContentPanel, .HelpTopicsPanel,
-    .SectionAnchorPanel, .TOCLineItemPanel, .ChorusArticlePanel,
-    ...) — verified via CDP — so a global swap flips the entire text
-    backdrop from gray to white without touching any unrelated color.
+    Visibility tweaks (Step 4):
+      - Force-expand the "Author Affiliations +" accordion
+        (`#affiliations` with inline `style=display:none`).
+
+    Reading column wrapper: `<main id=main-content>`. Cap at 752 px
+    with 56 px top/bottom + 16 px side padding.
     """
+    # -------------------------------------------------------------------
+    # Step 3 — strip chrome.
+    # -------------------------------------------------------------------
+    for _ in range(5):
+        before = html
+        html = _remove_nested_element(html, r'<header\b[^>]*>')
+        if html == before:
+            break
+    for _ in range(5):
+        before = html
+        html = _remove_nested_element(html, r'<footer\b[^>]*>')
+        if html == before:
+            break
+    html = remove_elements_by_id(html, "rightRail")
+    # Site top nav (`<nav id=top>` with logo + account) renders 36 px
+    # tall above #main-content; strip so the wrapper sits at body top.
+    html = remove_elements_by_id(html, "top")
+    # `#divNotSignedSection` wraps both the article-section tabs
+    # (`#navbar` → ARTICLE / FIGURES & TABLES / REFERENCES / CITED BY)
+    # AND the sign-in popup (`#divPopupDownloadOptions`). Keep the
+    # tabs; strip only the sign-in form.
+    html = remove_elements_by_id(html, "divPopupDownloadOptions")
+    # Floating "access" badge (e.g. Open Access label) pinned at the
+    # bottom of the viewport in narrow layouts.
     html = _remove_nested_element(
         html,
-        r'<aside[^>]*\bid=["\']?cookieConsentLandmark["\']?[^>]*>',
+        r'<div\b[^>]*class="access hidden-print"[^>]*>',
     )
+    # "How to translate text using browser tools" help link floats at the
+    # top of the article panel — remove it so the first rendered text is
+    # the publication-date anchor.
     html = _remove_nested_element(
         html,
-        r'<div[^>]*\bid=["\']?accessByCopy["\']?[^>]*>',
+        r'<a\b[^>]*href=[^>]*/help/tools-and-features[^>]*>',
     )
-    html = _remove_nested_element(
-        html,
-        r'<div class="access hidden-print"[^>]*>',
+    # CookieConsent banner (cc-window or cookie-consent variants).
+    for cls in ("cc-window", "cookie-consent", "cookieconsent"):
+        for _ in range(3):
+            before = html
+            html = _remove_nested_element(
+                html, rf'<div\b[^>]*class="[^"]*\b{cls}\b[^"]*"[^>]*>',
+            )
+            if html == before:
+                break
+
+    # -------------------------------------------------------------------
+    # Steps 2 + 4 — layout freeze and reading-column cap.
+    # -------------------------------------------------------------------
+    override = (
+        "<style>"
+        "html{width:100% !important;max-width:100% !important;"
+        "margin:0 !important;background:#fff !important}"
+        "body{width:100% !important;min-width:0 !important;"
+        "max-width:752px !important;margin:0 auto !important;"
+        "background:#fff !important;color:#000 !important}"
+        # The site wraps content in #page (hardcoded width:1200px) and
+        # Bootstrap .container + .row > .col-xs-8 (article) + .col-xs-4
+        # (#rightRail). Collapse outer width-constraining wrappers so the
+        # article column fills body width — but preserve the publisher's
+        # natural margins/padding on `.row` and inner `.col-*`, since
+        # the citation block (`#articleSubmission`, `#articleCitation`)
+        # uses `.row.ArticleContentRow{margin-top:15px;padding-top:5px}`
+        # plus the Bootstrap negative-gutter `ml:-15px` to space and
+        # align its sub-rows correctly.
+        "#page,.container,.container-fluid,.container.body-content,"
+        ".JAHProceedingsArticleCol{"
+        "display:block !important;width:100% !important;"
+        "max-width:100% !important;min-width:0 !important;"
+        "margin:0 !important;padding:0 !important;float:none !important;"
+        "border:none !important;flex:1 1 auto !important;"
+        "background:#fff !important}"
+        ".row,.row>[class*='col-']{"
+        "display:block !important;width:100% !important;"
+        "max-width:100% !important;min-width:0 !important;"
+        "float:none !important;flex:1 1 auto !important}"
+        # PAHArticleCol gets the same flatten (width, padding, float) but
+        # NOT margin-top — its natural 25 px top margin provides the
+        # breathing room between the article header and the Abstract
+        # heading on the live page.
+        ".PAHArticleCol{"
+        "display:block !important;width:100% !important;"
+        "max-width:100% !important;min-width:0 !important;"
+        "margin-left:0 !important;margin-right:0 !important;"
+        "margin-bottom:0 !important;"
+        "padding:0 !important;float:none !important;"
+        "border:none !important;flex:1 1 auto !important;"
+        "background:#fff !important}"
+        # Width/border-only flatten on visible panel wrappers inside
+        # main#main-content. Keep publisher-natural margin/padding so
+        # the citation block's `.panel-body.ArticleContent{padding-left:15px}`
+        # and similar internal gutters remain. Do NOT override `display`
+        # — `.panel.panel-default` / `.panel-body` are reused by hidden
+        # paywall popups (`#divPopupDownloadOptions` style=display:none)
+        # that would otherwise be exposed by a blanket display:block.
+        ":root main#main-content .ProceedingsArticlePanel,"
+        ":root main#main-content .panel.panel-default,"
+        ":root main#main-content .panel-body{"
+        "width:auto !important;max-width:100% !important;min-width:0 !important;"
+        "border:none !important;background:#fff !important}"
+        # `.SPIEPanel` is the outermost wrapper around the entire
+        # article column inside `main#main-content` — duplicating the
+        # role our cap (`main#main-content{padding:56px 16px}`) already
+        # serves. Its native rendering adds an outer 3-px top margin and
+        # 20-px bottom margin plus a 15-px-on-all-sides `.panel-body`
+        # padding, which:
+        #   - shrinks the usable column from 688 → 658 px (R fails),
+        #   - pushes the first text (`.DetailDate`) 18 px below the
+        #     wrapper's 56-px top padding (T fails),
+        #   - opens a 35-px gap between the last content row and the
+        #     wrapper's 56-px bottom padding (B fails).
+        # Collapse the outer SPIEPanel and its direct .panel-body so
+        # the inner `.ProceedingsArticleOpenAccessPanel` /
+        # `.ArticleContentPanel` subpanels become the visible chrome,
+        # at full 688-px width. Inner panels keep their own padding —
+        # that is the citation block layout we want to preserve.
+        ":root main#main-content .SPIEPanel{"
+        "margin:0 !important}"
+        # SPIEPanel's direct .panel-body is the outermost article shell —
+        # zero its vertical padding too (in addition to the horizontal
+        # zero below) so the inner header card sits flush at the
+        # wrapper's 56-px top padding. Inner ArticleContentPanel
+        # panel-bodies keep their pt=15/pb=15 for inter-section spacing.
+        ":root main#main-content .SPIEPanel > .panel-body{"
+        "padding-top:0 !important;padding-bottom:0 !important}"
+        # Zero ALL padding on every .panel-body inside main#main-content
+        # and zero every .row's Bootstrap negative gutters in tandem.
+        # The publisher nests `.panel.panel-default > .panel-body{padding:
+        # 15px} > .row{ml:-15px;mr:-15px}` repeatedly: SPIEPanel wraps
+        # the article, ArticleContentPanel wraps each content section
+        # (header, citation, footnotes, references). Each layer would
+        # otherwise shave 30 px off the column. Half-zero (only outer
+        # SPIEPanel) leaves the inner ArticleContentPanel still narrowing
+        # to 658. Vertical padding stays so inter-section gaps survive.
+        ":root main#main-content .panel-body{"
+        "padding-left:0 !important;padding-right:0 !important}"
+        ":root main#main-content .row{"
+        "margin-left:0 !important;margin-right:0 !important}"
+        # Last `.ArticleContentPanel` (the citation/footnotes block at
+        # the article tail) ships with `margin-bottom:25px`. With site
+        # chrome stripped, it's the last visible content — zero its
+        # trailing margin so the wrapper's 56-px bottom padding is the
+        # only B contribution.
+        ":root main#main-content "
+        ".ArticleContentPanel:last-of-type{margin-bottom:0 !important}"
+        # Reclaim ONLY the height of the stripped article-tabs row
+        # (`#divNotSignedSection`/`#navbar`, ~64 px). The publisher's
+        # natural section spacing (`.PAHArticleCol{margin-top:25px}`
+        # plus `.ArticleContentHeadRow{margin-top:30px;padding-top:10px}`)
+        # gives the Abstract heading the same breathing room above the
+        # citation as on the live page — keep it. Strip only the
+        # vertical right border that used to frame the column against
+        # the right rail (now gone).
+        ":root main#main-content .PAHArticleCol{"
+        "border-right:none !important}"
+        # Capped reading-column wrapper.
+        ":root main#main-content{"
+        "float:none !important;display:block !important;"
+        "width:auto !important;max-width:752px !important;"
+        "margin:0 auto !important;padding:56px 16px !important;"
+        "box-sizing:border-box !important;background:#fff !important}"
+        ":root main#main-content *{"
+        "max-width:100% !important;min-width:0 !important;"
+        "box-sizing:border-box !important}"
+        # Force-expand author-affiliations accordion (inline style=display:none).
+        "#affiliations{display:block !important;"
+        "visibility:visible !important;"
+        "max-height:none !important;height:auto !important;"
+        "overflow:visible !important}"
+        # Tables: force fixed layout + break-all so wide cells don't
+        # push past the wrapper.
+        ":root main#main-content table{"
+        "width:100% !important;max-width:100% !important;"
+        "table-layout:fixed !important}"
+        ":root main#main-content td,:root main#main-content th{"
+        "word-break:break-all !important;overflow-wrap:anywhere !important;"
+        "white-space:normal !important}"
+        # First-/last-child margin reset — scoped to direct children
+        # of the wrapper only (via `>`). Blanket `*:first-child` was
+        # zeroing the natural padding on every reference-list item.
+        ":root main#main-content>*:first-child{"
+        "margin-top:0 !important;padding-top:0 !important}"
+        ":root main#main-content>*:last-child{"
+        "margin-bottom:0 !important;padding-bottom:0 !important}"
+        # The spec start anchor "17 May 2013" is rendered inside
+        # `<text class=DetailDate>`, which ships with margin-top:32px.
+        # It lives 10 levels deep inside the wrapper so the direct-
+        # child first-child zero doesn't reach it. Target the class
+        # directly — only one `.DetailDate` in the article (the
+        # publication-date line), so no risk of collapsing other
+        # section headings.
+        ":root main#main-content .DetailDate{"
+        "margin-top:0 !important;padding-top:0 !important}"
+        # Title class ships `float:left; margin-top:2px; margin-
+        # bottom:0`, which makes the author byline sit flush with
+        # the last line of the title. Clear the float AND add a
+        # sensible margin-bottom so title and author list are
+        # visually separated.
+        ":root main#main-content .ProceedingsArticleOpenAccessHeaderText{"
+        "float:none !important;display:block !important;"
+        "margin-bottom:16px !important}"
+        # Figures: bioone wraps each figure in
+        #   <div class="fig panel" style="display:float;clear:both">
+        #     <a id=...></a>
+        #     <h2 class=label>FIG. N.</h2>
+        #     <div class=caption><p>...</p></div>
+        #     <a target=_blank href=<HIRES_JPG>>
+        #       <img src="data:image/jpeg;base64,..." (28-39 KB thumb)>
+        # Native order is label → caption → image. Per the figure layout
+        # contract, image must render above caption. Use flex column with
+        # `order` to put the image link first while keeping label/caption
+        # in source order. The high-res JPEG URL is on the inner <a href>
+        # — get_refs.py needs a browser-script swap to inline it; this
+        # CSS handles the visual order + full-width layout only.
+        ":root main#main-content .fig.panel{"
+        "display:flex !important;flex-direction:column !important;"
+        "width:100% !important;max-width:100% !important;"
+        "margin:1rem 0 !important;padding:0 !important;"
+        "float:none !important;clear:both !important}"
+        ":root main#main-content .fig.panel > a[href*='/graphic/']{"
+        "order:-1 !important;display:block !important;"
+        "width:100% !important;margin:0 0 5px 0 !important}"
+        ":root main#main-content .fig.panel > a[href*='/graphic/'] > img{"
+        "display:block !important;width:100% !important;"
+        "height:auto !important;max-width:100% !important;"
+        "margin:0 !important}"
+        "</style>"
     )
-    html = html.replace("#e5e6e7", "#fff")
+    if "</head>" in html:
+        html = html.replace("</head>", override + "</head>", 1)
+    else:
+        html = re.sub(r"(<body\b)", override + r"\1", html, count=1)
     return html
 
 
@@ -275,12 +489,16 @@ def _parse_references(html):
         else:
             remainder = ""
 
-        # Journal: text between the last full-stop before "Year;" and the
-        # matching " YYYY;" pattern. If Scholar URL gave us volume/year, we
-        # can pin the boundary precisely.
+        # Journal: text between the title-terminating punctuation and the
+        # " YYYY;" anchor. Titles may end with '.', '?', or '!' — the
+        # question/exclamation endings are common and must not prevent
+        # journal capture.
         journal = ""
         if remainder and year:
-            jm = re.search(rf'\.\s+([^.]+?)\s+{re.escape(year)}\s*;', remainder)
+            jm = re.search(
+                rf'[.?!]\s+([^.?!]+?)\s+{re.escape(year)}\s*;',
+                remainder,
+            )
             if jm:
                 journal = jm.group(1).strip().rstrip('.').strip()
 

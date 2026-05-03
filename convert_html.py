@@ -16,12 +16,10 @@ Two-phase processing:
            rounds are exhausted.
 """
 
-import atexit
 import json
 import os
 import re
 import sys
-import tempfile
 import time
 import urllib.request
 from concurrent.futures import ProcessPoolExecutor
@@ -37,6 +35,7 @@ from get_refs import (
     start_browser,
     stop_browser,
     _append_to_section,
+    apply_publisher_rule,
     REFS_NO_HTML_FILE,
     CDP_PORT,
 )
@@ -45,19 +44,10 @@ MIN_MAIN_TEXT_LEN = 5000
 MIN_REFERENCES = 5
 MAX_RETRIES = 3
 
-# URL transforms for retry: domain substring -> function to modify URL.
-# Publishers listed here always retry with the transformed URL before
-# PMC fallback, even when metadata is present.
-_RETRY_URL_TRANSFORMS = {
-    "cshlp": lambda url: url if url.endswith(".long") else url.rstrip("/") + ".long",
-}
-
-# Single-file wait strategy overrides per domain.
-# Default is "networkIdle"; some sites need "load" to avoid
-# execution context errors from late JS navigation.
-_WAIT_UNTIL_OVERRIDES = {
-    "cshlp": "load",
-}
+# Publisher-specific URL rewrites and wait strategies are centralized in
+# get_refs._PUBLISHER_RULES. convert_html.py uses apply_publisher_rule on
+# the resolved URL during retry to mirror what get_refs.py does on the
+# initial fetch.
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -175,12 +165,16 @@ def _fetch_pmc(pmcid, output_path, port):
 # _abbreviate_journals normalizes to the NLM MedAbbr so refs.json and
 # papers/<stem>.json agree on the canonical journal string.
 #
-# The NLM journal list is downloaded once per convert run to a temp file
-# (cleaned up at exit) and shared with parallel workers through the
-# ProcessPoolExecutor initializer so they don't each redownload.
+# The NLM journal list is cached at _JOURNALS_PATH in the project root.
+# Re-downloaded only when the cache is missing or older than 1 day; the
+# path is shared with parallel workers through the ProcessPoolExecutor
+# initializer so they don't each re-parse.
 
-_JOURNALS_URL = "https://ftp.ncbi.nih.gov/pubmed/J_Entrez.txt"
-_JOURNALS_FILE = None
+_JOURNALS_URL = "https://ftp.ncbi.nlm.nih.gov/pubmed/J_Entrez.txt"
+_JOURNALS_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "journals.json"
+)
+_JOURNALS_MAX_AGE_SECONDS = 24 * 60 * 60
 _JOURNAL_LOOKUP = None
 # Prefix index: tuple(normalized paren-stripped JournalTitle tokens[:n]) ->
 # abbr, populated only when exactly one NLM entry registers that prefix.
@@ -189,26 +183,19 @@ _JOURNAL_PREFIX_INDEX = None
 _PREFIX_MIN_TOKENS = 3
 
 
-def _cleanup_journals_file():
-    """atexit hook: remove the temp journals.json written by ensure_journals."""
-    global _JOURNALS_FILE
-    if _JOURNALS_FILE and os.path.exists(_JOURNALS_FILE):
-        os.remove(_JOURNALS_FILE)
-        _JOURNALS_FILE = None
-
-
-atexit.register(_cleanup_journals_file)
-
-
 def ensure_journals():
-    """Download the NLM J_Entrez.txt file, parse it, and write the
-    result to a temp JSON keyed by NlmId. Returns the file path.
-    Re-downloads each run; short-circuits if the path is already set
-    (via _worker_init in child processes).
+    """Return the path to journals.json.
+
+    Cached at _JOURNALS_PATH in the project root. If the cache exists and
+    is less than 1 day old, returns the path without network I/O.
+    Otherwise downloads _JOURNALS_URL, parses the J_Entrez flat text, and
+    writes a JSON keyed by NlmId.
     """
-    global _JOURNALS_FILE
-    if _JOURNALS_FILE and os.path.exists(_JOURNALS_FILE):
-        return _JOURNALS_FILE
+    if os.path.exists(_JOURNALS_PATH):
+        age = time.time() - os.path.getmtime(_JOURNALS_PATH)
+        if age < _JOURNALS_MAX_AGE_SECONDS:
+            return _JOURNALS_PATH
+
     print(f"Downloading {_JOURNALS_URL}...", flush=True)
     with urllib.request.urlopen(_JOURNALS_URL) as resp:
         data = resp.read().decode("utf-8")
@@ -235,13 +222,11 @@ def ensure_journals():
         if nlmid and abbr:
             journal_map[nlmid] = {"JournalTitle": title, "MedAbbr": abbr}
 
-    fd, path = tempfile.mkstemp(prefix="journals_", suffix=".json")
-    with os.fdopen(fd, "w", encoding="utf-8") as f:
+    with open(_JOURNALS_PATH, "w", encoding="utf-8") as f:
         json.dump(journal_map, f, indent=2, ensure_ascii=False)
         f.write("\n")
-    _JOURNALS_FILE = path
     print(f"Loaded {len(journal_map)} journals")
-    return path
+    return _JOURNALS_PATH
 
 
 def _norm_journal_key(s):
@@ -589,11 +574,14 @@ def process_html(html_path):
 
     # Determine if fetching is needed
     original_url = detect_url(html) or ""
-    _needs_transform = False
-    for k, transform in _RETRY_URL_TRANSFORMS.items():
-        if k in original_url and transform(original_url) != original_url:
-            _needs_transform = True
-            break
+    # A transform is "available" when the rule sheet would rewrite the
+    # saved URL to a different target — typically an abstract-to-fulltext
+    # upgrade (cshlp .long, biorxiv .full) or a publisher swap
+    # (ClinicalKey/linkinghub -> ScienceDirect). Forces a retry past the
+    # PMC fallback because the upgraded URL is likely to satisfy the
+    # quality gate where the abstract URL could not.
+    _transformed_url, _, _ = apply_publisher_rule(original_url)
+    _needs_transform = bool(original_url) and _transformed_url != original_url
     needs = None
     pmcid = None
     if not is_pmc and not _quality_ok(parsed) and doi:
@@ -688,6 +676,7 @@ def _fetch_round(fetch_items, port):
     from get_refs import (
         _cdp_open_tab,
         _cdp_close_tab,
+        apply_publisher_rule,
         PAGE_LOAD_WAIT,
     )
     import threading
@@ -730,6 +719,11 @@ def _fetch_round(fetch_items, port):
 
         for i, tid in preload_tabs.items():
             resolved = tab_info.get(tid, resolved_urls[i])
+            # Apply publisher rule sheet to rewrite the resolved URL before
+            # capture (e.g. cshlp .long, biorxiv .full,
+            # ClinicalKey/linkinghub -> ScienceDirect). Must come AFTER the
+            # redirect chain has settled, i.e. after PAGE_LOAD_WAIT.
+            resolved, _, _ = apply_publisher_rule(resolved)
             resolved_urls[i] = resolved
             try:
                 req = urllib.request.Request(
@@ -754,12 +748,10 @@ def _fetch_round(fetch_items, port):
             tmp_path = output_path + ".tmp"
             if os.path.exists(tmp_path):
                 os.remove(tmp_path)
-            # Determine wait strategy from URL
-            wait = "networkIdle"
-            for domain_key, w in _WAIT_UNTIL_OVERRIDES.items():
-                if domain_key in resolved_url:
-                    wait = w
-                    break
+            # Wait strategy + delay from publisher rule sheet.
+            _, wait, wait_delay = apply_publisher_rule(
+                resolved_url, default_wait="networkIdle",
+            )
             try:
                 subprocess.run(
                     [
@@ -767,7 +759,7 @@ def _fetch_round(fetch_items, port):
                         "--browser-server",
                         f"http://localhost:{port}",
                         f"--browser-wait-until={wait}",
-                        "--browser-wait-delay=5000",
+                        f"--browser-wait-delay={wait_delay}",
                         "--block-scripts=false",
                         resolved_url,
                         tmp_path,
@@ -891,12 +883,9 @@ def _fetch_round(fetch_items, port):
 def _worker_init(journals_path):
     """Initialize a ProcessPoolExecutor worker.
 
-    Seeds the worker's _JOURNALS_FILE with the parent-downloaded temp
-    path so ensure_journals() short-circuits (no redownload), and
-    builds the journal-abbreviation lookup.
+    Builds the journal-abbreviation lookup from the cached journals.json
+    the parent already resolved.
     """
-    global _JOURNALS_FILE
-    _JOURNALS_FILE = journals_path
     _load_journal_lookup(journals_path)
 
 
@@ -904,9 +893,9 @@ def main():
     args = sys.argv[1:] or ["papers/"]
     to_process = _collect_paths(args)
 
-    # Download the NLM journal list once before parsing and load the
-    # abbreviation lookup. Workers receive the temp file path via
-    # _worker_init so they don't each redownload or rebuild.
+    # Resolve the NLM journal list (cached at journals.json, refreshed
+    # daily) and load the abbreviation lookup. Workers receive the path
+    # via _worker_init so they don't each rebuild the lookup.
     journals_path = ensure_journals()
     _load_journal_lookup(journals_path)
 
@@ -948,12 +937,10 @@ def main():
             # challenges (e.g. academic.oup.com 429) don't block single-file.
             needs_preload = True
             url = doi if _aliased else (original_url or doi)
-            # Apply URL transforms (e.g. cshlp .long suffix)
+            # Publisher rule sheet (get_refs._PUBLISHER_RULES) is applied
+            # inside _fetch_round after preload resolves the redirect chain,
+            # so no transform is applied here.
             if url:
-                for domain_key, transform in _RETRY_URL_TRANSFORMS.items():
-                    if domain_key in (original_url or ""):
-                        url = transform(url)
-                        break
                 fetch_items.append((html_path, "retry", url, needs_preload))
         elif needs == "pmc" and result["pmcid"]:
             fetch_items.append((html_path, "pmc", result["pmcid"], False))

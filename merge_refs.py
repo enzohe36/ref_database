@@ -2,16 +2,17 @@
 """Merge papers/*.json metadata into refs.json.
 
 Usage:
-    python merge_refs.py
+    python merge_refs.py [<path> ...]
     python merge_refs.py --patch
-    python merge_refs.py --add-refs
+    python merge_refs.py --add-refs [<path> ...]
 
-Default: for every refs.json entry with a corresponding papers/<stem>.json,
-fill empty affiliations from the paper JSON, resolve any structured refs in
-the paper JSON to PMIDs via PubMed search, and union resolved PMIDs into
-refs.json's references list. Existing refs.json field values are never
-overwritten; the references list is the only field that is augmented (via
-union) rather than left alone.
+Default: for each paper JSON under the given paths (papers/ if no path
+is given), resolve any structured refs to PMIDs via PubMed search
+(phase 1), then match the paper's stem to a refs.json entry and fill
+empty affiliations + union resolved PMIDs into refs.json's references
+list (phase 2). Existing refs.json field values are never overwritten;
+the references list is the only field that is augmented. Unresolved
+references go to refs_no_pmid.json.
 
 --patch copies manually-resolved PMIDs from refs_no_pmid.json into
 papers/<stem>.json and refs.json (unioned), then removes them from
@@ -19,7 +20,12 @@ refs_no_pmid.json.
 
 --add-refs collects every PMID cited in refs.json's references lists,
 subtracts the PMIDs already present as refs.json keys, and invokes
-get_refs.py on the remainder to fetch metadata and HTML.
+get_refs.py on the remainder to fetch metadata and HTML. When paths are
+given, only PMIDs cited in the given papers' references are considered.
+
+Each path can be a <stem>.json file or a directory (all .json files in
+it are processed). Relative paths are resolved against the script's
+directory.
 """
 
 import json
@@ -507,28 +513,47 @@ def _apply_patch(refs, no_pmid, patch):
         del no_pmid[pmid]
 
 
-def _run_default_merge():
-    refs = load_references()
-    no_pmid = load_no_pmid()
+def _pmid_from_stem(paper_path):
+    """Extract the trailing PMID segment from a paper filename stem.
 
-    work = []
-    for pmid, entry in refs.items():
-        stem = entry.get("stem")
-        if not stem:
-            continue
-        paper_path = os.path.join(PAPERS_DIR, f"{stem}.json")
-        if not os.path.exists(paper_path):
-            continue
-        work.append((pmid, entry, paper_path))
+    Returns None if the trailing underscore-separated segment is not
+    all digits; callers use the PMID only for refs_no_pmid pruning,
+    which safely no-ops on None.
+    """
+    stem = os.path.splitext(os.path.basename(paper_path))[0]
+    last = stem.rsplit("_", 1)[-1]
+    return last if last.isdigit() else None
+
+
+def _run_default_merge(paper_paths):
+    no_pmid = load_no_pmid()
 
     # Phase 1: sequential PubMed PMID resolution, eager per-paper writes,
     # in-place pruning of refs_no_pmid for refs the paper has resolved.
-    print(f"Phase 1: resolving unresolved refs in {len(work)} papers (sequential).",
+    # Independent of refs.json — main_pmid is derived from the filename.
+    print(f"Phase 1: resolving unresolved refs in {len(paper_paths)} papers (sequential).",
           file=sys.stderr)
-    for main_pmid, _, paper_path in work:
+    for paper_path in paper_paths:
+        main_pmid = _pmid_from_stem(paper_path)
         _resolve_paper_refs(paper_path, main_pmid, no_pmid)
 
-    # Phase 2: parallel per-paper patch computation (local I/O + diff only)
+    # Phase 2: match each paper to refs.json by stem, then compute patches
+    # in parallel (local I/O + diff only; no network).
+    refs = load_references()
+    stem_to_pmid = {
+        entry["stem"]: pmid
+        for pmid, entry in refs.items()
+        if entry.get("stem")
+    }
+    work = []
+    for paper_path in paper_paths:
+        stem = os.path.splitext(os.path.basename(paper_path))[0]
+        pmid = stem_to_pmid.get(stem)
+        if not pmid:
+            print(f"No refs.json entry for {paper_path}", file=sys.stderr)
+            continue
+        work.append((pmid, refs[pmid], paper_path))
+
     n_workers = os.cpu_count() or 1
     print(
         f"Phase 2: computing refs.json patches (parallel, {n_workers} workers).",
@@ -627,13 +652,28 @@ def _run_patch():
 # --add-refs: citation-graph expansion
 # ---------------------------------------------------------------------------
 
-def _run_add_refs():
+def _run_add_refs(paths=None):
     refs = load_references()
     cited = set()
-    for entry in refs.values():
-        for p in entry.get("references") or []:
-            if isinstance(p, str) and p.isdigit():
-                cited.add(p)
+    if paths:
+        for paper_path in paths:
+            try:
+                with open(paper_path, encoding="utf-8") as f:
+                    paper_data = json.load(f)
+            except (OSError, json.JSONDecodeError) as e:
+                print(f"Skipping {paper_path}: {e}", file=sys.stderr)
+                continue
+            for ref_dict in paper_data.get("references") or []:
+                if not isinstance(ref_dict, dict):
+                    continue
+                key = next(iter(ref_dict))
+                if key and key.isdigit():
+                    cited.add(key)
+    else:
+        for entry in refs.values():
+            for p in entry.get("references") or []:
+                if isinstance(p, str) and p.isdigit():
+                    cited.add(p)
     existing = set(refs.keys())
     missing = sorted(cited - existing)
     print(
@@ -650,22 +690,42 @@ def _run_add_refs():
 # Main
 # ---------------------------------------------------------------------------
 
-def main():
-    if len(sys.argv) >= 2:
-        flag = sys.argv[1]
-        if flag == "--patch":
-            _run_patch()
-            return
-        if flag == "--add-refs":
-            _run_add_refs()
-            return
-        print(
-            "Usage: python merge_refs.py [--patch | --add-refs]",
-            file=sys.stderr,
-        )
-        sys.exit(1)
+def _collect_paper_paths(args):
+    """Collect papers/*.json paths from CLI arguments.
 
-    _run_default_merge()
+    Each arg can be a .json file or a directory (walked recursively
+    for .json files).
+    """
+    paths = []
+    for arg in args:
+        path = arg if os.path.isabs(arg) else os.path.join(BASE_DIR, arg)
+        if not os.path.exists(path):
+            print(f"Not found: {path}", file=sys.stderr)
+            continue
+        if os.path.isdir(path):
+            for root, _dirs, files in os.walk(path):
+                for f in files:
+                    if f.endswith(".json"):
+                        paths.append(os.path.join(root, f))
+        else:
+            paths.append(path)
+    return sorted(set(paths))
+
+
+def main():
+    args = sys.argv[1:]
+    if args and args[0] == "--patch":
+        if len(args) > 1:
+            print("--patch does not accept path arguments.", file=sys.stderr)
+            sys.exit(1)
+        _run_patch()
+        return
+    if args and args[0] == "--add-refs":
+        paths = _collect_paper_paths(args[1:]) if len(args) > 1 else None
+        _run_add_refs(paths)
+        return
+    paths = _collect_paper_paths(args) if args else _collect_paper_paths(["papers"])
+    _run_default_merge(paths)
 
 
 if __name__ == "__main__":
