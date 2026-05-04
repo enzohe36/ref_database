@@ -1,5 +1,5 @@
 """Compare a formatted HTML's element spacing against the raw HTML rendered at
-vw=720 (the format-html spec's reference). Flags elements whose top-of-element
+vw=720 (the develop-parser layout spec's reference). Flags elements whose top-of-element
 position relative to the article wrapper differs significantly between the
 raw and formatted renderings — meaning the formatter changed the publisher's
 native vertical rhythm at the reference viewport.
@@ -41,7 +41,7 @@ SETTLE = 4
 VW = 720
 
 # Threshold for flagging position / height differences. Sub-pixel rendering
-# and minor reflow typically stays under 4 px; format-html spec uses ±4 px
+# and minor reflow typically stays under 4 px; develop-parser layout spec uses ±4 px
 # tolerance so the same threshold here.
 TOP_DELTA_PX = 4
 HEIGHT_DELTA_PX = 4

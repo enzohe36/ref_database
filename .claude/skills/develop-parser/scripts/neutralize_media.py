@@ -22,13 +22,13 @@ keep multiplying as you discover more elements that change between viewports.
 The neutralizer collapses all the @media-driven layout differences into a
 single transform, so there's nothing left to override per-element.
 
-Don't use when: a parser already passes the format-html target spec across
+Don't use when: a parser already passes the develop-parser layout target spec across
 all viewports without it. Adding a wholesale CSS rewrite for a parser that
 was working is unnecessary risk.
 """
 import re
 
-# Threshold reasoning relative to the vw=720 reference (per format-html spec).
+# Threshold reasoning relative to the vw=720 reference (per develop-parser layout spec).
 # `@media (min-width: N)` only fires when vw >= N — MIN_DESKTOP=721 catches
 # every rule that does NOT fire at the reference (covers 768 / 992 / 1024 and
 # 1025+ desktop breakpoints publishers use). `@media (max-width: N)` fires

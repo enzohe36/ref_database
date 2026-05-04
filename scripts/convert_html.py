@@ -1,19 +1,20 @@
 #!/usr/bin/env python3
-"""Convert article HTML pages to structured JSON.
+"""Convert article HTML to papers/raw/<stem>_converted.json.
 
 Usage:
-    python convert_html.py [<path> ...]
+    python convert_html.py [<pmid|html|list> ...]
 
-Each path can be an HTML file or a directory (all .html files in the
-directory will be processed). Defaults to papers/ when no path is given.
-Skips files whose JSON already has non-empty main_text.
+No args: convert every papers/raw/<stem>.html that lacks a corresponding
+papers/raw/<stem>_converted.json.
 
-Two-phase processing:
-  Phase 1: Parse all HTMLs in parallel via ProcessPoolExecutor (no browser).
-  Phase 2: Fetch failed HTMLs in rounds. Each round opens one browser,
-           preloads all URLs with 1s delay, captures in parallel, then
-           re-parses. Rounds repeat until no requests remain or MAX_RETRIES
-           rounds are exhausted.
+PMID arg: locate papers/raw/<stem>.html (stem looked up via parsed/<stem>.json),
+write papers/raw/<stem>_converted.json.
+
+HTML file arg: parse that file, write _converted.json next to it (so files
+in papers/test/ produce output in papers/test/).
+
+List arg: file containing PMIDs and/or HTML paths separated by spaces or
+newlines.
 """
 
 import json
@@ -31,14 +32,14 @@ from html_parsers import (
     get_parser,
     _DOMAIN_ALIASES,
 )
-from get_refs import (
+from get_html import (
     start_browser,
     stop_browser,
-    _append_to_section,
     apply_publisher_rule,
-    REFS_NO_HTML_FILE,
     CDP_PORT,
 )
+from _cli import parse_argv
+from _project import parsed_path, pmid_to_stem, raw_dir, raw_html_path
 
 MIN_MAIN_TEXT_LEN = 5000
 MIN_REFERENCES = 5
@@ -162,19 +163,14 @@ def _fetch_pmc(pmcid, output_path, port):
 #
 # Applied as a post-processing step on parser output. Parsers emit whatever
 # form the publisher supplies (full title, ISO abbrev, sub-journal variant);
-# _abbreviate_journals normalizes to the NLM MedAbbr so refs.json and
-# papers/<stem>.json agree on the canonical journal string.
+# _abbreviate_journals normalizes to the NLM MedAbbr so the canonical journal
+# string is consistent across papers/parsed/<stem>.json.
 #
-# The NLM journal list is cached at _JOURNALS_PATH in the project root.
-# Re-downloaded only when the cache is missing or older than 1 day; the
-# path is shared with parallel workers through the ProcessPoolExecutor
-# initializer so they don't each re-parse.
+# The NLM journal list is downloaded fresh each invocation and held in
+# memory (no on-disk cache). The parsed dict is shared with parallel workers
+# through the ProcessPoolExecutor initializer so they don't each re-parse.
 
 _JOURNALS_URL = "https://ftp.ncbi.nlm.nih.gov/pubmed/J_Entrez.txt"
-_JOURNALS_PATH = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)), "journals.json"
-)
-_JOURNALS_MAX_AGE_SECONDS = 24 * 60 * 60
 _JOURNAL_LOOKUP = None
 # Prefix index: tuple(normalized paren-stripped JournalTitle tokens[:n]) ->
 # abbr, populated only when exactly one NLM entry registers that prefix.
@@ -184,18 +180,11 @@ _PREFIX_MIN_TOKENS = 3
 
 
 def ensure_journals():
-    """Return the path to journals.json.
+    """Download the NLM journal list and return {NlmId: {JournalTitle, MedAbbr}}.
 
-    Cached at _JOURNALS_PATH in the project root. If the cache exists and
-    is less than 1 day old, returns the path without network I/O.
-    Otherwise downloads _JOURNALS_URL, parses the J_Entrez flat text, and
-    writes a JSON keyed by NlmId.
+    No on-disk cache: every invocation re-downloads _JOURNALS_URL and parses
+    the J_Entrez flat text in memory.
     """
-    if os.path.exists(_JOURNALS_PATH):
-        age = time.time() - os.path.getmtime(_JOURNALS_PATH)
-        if age < _JOURNALS_MAX_AGE_SECONDS:
-            return _JOURNALS_PATH
-
     print(f"Downloading {_JOURNALS_URL}...", flush=True)
     with urllib.request.urlopen(_JOURNALS_URL) as resp:
         data = resp.read().decode("utf-8")
@@ -222,11 +211,8 @@ def ensure_journals():
         if nlmid and abbr:
             journal_map[nlmid] = {"JournalTitle": title, "MedAbbr": abbr}
 
-    with open(_JOURNALS_PATH, "w", encoding="utf-8") as f:
-        json.dump(journal_map, f, indent=2, ensure_ascii=False)
-        f.write("\n")
     print(f"Loaded {len(journal_map)} journals")
-    return _JOURNALS_PATH
+    return journal_map
 
 
 def _norm_journal_key(s):
@@ -247,9 +233,9 @@ def _norm_journal_key(s):
     return s
 
 
-def _load_journal_lookup(journals_path):
-    """Populate the module-level lookup and prefix index from the
-    journals.json temp file.
+def _load_journal_lookup(jdata):
+    """Populate the module-level lookup and prefix index from an in-memory
+    {NlmId: {JournalTitle, MedAbbr}} dict (as returned by ensure_journals()).
 
     Verbatim lookup: publisher -> MedAbbr with tiered priority per key.
     Each candidate is registered with a priority tier:
@@ -277,8 +263,6 @@ def _load_journal_lookup(journals_path):
     entry are discarded.
     """
     global _JOURNAL_LOOKUP, _JOURNAL_PREFIX_INDEX
-    with open(journals_path, encoding="utf-8") as f:
-        jdata = json.load(f)
 
     # key -> list of (tier, abbr)
     candidates = {}
@@ -479,14 +463,7 @@ def _mark_success(stem):
 
 
 def _log_parse_failure(stem, doi, reason=""):
-    """Append terminal failure to refs_no_html.md and emit per-stem log."""
-    _append_to_section(
-        REFS_NO_HTML_FILE,
-        "## HTML Parsing Failures",
-        stem,
-        doi,
-        reason,
-    )
+    """Emit per-stem log of terminal failure (no sidecar log file in new design)."""
     _emit_stem_log(stem, reason)
 
 
@@ -495,14 +472,87 @@ def _log_parse_failure(stem, doi, reason=""):
 # ---------------------------------------------------------------------------
 
 def _resolve_doi(stem):
-    """Look up DOI from refs.json by PMID in stem."""
-    parts = stem.rsplit("_", 1)
-    if parts and parts[-1].isdigit():
-        from get_refs import load_references
-        refs = load_references()
-        entry = refs.get(parts[-1], {})
-        return entry.get("doi", "")
-    return ""
+    """Look up DOI from papers/parsed/<stem>.json by stem."""
+    pjson = parsed_path(stem)
+    if not pjson.exists():
+        return ""
+    try:
+        with open(pjson, encoding="utf-8") as f:
+            data = json.load(f)
+        return data.get("doi", "")
+    except (json.JSONDecodeError, OSError):
+        return ""
+
+
+# ---------------------------------------------------------------------------
+# Schema transformation: parser output -> _converted.json
+# ---------------------------------------------------------------------------
+
+CONVERTED_TOP_KEYS = [
+    "stem", "pmid", "doi", "title", "journal", "year", "volume", "issue",
+    "pages", "authors", "publication_types", "main_text", "references",
+]
+
+CONVERTED_REF_KEYS = [
+    "pmid", "doi", "title", "journal", "year", "volume", "issue", "pages",
+    "authors",
+]
+
+
+def _converted_ref_from(item):
+    """Transform one entry of parser-output references into the locked _converted ref schema.
+
+    Parser emits each ref as `{"<pmid_or_empty>": {bib fields}}`. The single
+    key is "" for unresolved refs or a PMID string when already resolved.
+    Output: flat object with explicit pmid field plus the bib fields.
+    """
+    out = {k: ("" if k != "authors" else []) for k in CONVERTED_REF_KEYS}
+    if not isinstance(item, dict):
+        return out
+    if len(item) == 1:
+        key = next(iter(item))
+        inner = item[key] if isinstance(item[key], dict) else {}
+        out["pmid"] = key if key else ""
+    else:
+        # Already in flat form — read keys directly.
+        inner = item
+        out["pmid"] = item.get("pmid", "") or ""
+    for k in CONVERTED_REF_KEYS:
+        if k == "pmid":
+            continue
+        v = inner.get(k)
+        if k == "authors":
+            out[k] = v if isinstance(v, list) else []
+        else:
+            out[k] = v if v else ""
+    return out
+
+
+def _build_converted(parsed):
+    """Wrap parser output (papers/*.json shape) into the _converted.json schema."""
+    refs_in = parsed.get("references") or []
+    refs_out = [_converted_ref_from(r) for r in refs_in]
+    return {
+        "stem": "",
+        "pmid": "",
+        "doi": parsed.get("doi", "") or "",
+        "title": parsed.get("title", "") or "",
+        "journal": parsed.get("journal", "") or "",
+        "year": parsed.get("year", "") or "",
+        "volume": parsed.get("volume", "") or "",
+        "issue": parsed.get("issue", "") or "",
+        "pages": parsed.get("pages", "") or "",
+        "authors": parsed.get("authors") or [],
+        "publication_types": [],
+        "main_text": parsed.get("main_text", "") or "",
+        "references": refs_out,
+    }
+
+
+def _converted_path(html_path):
+    """Map an html_path to its _converted.json sidecar (same directory)."""
+    stem = os.path.splitext(os.path.basename(html_path))[0]
+    return os.path.join(os.path.dirname(html_path), f"{stem}_converted.json")
 
 
 def process_html(html_path):
@@ -570,7 +620,7 @@ def process_html(html_path):
         doi = _resolve_doi(stem)
 
     is_pmc = publisher == "nih"
-    json_path = os.path.join(os.path.dirname(html_path), f"{stem}.json")
+    json_path = _converted_path(html_path)
 
     # Determine if fetching is needed
     original_url = detect_url(html) or ""
@@ -592,10 +642,10 @@ def process_html(html_path):
             if pmcid:
                 needs = "pmc"
 
-    # Write whatever we have
+    # Write whatever we have (transformed to _converted.json schema)
     if parsed:
         with open(json_path, "w", encoding="utf-8") as f:
-            json.dump(parsed, f, indent=2, ensure_ascii=False)
+            json.dump(_build_converted(parsed), f, indent=2, ensure_ascii=False)
             f.write("\n")
 
     terminal = None
@@ -628,40 +678,64 @@ def process_html(html_path):
 # ---------------------------------------------------------------------------
 
 def _should_skip(html_path):
-    """Check if the corresponding JSON already passes the quality check."""
-    stem = os.path.splitext(os.path.basename(html_path))[0]
-    json_path = os.path.join(os.path.dirname(html_path), f"{stem}.json")
-    if os.path.exists(json_path):
+    """Skip if _converted.json already exists and is high quality."""
+    json_path = _converted_path(html_path)
+    if not os.path.exists(json_path):
+        return False
+    try:
         with open(json_path, encoding="utf-8") as f:
             data = json.load(f)
-        if _quality_ok(data):
-            return True
-    return False
+    except (json.JSONDecodeError, OSError):
+        return False
+    return _quality_ok(data)
 
 
-def _collect_paths(args):
-    """Collect HTML paths from CLI arguments.
-
-    Directory args are walked recursively so that papers/ (which now
-    contains per-publisher subdirectories) can be passed as a single
-    argument.
+def _collect_html_paths(pmids, html_paths):
+    """Resolve PMID inputs to papers/raw/<stem>.html paths and merge with explicit
+    HTML inputs. Filters out paths whose _converted.json already passes quality.
     """
     paths = []
-    for arg in args:
-        path = os.path.join(os.getcwd(), arg) if not os.path.isabs(arg) else arg
-        if not os.path.exists(path):
-            print(f"Not found: {path}", file=sys.stderr)
+    seen = set()
+
+    for pmid in pmids:
+        stem = pmid_to_stem(pmid)
+        if not stem:
+            print(f"PMID {pmid}: no papers/parsed/<stem>.json (run get_refs.py first)",
+                  file=sys.stderr)
             continue
-        if os.path.isdir(path):
-            htmls = []
-            for root, _dirs, files in os.walk(path):
-                for f in files:
-                    if f.endswith(".html"):
-                        htmls.append(os.path.join(root, f))
-            paths.extend(sorted(htmls))
-        else:
-            paths.append(path)
+        hp = str(raw_html_path(stem))
+        if not os.path.exists(hp):
+            print(f"{stem}: no papers/raw/<stem>.html (run get_html.py first)",
+                  file=sys.stderr)
+            continue
+        if hp in seen:
+            continue
+        seen.add(hp)
+        paths.append(hp)
+
+    for hp in html_paths:
+        if not os.path.exists(hp):
+            print(f"Not found: {hp}", file=sys.stderr)
+            continue
+        if hp in seen:
+            continue
+        seen.add(hp)
+        paths.append(hp)
+
     return [p for p in paths if not _should_skip(p)]
+
+
+def _default_scan():
+    """No-arg default: papers/raw/*.html lacking a corresponding _converted.json."""
+    rd = raw_dir()
+    if not rd.exists():
+        return []
+    out = []
+    for p in sorted(rd.glob("*.html")):
+        if _should_skip(str(p)):
+            continue
+        out.append(str(p))
+    return out
 
 
 def _fetch_round(fetch_items, port):
@@ -673,7 +747,7 @@ def _fetch_round(fetch_items, port):
     All captures run in parallel.
     Returns list of items that still need fetching.
     """
-    from get_refs import (
+    from get_html import (
         _cdp_open_tab,
         _cdp_close_tab,
         apply_publisher_rule,
@@ -836,40 +910,26 @@ def _fetch_round(fetch_items, port):
         is_pmc = publisher == "nih"
 
         if _quality_ok(parsed):
-            # Success — write JSON
             _mark_success(stem)
-            json_path = os.path.join(
-                os.path.dirname(html_path), f"{stem}.json"
-            )
-            with open(json_path, "w", encoding="utf-8") as f:
-                json.dump(parsed, f, indent=2, ensure_ascii=False)
+            with open(_converted_path(html_path), "w", encoding="utf-8") as f:
+                json.dump(_build_converted(parsed), f, indent=2, ensure_ascii=False)
                 f.write("\n")
         elif fetch_type == "retry" and _has_metadata(parsed):
-            # Retry got metadata but no main_text — try PMC next
             if not is_pmc:
                 pmcid = _pmcid_for_doi(doi)
                 if pmcid:
                     _record_attempt(stem, "retry: abstract only; pmc scheduled")
                     still_needed.append((html_path, "pmc", pmcid, False))
                     continue
-            # Write whatever we have
-            json_path = os.path.join(
-                os.path.dirname(html_path), f"{stem}.json"
-            )
-            with open(json_path, "w", encoding="utf-8") as f:
-                json.dump(parsed, f, indent=2, ensure_ascii=False)
+            with open(_converted_path(html_path), "w", encoding="utf-8") as f:
+                json.dump(_build_converted(parsed), f, indent=2, ensure_ascii=False)
                 f.write("\n")
             _record_attempt(stem, "retry: abstract only; no pmc available")
             _log_parse_failure(stem, doi, "retry: abstract only; no pmc available")
         elif fetch_type == "pmc":
-            # PMC fetch succeeded but quality failed — retrying same URL
-            # won't help. Persist whatever parsed and log.
             if parsed:
-                json_path = os.path.join(
-                    os.path.dirname(html_path), f"{stem}.json"
-                )
-                with open(json_path, "w", encoding="utf-8") as f:
-                    json.dump(parsed, f, indent=2, ensure_ascii=False)
+                with open(_converted_path(html_path), "w", encoding="utf-8") as f:
+                    json.dump(_build_converted(parsed), f, indent=2, ensure_ascii=False)
                     f.write("\n")
             _record_attempt(stem, "pmc: fallback insufficient")
             _log_parse_failure(stem, doi, "pmc: fallback insufficient")
@@ -880,24 +940,27 @@ def _fetch_round(fetch_items, port):
     return still_needed
 
 
-def _worker_init(journals_path):
-    """Initialize a ProcessPoolExecutor worker.
-
-    Builds the journal-abbreviation lookup from the cached journals.json
-    the parent already resolved.
-    """
-    _load_journal_lookup(journals_path)
+def _worker_init(jdata):
+    """Initialize a ProcessPoolExecutor worker by loading the journal lookup
+    from the in-memory dict pickled by the parent."""
+    _load_journal_lookup(jdata)
 
 
 def main():
-    args = sys.argv[1:] or ["papers/"]
-    to_process = _collect_paths(args)
+    if not sys.argv[1:]:
+        to_process = _default_scan()
+    else:
+        parsed = parse_argv(accept={"pmids", "htmls"})
+        to_process = _collect_html_paths(parsed["pmids"], parsed["htmls"])
 
-    # Resolve the NLM journal list (cached at journals.json, refreshed
-    # daily) and load the abbreviation lookup. Workers receive the path
-    # via _worker_init so they don't each rebuild the lookup.
-    journals_path = ensure_journals()
-    _load_journal_lookup(journals_path)
+    if not to_process:
+        return
+
+    # Download the NLM journal list (in-memory only) and load the lookup.
+    # Workers receive the parsed dict via _worker_init so they don't each
+    # re-download.
+    jdata = ensure_journals()
+    _load_journal_lookup(jdata)
 
     # Phase 1: parse all in parallel (no fetching). Parsers are pure-Python
     # regex work, so use processes to get real concurrency past the GIL.
@@ -909,7 +972,7 @@ def main():
         with ProcessPoolExecutor(
             max_workers=n_workers,
             initializer=_worker_init,
-            initargs=(journals_path,),
+            initargs=(jdata,),
         ) as pool:
             results = list(pool.map(process_html, to_process))
 

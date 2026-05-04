@@ -19,46 +19,32 @@
 
 ## File Structure
 
-- `<stem>`: `<first_author_last_name>_<year>_<journal>_<pmid>` with Latin diacritics converted to ASCII, punctuation and spaces to `_`, collapsed. Stored as "stem" (first field) in refs.json. Used as file name for papers/ files.
+- `<stem>`: `<first_author_last_name>_<year>_<journal>_<pmid>` with Latin diacritics converted to ASCII, punctuation and spaces to `_`, collapsed.
 - `<citation_in_text>`: derived from stem at conversion time. "LastName YYYY" (1 author) / "LastName & LastName YYYY" (2) / "LastName et al. YYYY" (3+).
-- `<citation>`: `<authors>. <title>. <journal>. <year>;<volume>(<issue>):<pages>. PMID: <pmid>.` Used in the references section when drafting documents. `<authors>` is comma-separated "author" values from the "authors" array.
-- chroma_db/: semantic search index (ChromaDB + sentence-transformers). Built from papers/*.json and refs.json.
-- html_parsers/: Python package with per-publisher HTML parsing modules (nih.py, nature.py). Module names are second-level domains.
-- papers/: article files.
-  - `papers/<stem>.html`: full article HTML downloaded by get_refs.py via single-file.
-  - `papers/<stem>.json`: structured article data (affiliations, references, main_text) created by convert_html.py, updated by merge_refs.py.
-  - `papers/<stem>.pdf`: original PDF (fallback when HTML unavailable).
-- papers_test/<second_level_domain>/: working copies of HTMLs used during parser development. Modified in place by convert_html.py (banner removal, JSON output). Re-create from papers_test_ref/ when a parser change makes existing test output stale.
-- papers_test_ref/<second_level_domain>.zip: pristine reference copies of the HTMLs in papers_test/ at bootstrap time. Used to reset papers_test/ subfolders.
-- journals.json: cached NLM journal list (NlmId -> {JournalTitle, MedAbbr}). Written by convert_html.py's ensure_journals(); re-downloaded from ftp.ncbi.nlm.nih.gov when missing or older than 1 day.
-- refs.json: citation database. JSON dict keyed by PMID. Each entry has fields (in order):
-  - "stem": filesystem-safe name for papers/ files. Use as in-text citation when drafting; convert_citation.py converts to readable format.
-  - "pub_type": array of publication types (e.g., ["Journal Article", "Review"]).
-  - "title": paper title.
-  - "journal": journal abbreviation (ISO format).
-  - "year": publication year.
-  - "volume", "issue": journal location.
-  - "pages": page range.
-  - "doi": DOI as URL (https://doi.org/...).
-  - "authors": array of objects, each with "author" (string, "LastName Initials") and "affiliation" (array of strings).
-  - "references": array of PMIDs (strings) cited by this paper.
-- refs_no_html.md: papers where HTML retrieval failed. Written by get_refs.py.
-- refs_no_pmid.json: unresolved references from merge_refs.py. Keyed by main paper PMID; each entry has "stem" (copied from refs.json for readability) and "references" (array of single-key dicts with empty key for manual PMID entry).
+- `<citation>`: `<authors>. <title>. <journal>. <year>;<volume>(<issue>):<pages>. PMID: <pmid>.` Used in the references section when drafting documents.
+- chroma_db/: semantic search index (single directory, multiple named collections). One collection per project plus `_global`. Built by build_model.py from papers/parsed/*.json.
+- scripts/html_parsers/: Python package with per-publisher HTML parsing modules. Module names are second-level domains.
+- NLM journal list (NlmId -> {JournalTitle, MedAbbr}) is downloaded fresh in memory each time convert_html.py runs. No on-disk cache.
+- papers/: split into three subdirectories.
+  - papers/parsed/<stem>.json: source of truth per paper. Schema (locked key order): stem, pmid, doi, title, journal, year, volume, issue, pages, authors (array of {author, affiliation[]}), publication_types, main_text, references (flat PMID list).
+  - papers/raw/<stem>.html: raw or banner-cleaned HTML downloaded by get_html.py.
+  - papers/raw/<stem>.pdf: original PDF (manually retrieved fallback when HTML is insufficient).
+  - papers/raw/<stem>_converted.json: structured output of HTML/PDF conversion. Same top-level keys as papers/parsed/<stem>.json (stem, pmid, publication_types are always empty placeholders), but references is an array of structured reference objects: {pmid, doi, title, journal, year, volume, issue, pages, authors[]} where authors is a flat list of "LastName IN" strings.
+  - papers/test/<stem>.{html,pdf,_converted.json}: working copies for parser/agent prompt development. Modified in place by convert_html.py when invoked on a specific test HTML file.
+- projects/<name>/: per-project workspace.
+  - projects/<name>/pmids.txt: space- or newline-separated PMIDs that belong to this project.
+  - projects/<name>/drafts/, factcheck/, etc.: existing per-project document files.
 
 ## Scripts
 
-- `python get_refs.py <pmid> [<pmid> ...]`: retrieves citation metadata from PubMed, writes to refs.json, fetches full paper HTML to papers/<stem>.html via single-file. Records HTML fetch failures in refs_no_html.md. Skips non-Journal Articles, Retracted Publications, and duplicates.
-- `python get_refs.py --path <file>`: reads PMIDs from a file (delimited by punctuation, spaces, or newlines).
-- `python get_refs.py --delete <pmid> [<pmid> ...]`: removes the specified PMIDs from refs.json.
-- `python get_refs.py --validate`: checks for Retracted Publications and published versions of preprints.
-- `python convert_html.py [<path> ...]`: parses HTML using publisher-specific logic (html_parsers/ package), fills author affiliations, structured references, and main_text into papers/<stem>.json. Each path can be an HTML file or a directory (all .html files in it are processed). Defaults to papers/ when no path is given. Skips files whose JSON already has non-empty main_text.
-- `python convert_pdf.py <path> [<path> ...]`: converts PDF to md (fallback when HTML unavailable).
-- `python merge_refs.py [<path> ...]`: for each paper JSON under the given paths (papers/ if no path is given), resolves unresolved structured references via PubMed (DOI shortcut, then author surnames + title chunks + journal + year with iterative relaxation) in phase 1, then matches the paper's stem to a refs.json entry and fills empty affiliations by matching author names + unions resolved PMIDs into refs.json's references list in phase 2. Existing refs.json field values are never overwritten; references is the only field augmented. Unresolved references go to refs_no_pmid.json. Each path can be a <stem>.json file or a directory; relative paths are resolved against the script's directory. Papers without a matching refs.json entry still get phase 1 (paper JSON updated) and a warning for phase 2.
-- `python merge_refs.py --patch`: copies manually resolved PMIDs from refs_no_pmid.json into papers/<stem>.json and refs.json (unioned), then removes them from refs_no_pmid.json.
-- `python merge_refs.py --add-refs [<path> ...]`: citation-graph expansion. Collects every PMID cited in refs.json's references lists, subtracts PMIDs already keyed in refs.json, and invokes get_refs.py on the remainder to fetch metadata and HTML. When paths are given, only PMIDs cited in those papers' references are considered.
-- `python convert_citation.py <file>`: converts stem citations in a document to in-text citation format and adds a References section. Modifies the file in place.
-- `python search_refs.py <query>`: searches papers by semantic similarity.
-- `python search_refs.py --build`: rebuilds chroma_db/. Iterates refs.json, chunks and embeds papers/*.json main_text where available.
+- `python scripts/get_refs.py <pmid|list> ...`: fetches PubMed metadata for each PMID and writes papers/parsed/<stem>.json. Skips PMIDs whose parsed JSON already exists. A list arg is a file containing PMIDs separated by spaces or newlines.
+- `python scripts/get_html.py <pmid|url|list> ...`: fetches full-text HTML via Edge + single-file. For PMID args: read DOI from papers/parsed/<stem>.json, save to papers/raw/<stem>.html. For URL args: fetch directly, save to papers/raw/<url_name>.html.
+- `python scripts/convert_html.py [<pmid|html|list> ...]`: parses HTML using scripts/html_parsers/ and writes papers/raw/<stem>_converted.json. No args: scans papers/raw/ for *.html files lacking a corresponding _converted.json. PMID args locate papers/raw/<stem>.html via parsed/<stem>.json. HTML file args produce _converted.json next to the input HTML (so files in papers/test/ produce output in papers/test/).
+- `python scripts/get_pmids.py [<pmid|json|list> ...]`: walks JSON files recursively and resolves every empty `pmid` field via PubMed, using the sibling bibliographic fields in the same dict (DOI shortcut + iterative relaxation, with PublicationType disambiguation when multiple matches return). On a `_converted.json` this resolves both the main-paper top-level `pmid` and each `references[i].pmid`. Sequential, PubMed rate-limited; writes back incrementally. No args: every papers/raw/<stem>_converted.json on disk. PMID args resolve to papers/raw/<stem>_converted.json. JSON args are processed directly and need not live under papers/raw/. A list arg is a file containing PMIDs and/or JSON paths separated by spaces or newlines.
+- `python scripts/merge_refs.py [<pmid|list> ...]`: merges papers/raw/<stem>_converted.json into papers/parsed/<stem>.json (parallel). Fills empty author affiliations, replaces main_text when it qualifies, unions references PMIDs. No args: every parsed/<stem>.json with a corresponding _converted.json. A list arg is a file containing PMIDs. Run get_pmids.py first if reference PMIDs need resolving (optional; see workflow note).
+- `python scripts/build_model.py [<project_name> ...]`: builds the embedding model. No args: rebuild the `_global` chroma collection over every papers/parsed/<stem>.json with non-empty main_text. With project args: rebuild each named project's collection from PMIDs in projects/<name>/pmids.txt.
+- `python scripts/search_refs.py "<query>"`: searches the embedding model. Project resolution is cwd-based: cwd inside projects/<name>/ queries that project's collection; cwd elsewhere queries the `_global` collection.
+- `python scripts/cite_refs.py <document>`: converts in-text stems in a document to "Author YYYY" form, detects/creates a "References" section, adds full citations, sorts all entries alphabetically, and auto-appends every cited PMID to the current project's pmids.txt. Project is resolved from cwd; errors out if not run from inside a projects/<name>/ subtree.
 
 ## Literature Search
 
@@ -66,12 +52,23 @@
 
 ## Skills
 
-- `/develop-parser`: parser contract, file layout, verification criteria, and bootstrap process for html_parsers/ modules. Auto-activates when editing files under html_parsers/, papers_test/, or papers_test_ref/.
+- `/develop-parser`: parser contract, file layout, verification criteria, and bootstrap process for scripts/html_parsers/ modules. Auto-activates when editing files under scripts/html_parsers/ or papers/test/.
+- `/convert-pdf`: invoked per stem (typically in parallel) to update papers/raw/<stem>_converted.json from a manually retrieved papers/raw/<stem>.pdf. Verifies _converted.json exists; updates authors[].affiliation, main_text, and references in place.
+- `/check-fact`: fact-check a finished review draft and add inline citations from the local corpus. One agent per paragraph runs in parallel; conclusion runs in a second wave restricted to body-cited stems. Outputs <draft_stem>.cited.md, then run `python scripts/cite_refs.py` to convert stems and emit the References section. Auto-activates on drafts under projects/<name>/.
+
+## Workflow
+
+1. PubMed search (when requested): form query, run via E-utilities `esearch`, retrieve PMIDs.
+2. Metadata fetch: `python scripts/get_refs.py <pmids>` creates papers/parsed/<stem>.json for each new PMID.
+3. Triage by title + abstract + keywords (already in parsed/<stem>.json) to decide which papers need full-text-quality main_text.
+4. For those papers: `python scripts/get_html.py <pmids>` → `python scripts/convert_html.py <pmids>` → if main_text quality is poor, retrieve PDF manually and run /convert-pdf in parallel agents → `python scripts/merge_refs.py <pmids>`. Skip `get_pmids.py` by default — only run it for papers whose cited references should be added to the database (it resolves PMIDs in `_converted.json` so the references can land in `parsed/<stem>.json` after the next merge_refs.py).
+5. Build embedding model: `python scripts/build_model.py [<project>]`.
+6. Local search (when requested): `python scripts/search_refs.py "<query>"` (cwd inside a project for project-scoped, cwd outside for global).
 
 ## Searching for Information
 
 1. Semantically enrich the user's query before searching. Expand abbreviations (e.g., TERT = telomerase reverse transcriptase), add synonyms (e.g., catalytic subunit), related terms (e.g., TERC, telomerase), and potential answer terms. Format the enriched query as a single string.
-2. Run `python search_refs.py <query>`. Output is a JSON array of {pmid, stem, score, snippet} for the top papers.
-3. Triage by snippet: drop papers whose snippet is clearly off-topic (e.g., generic background, citation list, unrelated section) before reading further.
-4. Read papers/<stem>.json main_text of the remaining candidates. DO NOT cite from the snippet alone, since a 400-word window may drop qualifiers that change a finding's meaning.
-5. Cite sources using `<stem>` when referencing specific findings. The user will run convert_citation.py to convert stems to readable citations.
+2. Run `python scripts/search_refs.py "<query>"`. Output is a JSON array of {pmid, stem, score, snippet} for the top papers.
+3. Triage by snippet: drop papers whose snippet is clearly off-topic before reading further.
+4. Read papers/parsed/<stem>.json main_text of the remaining candidates. DO NOT cite from the snippet alone, since a 400-word window may drop qualifiers that change a finding's meaning.
+5. Cite sources using `<stem>` when referencing specific findings. The user will run cite_refs.py to convert stems to readable citations.

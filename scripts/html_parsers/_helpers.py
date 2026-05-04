@@ -785,12 +785,10 @@ def parse_meta_authors(html):
 #
 # Use when piecemeal CSS overrides multiply (display / padding / pseudo-content
 # rules per-element) — the neutralizer collapses all viewport-gated layout
-# differences into one transform. See
-# `.claude/skills/format-html/scripts/neutralize_media.py` for the standalone
-# reference implementation.
+# differences into one transform.
 
-# Threshold reasoning relative to the vw=720 reference (per format-html
-# target). `@media (min-width: N)` fires only when vw >= N — so MIN_DESKTOP=721
+# Threshold reasoning relative to the vw=720 reference (per the develop-parser
+# layout target). `@media (min-width: N)` fires only when vw >= N — so MIN_DESKTOP=721
 # deletes every block whose threshold is above 720 (rule does NOT fire at the
 # reference). Catches publishers using 768 / 992 / 1024 as desktop breakpoint
 # in addition to the 1025+ ones. `@media (max-width: N)` fires when vw <= N —

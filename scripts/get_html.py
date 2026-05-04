@@ -1,18 +1,19 @@
 #!/usr/bin/env python3
-"""Fetch and parse PubMed citations by PMID.
+"""Fetch full-text HTML into papers/raw/.
 
 Usage:
-    python get_refs.py <pmid> [<pmid> ...]
-    python get_refs.py --path <file>
-    python get_refs.py --delete <pmid> [<pmid> ...]
-    python get_refs.py --validate
+    python get_html.py <pmid|url|list> [<pmid|url|list> ...]
 
-Retrieves citation metadata from PubMed. Writes to refs.json, generates
-papers/<stem>.json, fetches full paper HTML via single-file to papers/<stem>.html.
-Records HTML fetch failures in refs_no_html.md.
-Skips non-Journal Articles, Retracted Publications, and duplicates.
---path reads PMIDs from a file (delimited by punctuation, spaces, or newlines).
---validate checks for Retracted Publications and published versions of preprints.
+For each PMID arg: read doi from papers/parsed/<stem>.json, fetch the page
+via Edge + single-file, save to papers/raw/<stem>.html. PMIDs whose
+papers/raw/<stem>.html already exists are skipped.
+
+For each URL arg: fetch directly, save to papers/raw/<url_name>.html where
+<url_name> is the URL with all non-alphanumeric characters collapsed to
+underscores. URL-keyed outputs that already exist are skipped.
+
+A list arg is a file containing PMIDs and/or URLs separated by spaces or
+newlines.
 """
 
 import json
@@ -23,461 +24,20 @@ import subprocess
 import sys
 import tempfile
 import time
-import unicodedata
 import urllib.parse
 import urllib.request
-import xml.etree.ElementTree as ET
 
 import websocket
 from html import unescape
 
+from _cli import parse_argv
+from _project import parsed_path, raw_dir, raw_html_path
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-REFS_FILE = os.path.join(BASE_DIR, "refs.json")
-REFS_NO_HTML_FILE = os.path.join(BASE_DIR, "refs_no_html.md")
-PAPERS_DIR = os.path.join(BASE_DIR, "papers")
-os.makedirs(PAPERS_DIR, exist_ok=True)
+PAPERS_DIR = str(raw_dir())
 EDGE_PATH = "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge"
-_PUBMED_API_FILE = os.path.join(BASE_DIR, "api_pubmed.txt")
-_pubmed_throttle_cached = None
 
-
-def pubmed_throttle():
-    """Return (rate_gap_seconds, url_suffix) for PubMed E-utilities.
-
-    When api_pubmed.txt exists and is non-empty: 0.11 s gap + '&api_key=<key>'
-    suffix (authenticated 10 req/s allowance). Otherwise: 0.31 s gap + ''
-    (unauthenticated 3 req/s allowance). Result is cached after first call.
-    """
-    global _pubmed_throttle_cached
-    if _pubmed_throttle_cached is not None:
-        return _pubmed_throttle_cached
-    key = ""
-    try:
-        with open(_PUBMED_API_FILE, encoding="utf-8") as f:
-            key = f.read().strip()
-    except (FileNotFoundError, OSError):
-        pass
-    if key:
-        _pubmed_throttle_cached = (0.11, f"&api_key={key}")
-    else:
-        _pubmed_throttle_cached = (0.31, "")
-    return _pubmed_throttle_cached
-
-
-
-# ---------------------------------------------------------------------------
-# Stem generation
-# ---------------------------------------------------------------------------
-
-def make_stem(first_last_name, year, journal, pmid):
-    """Build a filesystem-safe stem from first author's last name, year, journal, and pmid.
-
-    Converts Latin diacritics to ASCII, replaces punctuation and spaces
-    with '_', collapses multiple '_' into one.
-    """
-    raw = f"{first_last_name} {year} {journal} {pmid}"
-    nfkd = unicodedata.normalize("NFKD", raw)
-    ascii_str = nfkd.encode("ascii", "ignore").decode("ascii")
-    slug = re.sub(r"[^A-Za-z0-9]+", "_", ascii_str)
-    slug = re.sub(r"_+", "_", slug).strip("_")
-    return slug
-
-
-# ---------------------------------------------------------------------------
-# PubMed fetch and parse
-# ---------------------------------------------------------------------------
-
-def fetch_xml(pmid):
-    """Fetch XML from PubMed E-utilities."""
-    _, api_suffix = pubmed_throttle()
-    url = (
-        f"https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi"
-        f"?db=pubmed&id={pmid}&rettype=xml&retmode=xml{api_suffix}"
-    )
-    with urllib.request.urlopen(url) as resp:
-        return resp.read().decode("utf-8")
-
-
-def doi_to_pmid(doi):
-    """Resolve a DOI to a PMID via PubMed esearch.
-
-    Accepts a bare DOI ("10.1039/D5AN00347D") or a full URL
-    ("https://doi.org/10.1039/..."). Returns the PMID as a string, or
-    None if PubMed has no matching record.
-
-    Uses the `[aid]` (Article Identifier) field — DOIs are indexed
-    there, so a single-record hit is expected when the DOI is real.
-    """
-    bare = doi.strip()
-    m = re.search(r"10\.\d{4,9}/\S+", bare)
-    if not m:
-        return None
-    term = m.group(0).rstrip("/").strip(".,; ")
-    _, api_suffix = pubmed_throttle()
-    url = (
-        f"https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi"
-        f"?db=pubmed&term={urllib.parse.quote(term)}%5Baid%5D"
-        f"&retmode=json{api_suffix}"
-    )
-    try:
-        with urllib.request.urlopen(url) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-    except Exception:
-        return None
-    ids = data.get("esearchresult", {}).get("idlist", [])
-    return ids[0] if ids else None
-
-
-def crossref_metadata(doi):
-    """Fetch metadata for a DOI from the Crossref REST API.
-
-    Used as a fallback when a DOI is not indexed in PubMed (so
-    `doi_to_pmid` returns None) — lets us build a stem and fetch HTML
-    without a PMID. Falls back to a doi-slug-only stem when Crossref
-    has no record. Returns a parsed-like dict, or None for malformed DOIs.
-    """
-    m = re.search(r"10\.\d{4,9}/\S+", doi)
-    if not m:
-        return None
-    bare = m.group(0).rstrip("/").strip(".,; ")
-    doi_slug = re.sub(r"[^A-Za-z0-9]+", "_", bare).strip("_")
-    first_last, year, journal, title = "", "", "", ""
-    try:
-        req = urllib.request.Request(
-            f"https://api.crossref.org/works/{urllib.parse.quote(bare, safe='/')}",
-            headers={"User-Agent": "ref_database/1.0"},
-        )
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-        msg = data.get("message", {})
-        for a in (msg.get("author") or []):
-            if a.get("family"):
-                first_last = a["family"]
-                break
-        issued = msg.get("issued", {}).get("date-parts") or []
-        if issued and issued[0]:
-            year = str(issued[0][0])
-        ct = msg.get("short-container-title") or msg.get("container-title") or []
-        journal = ct[0] if ct else ""
-        tl = msg.get("title") or [""]
-        title = tl[0] if tl else ""
-    except Exception:
-        pass
-    stem = make_stem(first_last, year, journal, doi_slug)
-    return {
-        "pmid": "",
-        "citation_short": stem,
-        "doi": f"https://doi.org/{bare}",
-        "title": title,
-        "journal": journal,
-        "year": year,
-        "_doi_only": True,
-        "_doi_bare": bare,
-    }
-
-
-def _looks_like_pmid(token):
-    """True for a bare positive integer (a PubMed ID)."""
-    t = token.strip().rstrip("/")
-    # Strip a trailing /<digits> path — e.g. "pubmed.gov/12345" → "12345"
-    m = re.search(r"(\d+)$", t)
-    return bool(m) and m.group(1) == t.lstrip("0").lstrip() or (
-        t.isdigit() and len(t) <= 9
-    )
-
-
-def _resolve_arg_to_pmid(arg):
-    """Map a CLI arg (PMID, PubMed URL, or DOI/DOI-URL) to a PMID string.
-
-    Accepts:
-      - "12345"                     → "12345"
-      - "pubmed.gov/12345"          → "12345"
-      - "10.1039/D5AN00347D"        → resolve via PubMed esearch
-      - "https://doi.org/10.xxx/…"  → resolve via PubMed esearch
-
-    Returns the PMID or None when resolution fails.
-    """
-    t = arg.strip().rstrip("/")
-    # Trailing numeric (PMID URL or bare PMID)
-    m = re.search(r"/(\d+)$", t)
-    if m:
-        return m.group(1)
-    if t.isdigit():
-        return t
-    # DOI: contains "10.<digits>/..."
-    if re.search(r"10\.\d{4,9}/\S+", t):
-        return doi_to_pmid(t)
-    return None
-
-
-def gt(elem, path, default=""):
-    """Get text from an element path."""
-    el = elem.find(path) if elem is not None else None
-    return el.text if el is not None and el.text else default
-
-
-def parse_xml(xml_data, pmid):
-    """Parse PubMed XML into citation fields and formatted output."""
-    root = ET.fromstring(xml_data)
-    article = root.find(".//PubmedArticle")
-    mc = article.find("MedlineCitation")
-    art = mc.find("Article")
-    jrnl = art.find("Journal")
-    ji = jrnl.find("JournalIssue")
-    pd = ji.find("PubDate")
-    pag = art.find("Pagination")
-
-    journal_abbrev = gt(jrnl, "ISOAbbreviation")
-    year = gt(pd, "Year")
-    volume = gt(ji, "Volume")
-    issue = gt(ji, "Issue")
-    # Pages: prefer StartPage-EndPage, fallback to PII
-    start_page = gt(pag, "StartPage") if pag is not None else ""
-    end_page = gt(pag, "EndPage") if pag is not None else ""
-    if start_page and end_page:
-        pages = f"{start_page}-{end_page}"
-    elif start_page:
-        pages = start_page
-    else:
-        pages = ""
-    if not pages:
-        for el in art.findall("ELocationID"):
-            if el.get("EIdType") == "pii" and el.text:
-                pages = el.text
-                break
-    title_el = art.find("ArticleTitle")
-    title = (
-        ET.tostring(title_el, encoding="unicode", method="text").strip().rstrip(".")
-        if title_el is not None
-        else ""
-    )
-    doi_raw = ""
-    for el in art.findall("ELocationID"):
-        if el.get("EIdType") == "doi":
-            doi_raw = el.text or ""
-    if not doi_raw:
-        pd_data_tmp = article.find("PubmedData")
-        if pd_data_tmp is not None:
-            aid_list_tmp = pd_data_tmp.find("ArticleIdList")
-            if aid_list_tmp is not None:
-                for aid in aid_list_tmp.findall("ArticleId"):
-                    if aid.get("IdType") == "doi":
-                        doi_raw = aid.text or ""
-    doi = f"https://doi.org/{doi_raw}" if doi_raw else ""
-
-    # Authors
-    authors_raw = []
-    for auth in art.findall(".//Author"):
-        ln = gt(auth, "LastName")
-        init = gt(auth, "Initials")
-        if ln:
-            affs = [
-                ai.findtext("Affiliation", "").strip()
-                for ai in auth.findall("AffiliationInfo")
-            ]
-            authors_raw.append({
-                "name": f"{ln} {init}".strip(),
-                "affiliation": [a for a in affs if a],
-            })
-
-    # Abstract
-    abstract_parts = []
-    for ab in art.findall(".//AbstractText"):
-        label = ab.get("Label", "")
-        text = ET.tostring(ab, encoding="unicode", method="text").strip()
-        if label:
-            abstract_parts.append(f"{label}: {text}")
-        else:
-            abstract_parts.append(text)
-    abstract = " ".join(abstract_parts)
-
-    # Keywords
-    keywords = []
-    kw_list = mc.find("KeywordList")
-    if kw_list is not None:
-        for kw in kw_list.findall("Keyword"):
-            if kw.text:
-                keywords.append(kw.text.strip())
-
-    # Publication type
-    pub_type = [pt.text for pt in art.findall(".//PublicationType") if pt.text]
-
-    # CitationShort
-    author_last_names = [
-        gt(a, "LastName")
-        for a in art.findall(".//Author")
-        if gt(a, "LastName")
-    ]
-    num_authors = len(author_last_names)
-    first_last = author_last_names[0] if author_last_names else ""
-    if num_authors == 1:
-        authors_short = first_last
-    elif num_authors == 2:
-        second_last = author_last_names[1]
-        authors_short = f"{first_last} & {second_last}"
-    else:
-        authors_short = f"{first_last} et al."
-
-    pd_data = article.find("PubmedData")
-    pmid_from_aid = ""
-    if pd_data is not None:
-        aid_list = pd_data.find("ArticleIdList")
-        if aid_list is not None:
-            for aid in aid_list.findall("ArticleId"):
-                if aid.get("IdType") == "pubmed":
-                    pmid_from_aid = aid.text or ""
-    pmid_final = pmid_from_aid or gt(mc, "PMID")
-
-    citation_in_text = f"{authors_short} {year}"
-    citation_short = make_stem(first_last, year, journal_abbrev, pmid_final)
-
-    # Reference PMIDs (deduplicated)
-    references = []
-    if pd_data is not None:
-        for ref in pd_data.findall(".//Reference"):
-            for aid in ref.findall(".//ArticleId"):
-                if aid.get("IdType") == "pubmed" and aid.text:
-                    if aid.text not in references:
-                        references.append(aid.text)
-
-    # Validate
-    if "Journal Article" not in pub_type:
-        return None
-    if "Retracted Publication" in pub_type:
-        return None
-
-    return {
-        "pmid": pmid_final,
-        "pub_type": pub_type,
-        "citation_in_text": citation_in_text,
-        "title": title,
-        "journal": journal_abbrev,
-        "year": year,
-        "volume": volume,
-        "issue": issue,
-        "pages": pages,
-        "doi": doi,
-        "_authors_raw": authors_raw,
-        "references": references,
-        "abstract": abstract,
-        "keywords": keywords,
-        "citation_short": citation_short,
-    }
-
-
-# ---------------------------------------------------------------------------
-# refs.json I/O
-# ---------------------------------------------------------------------------
-
-def load_references():
-    """Load refs.json, return dict."""
-    if not os.path.exists(REFS_FILE):
-        return {}
-    with open(REFS_FILE, encoding="utf-8") as f:
-        return json.load(f)
-
-
-def save_references(refs):
-    """Save dict to refs.json with compact arrays for pub_type and references."""
-    raw = json.dumps(refs, indent=2, ensure_ascii=False)
-    for key in ("pub_type", "references"):
-
-        def _collapse(m):
-            items = [s.strip().rstrip(",") for s in m.group(2).split("\n") if s.strip()]
-            return m.group(1) + " " + ", ".join(items) + " ]"
-
-        raw = re.sub(
-            rf'("{key}": \[)\s*\n(.*?)\n\s*\]',
-            _collapse,
-            raw,
-            flags=re.DOTALL,
-        )
-    with open(REFS_FILE, "w", encoding="utf-8") as f:
-        f.write(raw)
-        f.write("\n")
-
-
-def is_duplicate(pmid):
-    """Check if PMID already exists in refs.json."""
-    refs = load_references()
-    return pmid in refs
-
-
-def append_to_references(parsed):
-    """Add entry to refs.json."""
-    refs = load_references()
-    filtered = [
-        pt
-        for pt in parsed["pub_type"]
-        if not pt.startswith("Research Support")
-    ]
-    authors = [
-        {"author": auth["name"], "affiliation": auth.get("affiliation", [])}
-        for auth in parsed.get("_authors_raw", [])
-    ]
-    refs[parsed["pmid"]] = {
-        "stem": parsed["citation_short"],
-        "pub_type": filtered,
-        "title": parsed["title"],
-        "journal": parsed["journal"],
-        "year": parsed["year"],
-        "volume": parsed["volume"],
-        "issue": parsed["issue"],
-        "pages": parsed["pages"],
-        "doi": parsed["doi"],
-        "authors": authors,
-        "references": parsed.get("references", []),
-    }
-    save_references(refs)
-
-
-# ---------------------------------------------------------------------------
-# refs_no_html.md
-# ---------------------------------------------------------------------------
-
-def _append_to_section(filepath, section_header, stem, doi, reason=""):
-    """Append stem + doi + reason under a ## section in a markdown file.
-
-    Creates the section if it doesn't exist. Skips if stem already listed.
-    """
-    content = ""
-    if os.path.exists(filepath):
-        with open(filepath, encoding="utf-8") as f:
-            content = f.read()
-        if stem in content:
-            return
-
-    entry = f"stem:   {stem}\ndoi:    {doi}\nreason: {reason}\n"
-
-    if section_header in content:
-        # Append after the section header
-        idx = content.index(section_header) + len(section_header)
-        # Find end of header line
-        nl = content.find("\n", idx)
-        if nl == -1:
-            content += "\n\n" + entry
-        else:
-            content = content[:nl + 1] + "\n" + entry + content[nl + 1:]
-    else:
-        # Create new section at end
-        if content and not content.endswith("\n"):
-            content += "\n"
-        content += f"\n{section_header}\n\n{entry}"
-
-    with open(filepath, "w", encoding="utf-8") as f:
-        f.write(content)
-
-
-def append_to_no_html(parsed, reason="HTML retrieval failed after 3 attempts"):
-    """Append citation_short + doi to refs_no_html.md under retrieval failures."""
-    _append_to_section(
-        REFS_NO_HTML_FILE,
-        "## HTML Retrieval Failures",
-        parsed["citation_short"],
-        parsed["doi"],
-        reason,
-    )
+raw_dir().mkdir(parents=True, exist_ok=True)
 
 
 # ---------------------------------------------------------------------------
@@ -2559,274 +2119,82 @@ def _fetch_batch(batch, port):
 
 
 # ---------------------------------------------------------------------------
-# PubMed search
-# ---------------------------------------------------------------------------
-
-def search_pmids(query):
-    """Search PubMed and return list of PMIDs."""
-    _, api_suffix = pubmed_throttle()
-    url = (
-        f"https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi"
-        f"?db=pubmed&term={urllib.parse.quote(query)}&retmax=20&retmode=xml"
-        f"{api_suffix}"
-    )
-    with urllib.request.urlopen(url) as resp:
-        xml_data = resp.read().decode("utf-8")
-    root = ET.fromstring(xml_data)
-    return [id_el.text for id_el in root.findall(".//IdList/Id")]
-
-
-# ---------------------------------------------------------------------------
-# Validate
-# ---------------------------------------------------------------------------
-
-def validate():
-    """Validate all PMIDs in refs.json."""
-    refs = load_references()
-    pmids = list(refs.keys())
-    print(f"Validating {len(pmids)} entries...", flush=True)
-    retracted = []
-    preprints = []
-    fetch_count = 0
-    all_pmids_set = set(pmids)
-
-    for pmid in pmids:
-        if fetch_count > 0:
-            time.sleep(pubmed_throttle()[0])
-        try:
-            xml_data = fetch_xml(pmid)
-            fetch_count += 1
-            root = ET.fromstring(xml_data)
-            pub_types = [
-                pt.text for pt in root.findall(".//PublicationType") if pt.text
-            ]
-        except Exception as e:
-            print(json.dumps({"pmid": pmid, "status": "error", "message": str(e)}))
-            continue
-
-        if "Retracted Publication" in pub_types:
-            retracted.append(pmid)
-        if "Preprint" in pub_types:
-            title_el = root.find(".//ArticleTitle")
-            title = (
-                ET.tostring(title_el, encoding="unicode", method="text").strip()
-                if title_el is not None
-                else ""
-            )
-            preprints.append((pmid, title))
-
-    if retracted:
-        for pmid in retracted:
-            print(json.dumps({"pmid": pmid, "status": "retracted"}))
-    else:
-        print(json.dumps({"status": "ok", "message": "No retracted articles found."}))
-
-    for pmid, title in preprints:
-        if fetch_count > 0:
-            time.sleep(pubmed_throttle()[0])
-        try:
-            query = f"{title} NOT preprint[pt]"
-            result_pmids = search_pmids(query)
-            fetch_count += 1
-        except Exception as e:
-            print(
-                json.dumps(
-                    {
-                        "pmid": pmid,
-                        "status": "error",
-                        "message": f"Search failed: {e}",
-                    }
-                )
-            )
-            continue
-
-        candidates = [
-            p for p in result_pmids if p != pmid and p not in all_pmids_set
-        ]
-        print(
-            json.dumps(
-                {
-                    "pmid": pmid,
-                    "status": "preprint",
-                    "title": title,
-                    "candidates": candidates,
-                }
-            )
-        )
-
-    if not preprints:
-        print(json.dumps({"status": "ok", "message": "No preprints to check."}))
-
-
-# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
+def _url_name(url):
+    """Convert a URL to a filesystem-safe name (punctuation -> underscore).
+
+    Always derived from the input URL exactly as supplied — redirects and
+    SingleFile-comment URLs in the saved HTML are not consulted, so a given
+    input URL deterministically maps to one filename.
+    """
+    name = re.sub(r"[^A-Za-z0-9]+", "_", url).strip("_")
+    return name[:200]  # avoid silly-long filenames
+
+
+def _doi_to_url(doi):
+    """Strip the doi.org prefix if present; return as-is otherwise."""
+    if not doi:
+        return ""
+    return doi if doi.startswith("http") else f"https://doi.org/{doi}"
+
+
+def _read_doi_for_pmid(pmid):
+    """Read DOI from papers/parsed/<stem>.json. Returns (stem, doi) or (None, None)."""
+    from _project import pmid_to_stem
+    stem = pmid_to_stem(pmid)
+    if not stem:
+        return None, None
+    try:
+        with open(parsed_path(stem), encoding="utf-8") as f:
+            data = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return stem, ""
+    return stem, data.get("doi", "")
+
+
 def main():
-    if len(sys.argv) < 2:
-        print(
-            "Usage: python get_refs.py <pmid> [<pmid> ...]\n"
-            "       python get_refs.py --path <file>\n"
-            "       python get_refs.py --delete <pmid> [<pmid> ...]\n"
-            "       python get_refs.py --validate",
-            file=sys.stderr,
-        )
+    args = parse_argv(accept={"pmids", "urls"})
+    pmids = args["pmids"]
+    urls = args["urls"]
+    if not pmids and not urls:
+        print(__doc__, file=sys.stderr)
         sys.exit(1)
 
-    if sys.argv[1] == "--validate":
-        validate()
-        return
-
-    if sys.argv[1] == "--delete":
-        if len(sys.argv) < 3:
-            print(
-                "Usage: python get_refs.py --delete <pmid> [<pmid> ...]",
-                file=sys.stderr,
-            )
-            sys.exit(1)
-        refs = load_references()
-        for pmid in sys.argv[2:]:
-            if pmid in refs:
-                del refs[pmid]
-                print(json.dumps({"pmid": pmid, "status": "deleted"}))
-            else:
-                print(json.dumps({"pmid": pmid, "status": "not found"}))
-        save_references(refs)
-        return
-
-    doi_only_proxies = []  # populated by the DOI-only path below
-    if sys.argv[1] == "--path":
-        if len(sys.argv) < 3:
-            print("Usage: python get_refs.py --path <file>", file=sys.stderr)
-            sys.exit(1)
-        with open(sys.argv[2], encoding="utf-8") as f:
-            pmids = re.findall(r"\d+", f.read())
-    else:
-        # Accept PMIDs and/or DOIs. DOIs are resolved to PMIDs via
-        # PubMed esearch before proceeding through the normal pipeline,
-        # so downstream steps (refs.json entry, HTML fetch, JSON parse)
-        # stay unchanged. DOIs without a PubMed hit fall back to
-        # Crossref-only metadata: HTML is fetched and saved under a
-        # synthetic stem, but no refs.json entry is created.
-        raw_args = sys.argv[1:]
-        pmids = []
-        doi_only_proxies = []  # parsed-like dicts for DOI-only fetches
-        for arg in raw_args:
-            pmid = _resolve_arg_to_pmid(arg)
-            if pmid:
-                pmids.append(pmid)
-                continue
-            if re.search(r"10\.\d{4,9}/\S+", arg):
-                proxy = crossref_metadata(arg)
-                if proxy and proxy.get("citation_short"):
-                    doi_only_proxies.append(proxy)
-                    print(
-                        json.dumps({"input": arg, "status": "doi-only",
-                                    "stem": proxy["citation_short"]}),
-                        file=sys.stderr,
-                    )
-                    continue
-            print(
-                json.dumps({"input": arg, "status": "unresolved",
-                            "message": "not a PMID and no PubMed hit for DOI"}),
-                file=sys.stderr,
-            )
-
-    # For each PMID, three independent checks:
-    #   1. refs.json entry exists? If not, fetch from PubMed and add.
-    #   2. papers/<stem>.json exists? If not, generate.
-    #   3. papers/<stem>.html exists? If not, fetch via browser.
-    # Each check uses the parsed data but doesn't depend on whether
-    # previous checks added or skipped.
-
-    refs = load_references()
-    fetched_count = 0
-    need_html = []  # (parsed, stem) for papers needing HTML fetch
-
-    # DOI-only entries (Crossref-resolved) skip refs.json/PubMed and go
-    # directly into the HTML fetch queue.
-    for proxy in doi_only_proxies:
-        stem = proxy["citation_short"]
-        html_path = os.path.join(PAPERS_DIR, f"{stem}.html")
-        if not os.path.exists(html_path):
-            need_html.append((proxy, stem))
+    # Build fetch_items: (stem, url, output_path).
+    fetch_items = []
 
     for pmid in pmids:
-        pmid = re.sub(r".*/(\d+)/?$", r"\1", pmid.strip().rstrip("/"))
+        stem, doi = _read_doi_for_pmid(pmid)
+        if not stem:
+            print(f"PMID {pmid}: no papers/parsed/<stem>.json (run get_refs.py first)",
+                  file=sys.stderr)
+            continue
+        if not doi:
+            print(f"{stem}: no doi in parsed JSON; skipping", file=sys.stderr)
+            continue
+        out = str(raw_html_path(stem))
+        if os.path.exists(out):
+            print(f"{stem}: skipped (html already exists)")
+            continue
+        fetch_items.append((stem, _doi_to_url(doi), out))
 
-        # Step 1: refs.json
-        if pmid in refs:
-            # Reconstruct parsed-like dict from existing entry for steps 2-3
-            entry = refs[pmid]
-            stem = entry.get("stem", "")
-            doi = entry.get("doi", "")
-            parsed_proxy = {"pmid": pmid, "citation_short": stem, "doi": doi}
-        else:
-            if fetched_count > 0:
-                time.sleep(pubmed_throttle()[0])
-            try:
-                xml_data = fetch_xml(pmid)
-                fetched_count += 1
-                parsed = parse_xml(xml_data, pmid)
-            except Exception as e:
-                print(json.dumps({"pmid": pmid, "status": "error", "message": str(e)}))
-                continue
-            if parsed is None:
-                pub_types = [
-                    pt.text
-                    for pt in ET.fromstring(xml_data).findall(".//PublicationType")
-                    if pt.text
-                ]
-                reason = (
-                    "Retracted Publication"
-                    if "Retracted Publication" in pub_types
-                    else "not a Journal Article"
-                )
-                print(
-                    json.dumps(
-                        {
-                            "pmid": pmid,
-                            "status": "skipped",
-                            "message": f"PMID {pmid}: {reason}. PublicationTypes: {pub_types}",
-                        }
-                    )
-                )
-                continue
-            append_to_references(parsed)
-            parsed_proxy = parsed
+    for url in urls:
+        stem = _url_name(url)
+        out = str(raw_dir() / f"{stem}.html")
+        if os.path.exists(out):
+            print(f"{stem}: skipped (html already exists)")
+            continue
+        fetch_items.append((stem, url, out))
 
-        stem = parsed_proxy["citation_short"]
-        doi = parsed_proxy["doi"]
-
-        # Step 2: papers/<stem>.html
-        html_path = os.path.join(PAPERS_DIR, f"{stem}.html")
-        if not os.path.exists(html_path):
-            if doi:
-                need_html.append((parsed_proxy, stem))
-            else:
-                append_to_no_html(parsed_proxy, "no DOI available")
-
-    # Fetch HTML for all papers that need it
-    if not need_html:
+    if not fetch_items:
         return
 
-    parsed_by_stem = {stem: p for p, stem in need_html}
-
-    def on_failure(stem):
-        append_to_no_html(parsed_by_stem[stem])
-
-    fetch_items = [
-        (stem, p["doi"], os.path.join(PAPERS_DIR, f"{stem}.html"))
-        for p, stem in need_html
-    ]
-
-    # Track retry counts
-    retry_counts = {}  # stem -> attempts so far
+    retry_counts = {}
     MAX_RETRIES = 3
     remaining = list(fetch_items)
-
-    # Build lookup for retry
-    item_by_stem = {stem: (stem, doi, path) for stem, doi, path in fetch_items}
+    item_by_stem = {stem: (stem, url, path) for stem, url, path in fetch_items}
 
     while remaining:
         next_remaining = []
@@ -2846,13 +2214,10 @@ def main():
                     if retry_counts[stem] < MAX_RETRIES:
                         next_remaining.append(item_by_stem[stem])
                     elif retry_counts[stem] == MAX_RETRIES:
-                        on_failure(stem)
-                        _emit_stem_log(
-                            stem, "HTML retrieval failed after 3 attempts"
-                        )
+                        _emit_stem_log(stem, "HTML retrieval failed after 3 attempts")
             except RuntimeError as e:
                 print(f"  Browser error: {e}", file=sys.stderr)
-                for stem, doi, path in batch:
+                for stem, url, path in batch:
                     if os.path.exists(path):
                         _emit_stem_log(stem, "success")
                         continue
@@ -2861,14 +2226,10 @@ def main():
                     if retry_counts[stem] < MAX_RETRIES:
                         next_remaining.append(item_by_stem[stem])
                     elif retry_counts[stem] == MAX_RETRIES:
-                        on_failure(stem)
-                        _emit_stem_log(
-                            stem, "HTML retrieval failed after 3 attempts"
-                        )
+                        _emit_stem_log(stem, "HTML retrieval failed after 3 attempts")
             finally:
                 stop_browser(proc, profile_dir)
 
-        # Failures retry in the next round
         if not next_remaining:
             break
         remaining = next_remaining

@@ -11,7 +11,7 @@ bounding box of every <article> on the page (falls back to #iucr-art /
 #main.article / .article_content-left when no <article> is present).
 
 Run from the project root:
-    python .claude/skills/format-html/scripts/chrome_scan.py papers/<stem>.html [...]
+    python .claude/skills/develop-parser/scripts/chrome_scan.py papers/<stem>.html [...]
 
 0 header + 0 footer candidates means remove_banners cleared all detectable
 chrome. Non-zero results are either a missing selector in remove_banners
@@ -27,7 +27,7 @@ import urllib.request
 
 import websocket
 
-# Script lives at .claude/skills/format-html/scripts/chrome_scan.py —
+# Script lives at .claude/skills/develop-parser/scripts/chrome_scan.py —
 # walk up four levels to reach the project root where get_refs.py lives.
 BASE = os.path.abspath(
     os.path.join(os.path.dirname(__file__), "..", "..", "..", "..")

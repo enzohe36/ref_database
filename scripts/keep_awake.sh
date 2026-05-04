@@ -2,7 +2,7 @@
 set -e
 
 INTERVAL=60
-DISTANCE=100
+DISTANCE=1
 
 echo "Keeping awake. Mouse jiggles ${DISTANCE}px every ${INTERVAL}s. Ctrl+C to stop."
 

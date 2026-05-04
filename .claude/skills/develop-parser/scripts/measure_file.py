@@ -2,7 +2,7 @@
 
 Two checks, both reporting only failures:
 
-  1. Per-viewport target check — `L / R / T / B / W` against the format-html
+  1. Per-viewport target check — `L / R / T / B / W` against the develop-parser layout
      spec at each viewport, ±4 px tolerance.
 
   2. Cross-viewport layout diff — compares dimensions / display mode of every
@@ -246,7 +246,7 @@ def main():
         snapshots[vw] = _measure(path, vw)
 
     # 1. Per-viewport target failures.
-    print("Per-viewport target (L/R/T/B/W vs format-html spec, ±4):")
+    print("Per-viewport target (L/R/T/B/W vs develop-parser layout spec, ±4):")
     any_fail = False
     for vw in viewports:
         bounds, _, _ = snapshots[vw]

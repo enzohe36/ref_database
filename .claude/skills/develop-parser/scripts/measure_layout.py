@@ -1,5 +1,5 @@
 """Measure rendered text bounds (L/R/T/B/width) of a formatted HTML at one or
-more viewports via CDP, against the format-html target spec.
+more viewports via CDP, against the develop-parser layout target spec.
 
 Usage:
   python measure_layout.py <parser_module> <html_path> [vw1 vw2 ...]
@@ -10,7 +10,7 @@ Usage:
                   running convert_html.py
   vw...:          viewport widths in px; default = 600 720 820 1024 1280 1600 1920
 
-Reports L, R, T, B, width per viewport. Target (per format-html spec):
+Reports L, R, T, B, width per viewport. Target (per develop-parser layout spec):
     L = max(16, (vw - 720) / 2),  R = L,  T = 56,  B = 56,
     width = vw - 32 for vw <= 752 else 720;  tolerance ±4 px.
 
@@ -112,7 +112,7 @@ def _measure(out_path, vw):
 
 
 def _format_check(m):
-    """Return a per-row pass/fail summary against format-html targets."""
+    """Return a per-row pass/fail summary against develop-parser layout targets."""
     vw = m["vw"]
     target_L = max(16, (vw - 720) // 2)
     target_W = vw - 32 if vw <= 752 else 720
