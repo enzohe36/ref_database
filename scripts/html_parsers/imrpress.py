@@ -12,7 +12,7 @@ from ._helpers import (
     get_all_meta,
     get_meta,
     neutralize_media_queries,
-    remove_elements_by_selector,
+    remove_elements_by_id,
     strip_common,
     strip_tags,
     tags_to_text,
@@ -68,159 +68,155 @@ _SUPP_RE = re.compile(
 # Banner removal
 # ---------------------------------------------------------------------------
 
+
 def remove_banners(html):
-    """Normalize IMR Press HTML to a single centered text column.
+    """Apply Phase 2 layout rules for imrpress.com.
 
-    IMR Press is a Nuxt-rendered Vue layout. The reading content lives in
-    <div class=right-layout watermark-area>; the left sidebar (Academic
-    Editor card, Download/3D-view panel, article-tab list) lives in the
-    sibling <div class=left-layout>. Both are flex children of
-    <div class=article-detail>, which in turn sits inside
-    <main class="page-content base-max-width-layout">.
-
-    Chrome stripped (Step 3):
-      - <header class=classic-header> site top bar.
-      - <footer class=classic-footer> site footer.
-      - <div class=cookie-consent> "We use cookies..." banner.
-      - <div class=floating-tool-container> fixed Cite/Download/Share
-        cluster (bottom-right FAB).
-      - <div class=left-layout> sidebar — its flex-basis pushes the
-        reading column off-center on wide viewports.
-
-    Reading column (Step 4): <div class=right-layout watermark-area>.
-    The hidden references list (`<ul class=article-references-list
-    style=display:none>`) is expanded so references render inline.
+    Step 1: cap body width at 752 px, center, neutralize @media queries
+            so the publisher's narrow CSS branch always applies. The
+            `.article-detail` wrapper ships its own `max-width:1200px`
+            and a 60/40 left-sidebar/right-article split that needs
+            collapsing to the body cap.
+    Step 2: remove `.cookie-consent` (position:fixed bottom banner).
+    Step 3: remove sticky chrome flagged by scan_sticky.py — the
+            page-wide fixed `header.classic-header`, the right-side
+            fixed `.floating-tool-container` (Cite/Share/PDF rail),
+            and the Hotjar `#hj-survey-toggle-1` floater.
+            `.side-bar.base-sticky-menu` (article TOC sidebar) is
+            removed via Step 4 by stripping the parent
+            `.left-layout` column.
+    Step 4: remove `.left-layout` — IMR Press' left article TOC sidebar
+            (Catalogue / Figures / References / Citations tabs). It
+            spans full article height and lives beside the right-layout
+            article column.
+    Step 5: no ad slots ship in the captured imrpress HTML
+            (no ad/gpt/dfp/sponsored markers found).
+    Step 6: page background is white; `.layout-container` and `body`
+            are explicitly forced white for symmetry. The footer ships
+            a navy `.classic-footer` background; cap it to body width
+            so the colored band doesn't bleed past the centered cap.
+    Step 7: figure images are inlined at full natural resolution
+            (1.7K-5K px wide JPEGs) — well above the 720-px column
+            width target. No retrieval issue.
+    Step 8: figures live inside `<figure class=ipub-html-image>` with
+            an `<img>` followed by `<span class=ipub-html-label>`
+            label and one or more caption `<p>` paragraphs. Force
+            block layout, image at column width, caption below.
+            Tables inside `.ipub-html-table-wrap` already overflow
+            cleanly when wider than the column; cap the wrapper so it
+            doesn't push body width past the cap.
+    Step 9: expand collapsed content:
+            - `.name-list.ellipsis-3-lines` (line-clamped 3 lines) →
+              show all author rows.
+            - `.article-info-container` (inline `style=display:none`,
+              holds editor / received / accepted / publication metadata)
+              → reveal.
+            - `.article-references-list` (inline `style=display:none`,
+              the entire references list) → reveal so all references
+              render below the toggle heading.
+            Layer-1 DOM strip (inline style attribute) handles the
+            references list and article-info container; Layer-2 CSS
+            override handles the line-clamped author row.
     """
-    # Lock layout to publisher's narrow (≤1024 px) form at any viewport.
     html = neutralize_media_queries(html)
-    # Step 3 — strip chrome.
-    html = _remove_nested_element(html, r"<header\b[^>]*>")
-    html = _remove_nested_element(html, r"<footer\b[^>]*>")
-    # IMR Press uses unquoted class attributes in the rendered Nuxt HTML,
-    # so remove_elements_by_selector (which matches class="...") misses
-    # them. Use _remove_nested_element directly for each.
-    # `placeholder-box` reserves the 7rem (~113 px) fixed-header gap;
-    # since we just removed the header, drop the spacer too.
-    for cls in ("cookie-consent", "floating-tool-container",
-                "left-layout", "placeholder-box"):
-        for _ in range(5):
-            before = html
-            html = _remove_nested_element(
-                html, rf'<div\b[^>]*\bclass={cls}\b[^>]*>'
-            )
-            if html == before:
-                break
-    # Orange "Frontiers in Bioscience-Landmark (FBL) is published by
-    # IMR Press from Volume X Issue Y (2021). Previous articles were
-    # published by another publisher..." disclaimer banner. Lives in
-    # a standalone `<article class=base-journal-theme-block>` inside
-    # `.right-layout.watermark-area`, above the "1 Mar 2017 Review"
-    # spec start anchor. Strip it so the column starts at the
-    # publication-date row as the spec requires.
-    for _ in range(3):
-        before = html
-        html = _remove_nested_element(
-            html, r'<article\b[^>]*\bclass=base-journal-theme-block\b[^>]*>',
+
+    # IMR Press writes class attributes UNQUOTED (`class=floating-tool-container`),
+    # so the shared remove_elements_by_selector helper (which expects
+    # double-quoted `class="..."`) doesn't match. Use _remove_nested_element
+    # with patterns tolerating both quote conventions.
+    def _strip_class(html_, tag, name):
+        return _remove_nested_element(
+            html_,
+            rf'<{tag}\b[^>]*\bclass=(?:"[^"]*\b{re.escape(name)}\b[^"]*"|'
+            rf"'[^']*\b{re.escape(name)}\b[^']*'|"
+            rf'{re.escape(name)}\b)[^>]*>',
         )
-        if html == before:
-            break
-    # "Publisher's Note: IMR Press stays neutral with regard to
-    # jurisdictional claims..." disclaimer block at the bottom of the
-    # article, lives in a separate trailing `<article class=article>`
-    # containing only a `<div class=rich-text>` with the disclaimer.
-    # Match by the rich-text containing the trailing-disclaimer text.
+
+    # Step 2 — cookie consent banner.
+    html = _strip_class(html, "div", "cookie-consent")
+    # Step 3 — fixed-position site header, right-side floating tool rail,
+    # and Hotjar survey toggle button.
+    html = _strip_class(html, "header", "classic-header")
+    html = _strip_class(html, "div", "floating-tool-container")
+    html = remove_elements_by_id(html, "hj-survey-toggle-1")
+    # Step 4 — left article TOC sidebar.
+    html = _strip_class(html, "div", "left-layout")
+    # Step 10 — drop the page-content placeholder-box. The publisher
+    # reserved 128 px (one viewport) at the top of <main> so the
+    # now-removed `position:fixed` header didn't overlap content; with
+    # the header gone the reservation becomes a leading blank band.
+    html = _strip_class(html, "div", "placeholder-box")
+    # Step 9 (Layer 1) — strip inline display:none on references and
+    # article-info containers so the parser-visible content also renders.
     html = re.sub(
-        r"<article\b[^>]*>\s*<div\b[^>]*\bclass=rich-text\b[^>]*>"
-        r"\s*<p>\s*<strong>\s*Publisher’s Note\b.*?</article>",
-        "", html, count=2, flags=re.DOTALL,
+        r'(<ul[^>]*class="[^"]*article-references-list[^"]*"[^>]*?)\s*style="display:none"',
+        r"\1", html,
+    )
+    html = re.sub(
+        r'(<div[^>]*class="[^"]*article-info-container[^"]*"[^>]*?)\s*style="display:none"',
+        r"\1", html,
     )
 
-    # Steps 2 + 4 — layout freeze and reading-column cap.
-    # The marker comment makes injection idempotent — re-running
-    # remove_banners on already-formatted HTML strips the previous block
-    # before injecting the new one (otherwise convert_html accumulates
-    # one duplicate style block per run on the same file).
-    _INJECT_MARKER = "<!--imrpress-format-html-->"
-    html = re.sub(
-        re.escape(_INJECT_MARKER) + r"<style>.*?</style>",
-        "", html, flags=re.DOTALL,
-    )
     override = (
-        _INJECT_MARKER
-        + "<style>"
-        # Overlay-scrollbar trick so the scrollbar doesn't eat ~3 px
-        # from the inline axis and shrink the column to 717/vw-3.
-        "html{overflow-y:overlay}"
-        "html::-webkit-scrollbar{width:0}"
-        "html{width:100% !important;max-width:100% !important;"
-        "margin:0 !important;background:#fff !important}"
-        "body{width:100% !important;min-width:0 !important;"
-        "max-width:752px !important;margin:0 auto !important;"
-        "background:#fff !important;color:#000 !important}"
-        # Collapse flex ancestors so the right-layout wrapper sizes to
-        # its parent instead of being pinned by flex-basis rules.
-        ".layout-container,.page-content,.article-detail{"
-        "display:block !important;flex:unset !important;"
-        "width:100% !important;max-width:100% !important;"
-        "min-width:0 !important;min-height:0 !important;"
-        "margin:0 !important;padding:0 !important;"
-        "background:#fff !important}"
-        # Cap the main reading column.
-        ".right-layout.watermark-area{"
-        "float:none !important;display:block !important;"
-        "flex:unset !important;"
-        "width:auto !important;max-width:752px !important;"
-        "margin:0 auto !important;"
-        "padding:56px 16px !important;"
-        "box-sizing:border-box !important;"
-        "background:#fff !important}"
-        # Clamp descendants so no inline fixed width overflows.
-        ".right-layout.watermark-area *{"
-        "max-width:100% !important;min-width:0 !important}"
-        # Tables have intrinsic min-content width that beats max-width;
-        # force fixed layout so wide data tables honor the column cap.
-        ".right-layout.watermark-area table{"
-        "table-layout:fixed !important;width:100% !important;"
-        "word-break:break-word !important}"
-        # Expand the collapsed references accordion (inline style=display:none).
-        ".right-layout.watermark-area .article-references-list,"
-        ".article-references-list{display:block !important}"
-        # Zero first/last descendant margins so the 56 px padding is the
-        # only contributor to the top/bottom gaps. :root prefix beats the
-        # site's `.article-detail .right-layout .article{margin-bottom:2rem}`
-        # rule on the last article block (References).
-        # Zero margin-top only on the DIRECT first child (descendant
-        # form kills section headings' native top margin). For the
-        # bottom, the descendant *:last-child form is safe because
-        # section breaks rely on the following heading's margin-top,
-        # not on any preceding element's margin-bottom.
-        ":root .right-layout.watermark-area > *:first-child{"
-        "margin-top:0 !important;padding-top:0 !important}"
-        # Direct-child only — descendant `*:last-child{margin-bottom:0}`
-        # zeros the 2rem natural margin-bottom on article-info, so the
-        # following <h3>Abstract</h3> sits flush instead of 32 px below.
-        ":root .right-layout.watermark-area > *:last-child{"
-        "margin-bottom:0 !important;padding-bottom:0 !important}"
-        # Last LI inside the last article (article-references) has a
-        # 1rem margin-bottom that collapses up through UL → article and
-        # adds ~16 px to the wrapper's effective bottom edge.
-        ":root .right-layout.watermark-area > article:last-child "
-        "*:last-child{margin-bottom:0 !important}"
-        # Figures: `_imrpress_inline_figures` (get_refs.py post_capture)
-        # extracts the figN.jpg URL from elsewhere in the saved HTML and
-        # inlines it as a data URL on `<img id=S<sec>-F<N>-g1>` inside
-        # `<figure class=ipub-html-image>`. Native rendering centers the
-        # img at its intrinsic pixel dimensions, leaving a visibly
-        # narrower image than the caption column. Force block + 100%
-        # width so the figure aligns with caption width above the
-        # `<span class=ipub-html-label>` + caption `<p>`.
-        ":root .right-layout.watermark-area figure.ipub-html-image{"
-        "display:block !important;text-align:left !important;"
-        "margin:1rem 0 !important;padding:0 !important}"
-        ":root .right-layout.watermark-area figure.ipub-html-image img{"
-        "display:block !important;width:100% !important;"
-        "height:auto !important;max-width:100% !important;"
-        "margin:0 0 5px 0 !important}"
+        "<style>"
+        # Step 1 / Step 6 — lock layout to 752 px, center, white bg.
+        "html{margin:0!important;padding:0!important;"
+        "background:#fff!important;}"
+        "body{max-width:752px!important;width:auto!important;"
+        "min-width:0!important;"
+        "margin:0 auto!important;padding:0 16px!important;"
+        "box-sizing:border-box!important;"
+        "background:#fff!important;"
+        "overflow-wrap:break-word!important;word-wrap:break-word!important;}"
+        # Page-wide IMR Press wrappers ship max-width:1200px and the
+        # `.article-detail` 60/40 sidebar/article split. Collapse to body.
+        # Force-white only on the body wrappers, NOT on .base-max-width-layout
+        # (that class is reused inside .classic-footer where the navy bg
+        # must stay).
+        ".layout-container,.page-content,.article-detail,"
+        ".right-layout"
+        "{width:auto!important;max-width:100%!important;"
+        "margin-left:auto!important;margin-right:auto!important;"
+        "padding-left:0!important;padding-right:0!important;"
+        "box-sizing:border-box!important;background:#fff!important;}"
+        ".base-max-width-layout"
+        "{width:auto!important;max-width:100%!important;"
+        "margin-left:auto!important;margin-right:auto!important;"
+        "padding-left:0!important;padding-right:0!important;"
+        "box-sizing:border-box!important;}"
+        # Footer keeps its navy bg but must respect body cap.
+        ".classic-footer{max-width:100%!important;width:auto!important;"
+        "box-sizing:border-box!important;}"
+        # Step 9 (Layer 2) — un-clamp the author row.
+        ".name-list.ellipsis-3-lines,.name-list"
+        "{-webkit-line-clamp:none!important;line-clamp:none!important;"
+        "overflow:visible!important;display:block!important;"
+        "max-height:none!important;}"
+        # Step 9 — ensure references list renders even if the inline
+        # style strip missed (defense in depth).
+        ".article-references-list{display:block!important;}"
+        ".article-info-container{display:block!important;}"
+        # Step 8 — figures: image above caption, image at column width.
+        "figure.ipub-html-image"
+        "{display:block!important;width:100%!important;"
+        "max-width:100%!important;margin:16px 0!important;"
+        "box-sizing:border-box!important;}"
+        "figure.ipub-html-image img"
+        "{display:block!important;width:100%!important;"
+        "max-width:100%!important;height:auto!important;"
+        "margin:0 auto 8px auto!important;}"
+        "figure.ipub-html-image .ipub-html-label,"
+        "figure.ipub-html-image p"
+        "{display:block!important;width:100%!important;"
+        "max-width:100%!important;margin:0 0 4px 0!important;}"
+        # The "Full Image" CTA button below each figure is publisher
+        # chrome but clutters reading; collapse without removing
+        # (parser ignores it via _wrap_figure_captions logic).
+        ".ipub-button{display:none!important;}"
+        # Tables: keep horizontal scroll wrapper at column width.
+        ".ipub-html-table-wrap"
+        "{max-width:100%!important;width:auto!important;"
+        "box-sizing:border-box!important;overflow-x:auto!important;}"
         "</style>"
     )
     if "</head>" in html:
@@ -551,6 +547,53 @@ def _slice_article(html, article_class):
     return html[m.end():pos]
 
 
+def _wrap_figure_captions(html):
+    """Inject a <figcaption> into each IMR Press <figure> so extract_captions
+    can pull the label + description.
+
+    IMR Press emits figures as:
+      <figure ...>
+        <img ...>
+        <span class=ipub-html-label>Fig. N.</span>
+        <p><strong>Title</strong>. Description.</p>
+        <div class=ipub-button>Full Image</div>
+      </figure>
+    No <figcaption> wrapper exists, so the shared extract_captions helper
+    drops the entire figure. Build a <figcaption> from the ipub-html-label
+    span plus every <p> inside the figure and inject it before </figure>.
+    """
+    def _build(m):
+        block = m.group(0)
+        # Pull label text (e.g. "Fig. 1.")
+        label = ""
+        lm = re.search(
+            r'<span[^>]*class="?ipub-html-label"?[^>]*>(.*?)</span>',
+            block, re.DOTALL,
+        )
+        if lm:
+            label = re.sub(r"\s+", " ", strip_tags(lm.group(1))).strip()
+        # Pull every <p>...</p> body inside the figure
+        paras = []
+        for pm in re.finditer(r"<p[^>]*>(.*?)</p>", block, re.DOTALL):
+            inner = re.sub(r"\s+", " ", strip_tags(pm.group(1))).strip()
+            if inner:
+                paras.append(inner)
+        caption = label
+        if paras:
+            caption = (caption + " " + " ".join(paras)).strip()
+        if not caption:
+            return block
+        # Inject <figcaption> just before </figure>
+        return re.sub(
+            r"</figure>",
+            f"<figcaption>{caption}</figcaption></figure>",
+            block, count=1,
+        )
+    return re.sub(
+        r"<figure\b[^>]*>.*?</figure>", _build, html, flags=re.DOTALL,
+    )
+
+
 def _parse_main_text(html):
     """Assemble main_text from abstract + keywords + article content.
 
@@ -605,6 +648,7 @@ def _parse_main_text(html):
             flags=re.DOTALL,
         )
         body_html = _strip_inline_formulas(body_html)
+        body_html = _wrap_figure_captions(body_html)
         body_html = extract_captions(body_html)
         body_html = strip_common(body_html)
         body_html = re.sub(

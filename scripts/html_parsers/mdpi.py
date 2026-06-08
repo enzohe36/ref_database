@@ -4,7 +4,6 @@ import re
 from html import unescape
 
 from ._helpers import (
-    _remove_nested_element,
     drop_noise,
     extract_captions,
     format_author_name,
@@ -13,11 +12,105 @@ from ._helpers import (
     neutralize_media_queries,
     parse_meta_authors,
     remove_elements_by_id,
-    remove_elements_by_selector,
     strip_common,
     strip_tags,
     tags_to_text,
 )
+
+# Phase 2 layout override. See remove_banners.
+_OVERRIDE_CSS = """<style>
+:root, html, body { background: white !important; }
+body {
+    max-width: 752px !important;
+    margin: 0 auto !important;
+    padding: 0 !important;
+    background: white !important;
+}
+:root article.bright {
+    width: auto !important;
+    max-width: 100% !important;
+    margin: 0 !important;
+    padding: 56px 16px !important;
+    background: white !important;
+    box-sizing: border-box !important;
+    float: none !important;
+    line-height: 1.5em !important;
+    font-size: 110% !important;
+}
+/* Neutralize the MDPI two-column wrapper so the article column fills the
+   body cap rather than sitting at large-9. */
+:root .html-content__container,
+:root .content__container,
+:root .content__column,
+:root .middle-column__main,
+:root .main-section,
+:root .page-highlight,
+:root .abstract_div,
+:root .row.full-width,
+:root #container,
+:root #main-content,
+:root #middle-column,
+html body #main-content .row-fixed-left-column #middle-column.large-9 {
+    width: auto !important;
+    max-width: 100% !important;
+    float: none !important;
+    margin: 0 !important;
+    padding: 0 !important;
+    background: white !important;
+}
+/* Hide the desktop-only left sidebar (Foundation .show-for-large-up which
+   should hide on small/medium but the em-based @media gating slips past
+   neutralize_media_queries). */
+:root #left-column.show-for-large-up,
+:root .show-for-large-up {
+    display: none !important;
+}
+/* Site top-bar chrome ships with position:absolute and an explicit pixel
+   width that overflows the body cap; constrain it to the body envelope. */
+:root .top-bar.bright,
+:root .html-profile-nav,
+:root .html-profile-nav.bright,
+:root .html-profile-nav.affix-top {
+    position: static !important;
+    width: 100% !important;
+    max-width: 100% !important;
+    margin-left: 0 !important;
+    margin-right: 0 !important;
+    box-sizing: border-box !important;
+}
+/* Figure layout: high-res image above caption, full column width. */
+:root article.bright .html-fig-wrap,
+:root article.bright .html-fig-wrap > *,
+:root article.bright .html-fig-wrap .html-fig_img,
+:root article.bright .html-fig-wrap .html-figpopup,
+:root article.bright .html-fig-wrap .html-figpopup-link {
+    display: block !important;
+    width: 100% !important;
+    max-width: 100% !important;
+    text-align: left !important;
+    box-sizing: border-box !important;
+    float: none !important;
+    margin-left: 0 !important;
+    margin-right: 0 !important;
+}
+:root article.bright .html-fig-wrap img,
+:root article.bright .html-fig-wrap .html-fig_img img,
+:root article.bright .html-fig-wrap .html-figpopup img {
+    display: block !important;
+    width: 100% !important;
+    height: auto !important;
+    max-width: 100% !important;
+    margin: 0 0 5px 0 !important;
+}
+/* Caption sits beneath the image with a small gap. */
+:root article.bright .html-fig-wrap .html-fig_description {
+    display: block !important;
+    width: 100% !important;
+    max-width: 100% !important;
+    margin-top: 5px !important;
+    text-align: left !important;
+}
+</style>"""
 
 # Publisher-specific noise strings removed from main_text
 _NOISE = (
@@ -42,254 +135,19 @@ _SUPP_RE = re.compile(
 # ---------------------------------------------------------------------------
 
 def remove_banners(html):
-    """Normalize MDPI HTML to a single centered text column.
-
-    MDPI article pages wrap the reading content in `<article class=bright>`
-    which sits inside `#middle-column` (the Foundation grid column).
-    Siblings include `#left-column` (share / download / author cards),
-    a `.middle-column__help` floating altmetric/figures panel, and the
-    site `<header>`/`<footer>` plus the bottom-fixed cookie banner.
-    `<div id=big_right|big_left|small_right|small_left>` are the
-    fixed-position previous/next-article arrows that bracket the viewport
-    on wide screens.
-
-    Chrome stripped (Step 3):
-      - #big_right / #big_left / #small_right / #small_left (prev/next).
-      - Site <header> and <footer>.
-      - #cookie-notification (bottom banner).
-      - #usercentrics-cmp-ui (user-consent shadow DOM wrapper).
-      - #left-column (share / download / author-card sidebar).
-      - .middle-column__help (altmetric donut + "jump to" side panel).
-      - Trailing `.webpymol-controls-template` block that renders as
-        inline text after the article close.
-
-    Reading column (Step 4): `article.bright`.
-    """
-    # Lock layout to publisher's narrow (≤1024 px) form at any viewport.
+    """Strip MDPI site chrome and lock article column to the 720-px native form."""
     html = neutralize_media_queries(html)
-    # Step 3 — strip chrome.
+    # Cookie / consent CMP host (Usercentrics shadow-root host).
+    html = remove_elements_by_id(html, "usercentrics-cmp-ui")
+    # Sticky page-side navigation arrows (prev / next-article rails).
     html = remove_elements_by_id(
-        html,
-        "big_right", "big_left", "small_right", "small_left",
-        "cookie-notification",
-        "usercentrics-cmp-ui",
-        "left-column",
-        # MDPI's site footer is `<div id=footer>`, not `<footer>` — the
-        # HTML5 footer strip below misses it.
-        "footer",
-        # Foundation reveal-modal popups. My `display:block !important`
-        # rules on `.content__container` (a class used both inside and
-        # outside the article) override Foundation's default
-        # `.reveal-modal{display:none}`, so the menu / captcha / share
-        # / cite / RSS modals all render as page text above the
-        # article. Strip them by id.
-        "menuModal", "captchaModal", "rssNotificationModal",
-        "main-help-modal", "main-share-modal",
-        "cite-modal", "author-biographies-modal",
-        "recommended-articles-modal", "weixin-share-modal",
-    )
-    html = _remove_nested_element(html, r"<header\b[^>]*>")
-    html = _remove_nested_element(html, r"<footer\b[^>]*>")
-    # Mobile top bar (`<nav class="tab-bar show-for-medium-down">`):
-    # renders the MDPI logo, "toggle desktop layout", and "MDPI main
-    # page" hamburger. Sits OUTSIDE <header>/<section.main-section>.
-    html = _remove_nested_element(
-        html, r'<nav\b[^>]*\bclass="tab-bar show-for-medium-down"[^>]*>'
-    )
-    # .middle-column__help has its classes unquoted — helper can't
-    # target, so match directly.
-    for _ in range(3):
-        before = html
-        html = _remove_nested_element(
-            html,
-            r'<div\b[^>]*\bclass=middle-column__help\b[^>]*>',
-        )
-        if html == before:
-            break
-    # webpymol-controls template — UI affordance rendered as flowing text.
-    html = _remove_nested_element(
-        html,
-        r'<div\b[^>]*\bclass="webpymol-controls webpymol-controls-template"[^>]*>',
-    )
-    # Siblings of <article class=bright> inside the content container
-    # render above "Open Access Review" and break the start anchor:
-    #   .html-profile-nav — Download PDF / settings / Order Reprints
-    #   .html-article-menu — font/size/layout picker
-    # Both use unquoted class attrs; match each directly.
-    for cls in ("html-profile-nav", "html-article-menu"):
-        for _ in range(5):
-            before = html
-            html = _remove_nested_element(
-                html, rf'<div\b[^>]*\bclass=["\']?{cls}\b[^>]*>'
-            )
-            if html == before:
-                break
-    # JSmol modal (empty iframe wrapper) sits just before the article.
-    html = remove_elements_by_id(html, "jmolModal")
-    # `.highlight-box1` — the action-button row inside the article
-    # (Download / Browse Figures / Versions & Notes). All three require
-    # JavaScript dropdowns that don't work in a static snapshot; the
-    # row renders as broken bare text. Strip.
-    for _ in range(3):
-        before = html
-        html = _remove_nested_element(
-            html, r'<div\b[^>]*\bclass=highlight-box1\b[^>]*>'
-        )
-        if html == before:
-            break
-    # `.additional-content` sits inside article.bright after the copyright
-    # line and holds "Share and Cite" + article-stats charts (including
-    # the "Multiple requests from the same IP" disclaimer). Per the
-    # notes, main text ends at the copyright line, so drop it.
-    for _ in range(3):
-        before = html
-        html = _remove_nested_element(
-            html,
-            r'<div\b[^>]*\bclass=additional-content\b[^>]*>',
-        )
-        if html == before:
-            break
-
-    # Steps 2 + 4 — layout freeze and reading-column cap.
-    override = (
-        "<style>"
-        "html{overflow-y:overlay}"
-        "html::-webkit-scrollbar{width:0}"
-        "html{width:100% !important;max-width:100% !important;"
-        "margin:0 !important;background:#fff !important}"
-        "body{width:100% !important;min-width:0 !important;"
-        "max-width:752px !important;margin:0 auto !important;"
-        "padding:0 !important;"
-        "background:#fff !important;color:#000 !important}"
-        ":root body{padding:0 !important;margin:0 auto !important}"
-        # Collapse Foundation wrappers between body and article.bright.
-        # Use `:root` + the site's own selector chain for the middle
-        # column so we beat the @media(min-width:74.375em) rule that
-        # otherwise reserves 316 px of left-column space.
-        ".main-section,#main-content,#middle-column,"
-        ".middle-column__main,.content__container,"
-        "article.bright .row,article.bright [class*='columns']{"
-        "display:block !important;float:none !important;"
-        "width:100% !important;max-width:100% !important;"
-        "min-width:0 !important;margin:0 !important;padding:0 !important;"
-        "box-sizing:border-box !important;"
-        "background:#fff !important}"
-        ":root #main-content .row-fixed-left-column #middle-column,"
-        ":root #main-content .row-fixed-left-column #middle-column.large-9{"
-        "width:100% !important;float:none !important}"
-        # `.html-content__container content__container ...` (direct parent
-        # of article.bright) has `margin-bottom:16px` that extends docH
-        # past the 56-px wrapper padding. The site rule is
-        # `#main-content #middle-column .middle-column__main
-        # .content__container:last-of-type{margin-bottom:16px!important}`
-        # — match that exact specificity chain to beat it.
-        ":root #main-content #middle-column .middle-column__main .content__container:last-of-type,"
-        ":root div.html-content__container,"
-        ":root div.content__container,"
-        ":root [class*='content__container__combined-for-large']{"
-        "margin:0 !important;padding:0 !important}"
-        # #container ships `margin-top:50px` at vw < 1190 (to clear the
-        # site's fixed header); the header is removed, so zero it.
-        ":root #container{margin-top:0 !important}"
-        # Cap the reading column.
-        "article.bright{"
-        "float:none !important;display:block !important;"
-        "width:auto !important;max-width:752px !important;"
-        "margin:0 auto !important;"
-        "padding:56px 16px !important;"
-        "box-sizing:border-box !important;"
-        "background:#fff !important}"
-        "article.bright *{"
-        "max-width:100% !important;min-width:0 !important}"
-        "article.bright table{"
-        "table-layout:fixed !important;width:100% !important;"
-        "word-break:break-word !important}"
-        # `<section class=html-fn_group>` wraps the Disclaimer /
-        # Publisher's Note in a malformed 2-empty-td table. The native
-        # layout relies on auto table sizing — the first empty td
-        # collapses to ~0 and the second td (with the text) spans the
-        # full width. `table-layout:fixed` would split them 50/50.
-        # Re-enable auto layout specifically for this section.
-        "article.bright .html-fn_group table{"
-        "table-layout:auto !important;width:100% !important}"
-        # Direct-child only on both ends — the descendant
-        # `*:last-child{margin-bottom:0; padding-bottom:0}` form was
-        # zeroing the publisher's natural margin-bottom:20 on the
-        # disclaimer's inner table (which spaces it from the copyright
-        # block) and padding-bottom:5 on the TD that wraps the
-        # disclaimer text.
-        ":root article.bright > *:first-child{"
-        "margin-top:0 !important;padding-top:0 !important}"
-        # Structural last-child chain (6 levels) — zeros margin/padding-
-        # bottom only on the chain of "absolute last" descendants of the
-        # wrapper, not every nested last-child. Preserves publisher
-        # margins on middle sections (e.g. Disclaimer's table.mb=20)
-        # while still enforcing B=56 on the final trailing element.
-        ":root article.bright > *:last-child,"
-        ":root article.bright > *:last-child > *:last-child,"
-        ":root article.bright > *:last-child > *:last-child > *:last-child,"
-        ":root article.bright > *:last-child > *:last-child > *:last-child > *:last-child,"
-        ":root article.bright > *:last-child > *:last-child > *:last-child > *:last-child > *:last-child,"
-        ":root article.bright > *:last-child > *:last-child > *:last-child > *:last-child > *:last-child > *:last-child"
-        "{margin-bottom:0 !important;padding-bottom:0 !important}"
-        # h3.html-italic (subsection headings "2.2 ...") ships
-        # margin-top:7.15px. In the native HTML that margin doesn't
-        # collapse with the preceding section's margin-bottom (a site
-        # wrapper prevents collapsing via its padding), yielding a 14 px
-        # gap. After our container-zero pass the margins collapse to
-        # max=7 px. Bumping the heading's own margin-top to 14 px
-        # restores the raw visual rhythm regardless of collapsing.
-        ":root article.bright h3.html-italic{"
-        "margin-top:14px !important}"
-        # jQuery-UI inserts hundreds of `.ui-helper-hidden-accessible`
-        # stubs at absolute y≈docH-1; they're 1×1 but they extend the
-        # document height by ~10 px because position:absolute with
-        # non-zero top contributes to scrollHeight. Hide them.
-        ".ui-helper-hidden-accessible{display:none !important}"
-        # Figures: mdpi wraps each figure in
-        #   <div class=html-fig-wrap id=<journal>-<vol>-<id>-f<N>>
-        #     <div class=html-fig_img>
-        #       <div class=html-figpopup>
-        #         <img src="data:..." data-large=<HIRES_URL>
-        #              data-original=<HIRES_URL> data-lsrc=<MEDIUM_URL>>
-        #       </div>
-        #       <a class=html-expand html-figpopup>...</a>
-        #     </div>
-        #     <div class=html-fig_description><b>Figure N.</b>...</div>
-        # Native order: image above caption (correct). The interactive
-        # `.html-figpopup` overlay click-target adds chrome via JS
-        # (lightbox) — without JS the `<a class=html-expand>` corner is
-        # an empty pseudo-element box. Force the img to display:block
-        # at full column width and hide the expand corner.
-        ":root article.bright .html-fig-wrap{"
-        "margin:1rem 0 !important;padding:0 !important;"
-        "width:100% !important;max-width:100% !important;"
-        "float:none !important}"
-        ":root article.bright .html-fig_img{"
-        "display:block !important;margin:0 !important;padding:0 !important;"
-        "width:100% !important;max-width:100% !important}"
-        ":root article.bright .html-figpopup{"
-        "display:block !important;margin:0 !important;padding:0 !important;"
-        "width:100% !important;max-width:100% !important;"
-        "cursor:default !important}"
-        ":root article.bright .html-fig_img img{"
-        "display:block !important;width:100% !important;"
-        "height:auto !important;max-width:100% !important;"
-        "margin:0 0 5px 0 !important}"
-        # Expand-corner pseudo-button (non-functional without JS).
-        ":root article.bright a.html-expand{display:none !important}"
-        "</style>"
+        html, "small_left", "small_right", "big_left", "big_right",
     )
     if "</head>" in html:
-        html = html.replace("</head>", override + "</head>", 1)
+        html = html.replace("</head>", _OVERRIDE_CSS + "</head>", 1)
     else:
-        html = re.sub(r"(<body\b)", override + r"\1", html, count=1)
+        html = re.sub(r"(<body\b)", _OVERRIDE_CSS + r"\1", html, count=1)
     return html
-
-
-# ---------------------------------------------------------------------------
-# Metadata
-# ---------------------------------------------------------------------------
 
 def _parse_metadata(html):
     """Extract bundled metadata: title, journal, year, volume, issue, pages, doi.

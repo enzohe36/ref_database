@@ -2,24 +2,39 @@
 """Convert in-text citation stems to readable form and update the References section.
 
 Usage:
-    python cite_refs.py <document.md>
+    python cite_refs.py <document.md>                # Author-Year mode (default)
+    python cite_refs.py --numbered <document.md>     # Numeric mode
 
-Project resolution: cwd-based. Must be run from inside a projects/<name>/
-subtree (errors out otherwise — the auto-add step requires a project).
+Runs from anywhere — no project context needed. Citation lookup is global:
+papers/parsed/<stem>.json is read directly regardless of which project the
+cited paper "belongs to".
 
-Behavior:
-  1. Scan the document for in-text stems and convert each to its in-text
-     citation form ("LastName YYYY" / "LastName & LastName YYYY" /
-     "LastName et al. YYYY").
-  2. Detect the "References" section. Create one at the end if absent.
-  3. Add a full citation for each cited stem to the References section.
-  4. Sort all entries in the References section alphabetically (including
-     any pre-existing entries), then renumber.
-  5. For every cited PMID not already in projects/<name>/pmids.txt, append
-     it to the project's pmids list.
+Input citation format:
+  An in-text citation is a literal stem (basename of papers/parsed/<stem>.json,
+  e.g. `Cao_2024_Nature_38123456`). Stems may appear bare, in parens
+  `(StemA; StemB)`, or in brackets `[StemA; StemB]`, with multiple stems
+  separated by `; `. Stem regex allows compound surnames
+  (`Robin_Jagerschmidt_…`, `Tecalco_Cruz_…`) via
+  `[A-Z][a-z]+(?:_[A-Z][a-zA-Z]*)*_[0-9]{4}_…_[0-9]+`.
 
-Citation lookup source: papers/parsed/<stem>.json globally. A cited stem
-may correspond to a paper in any project (or an orphan).
+Default (Author-Year) mode:
+  1. Replace each stem with its in-text form ("LastName YYYY" /
+     "LastName & LastName YYYY" / "LastName et al. YYYY").
+  2. Build or update the "References" section. Existing entries are parsed
+     regardless of their format (numbered list, bulleted list, or plain
+     paragraphs). New citations are merged with existing entries by PMID
+     (re-rendering any whose PMID is now cited), sorted alphabetically,
+     and emitted as plain paragraphs separated by blank lines. Pre-existing
+     entries with no live citation are preserved verbatim.
+
+--numbered mode:
+  1. Replace each stem with its citation number in order of first appearance,
+     preserving surrounding brackets and `; ` separators —
+     `[StemA; StemB; StemC]` becomes `[1; 2; 3]`.
+  2. Rebuild the "References" section as a numbered list in appearance order.
+     Orphan entries from a pre-existing References section are dropped; a
+     warning is emitted if a dropped entry's "Author YYYY" form is still
+     present in the body (signal of a mixed-style citation worth fixing).
 """
 
 import argparse
@@ -28,17 +43,14 @@ import re
 import sys
 from pathlib import Path
 
-from _project import (
-    add_pmids_to_project,
-    current_project_from_cwd,
-    parsed_path,
-)
+from _project import parsed_path, pmid_to_stem
 
 
-STEM_RE = re.compile(r"\b([A-Z][a-zA-Z]*(?:_[A-Z][a-zA-Z]*)*_\d{4}_[\w]+_\d+)\b")
+STEM_RE = re.compile(r"\b([A-Za-z][a-zA-Z]*(?:_[A-Za-z][a-zA-Z]*)*_\d{4}_[\w]+_\d+)\b")
 REFERENCES_HEADER_RE = re.compile(r"^##\s*References\s*$", re.MULTILINE)
-NUMBERED_ENTRY_RE = re.compile(r"^\s*\d+\.\s+", re.MULTILINE)
 PMID_IN_ENTRY_RE = re.compile(r"PMID:\s*(\d+)", re.IGNORECASE)
+NUMBERED_LEAD_RE = re.compile(r"^\s*\d+\.\s+")
+BULLET_LEAD_RE = re.compile(r"^\s*-\s+")
 
 
 def derive_pmid(stem):
@@ -103,20 +115,40 @@ def _load_parsed(stem):
 
 
 def _split_existing_section(text):
-    r"""Return (body_before_references, existing_entries[]).
+    """Return (body_before_references, existing_entries[]).
 
-    Existing entries are extracted by splitting the post-"## References"
-    body on numbered list markers (^\d+\.\s+). Trims trailing whitespace
-    on each entry. Returns ([], []) if no References section found.
+    Handles three input formats for the existing References section so the
+    script can round-trip its own output regardless of which mode produced it:
+      - Numbered list (`1. ...`, `2. ...`)
+      - Bulleted list (`- ...`)
+      - Plain paragraphs separated by blank lines
+    Leading markers are stripped from each returned entry. Returns
+    (text, []) if no References section is found.
     """
     m = REFERENCES_HEADER_RE.search(text)
     if not m:
         return text.rstrip() + "\n", []
     body = text[:m.start()].rstrip() + "\n"
-    after = text[m.end():]
-    # Split on numbered markers
-    pieces = re.split(r"\n\s*\d+\.\s+", "\n" + after)
-    entries = [p.strip() for p in pieces[1:] if p.strip()]
+    after = text[m.end():].strip("\n")
+    if not after:
+        return body, []
+
+    entries = []
+    for block in re.split(r"\n\s*\n", after):
+        block = block.strip("\n")
+        if not block.strip():
+            continue
+        first_line = block.lstrip().splitlines()[0]
+        if NUMBERED_LEAD_RE.match(first_line):
+            pieces = re.split(r"(?m)^\s*\d+\.\s+", block)
+        elif BULLET_LEAD_RE.match(first_line):
+            pieces = re.split(r"(?m)^\s*-\s+", block)
+        else:
+            pieces = [block]
+        for p in pieces:
+            p = p.strip()
+            if p:
+                entries.append(p)
     return body, entries
 
 
@@ -130,15 +162,50 @@ def _pmid_of(entry_text):
     return m.group(1) if m else None
 
 
-def convert(text):
-    """Return (new_text, cited_pmids_in_appearance_order)."""
+def _author_year_form_from_entry(entry_text):
+    """Best-effort 'Author YYYY' form for a free-text References entry.
+
+    Extract the PMID, resolve it to a stem, load parsed/<stem>.json, and
+    rebuild the in-text form. Returns None if any step fails.
+    """
+    pmid = _pmid_of(entry_text)
+    if not pmid:
+        return None
+    stem = pmid_to_stem(pmid)
+    if not stem:
+        return None
+    entry = _load_parsed(stem)
+    if entry is None:
+        return None
+    return in_text_form(entry)
+
+
+def _warn_missing(missing):
+    if not missing:
+        return
+    names = ", ".join(missing[:5])
+    more = "" if len(missing) <= 5 else f" (+{len(missing) - 5} more)"
+    print(f"warning: {len(missing)} stem(s) missing parsed/<stem>.json: {names}{more}",
+          file=sys.stderr)
+
+
+def _assemble(new_body, refs_body):
+    """Glue the converted body and the rendered References section together."""
+    if refs_body:
+        return new_body.rstrip() + "\n\n## References\n\n" + refs_body + "\n"
+    return new_body.rstrip() + "\n\n## References\n"
+
+
+def _convert_author_year(text):
+    """Default mode: stems -> 'Author YYYY'; refs as alphabetical paragraphs."""
+    body_with_refs, existing_entries = _split_existing_section(text)
+
     seen_stems = []
     seen_set = set()
     missing = []
 
     def _replace(match):
         stem = match.group(1)
-        pmid = derive_pmid(stem)
         entry = _load_parsed(stem)
         if entry is None:
             missing.append(stem)
@@ -148,14 +215,8 @@ def convert(text):
             seen_stems.append(stem)
         return in_text_form(entry)
 
-    body_with_refs, existing_entries = _split_existing_section(text)
     new_body = STEM_RE.sub(_replace, body_with_refs)
-
-    if missing:
-        names = ", ".join(missing[:5])
-        more = "" if len(missing) <= 5 else f" (+{len(missing) - 5} more)"
-        print(f"warning: {len(missing)} stem(s) missing parsed/<stem>.json: {names}{more}",
-              file=sys.stderr)
+    _warn_missing(missing)
 
     new_entries_by_pmid = {}
     cited_pmids = []
@@ -165,12 +226,11 @@ def convert(text):
         entry = _load_parsed(stem)
         if entry is None:
             continue
-        cite = f"{full_citation(entry)} PMID: {pmid}."
-        new_entries_by_pmid[pmid] = cite
+        new_entries_by_pmid[pmid] = f"{full_citation(entry)} PMID: {pmid}."
 
-    # Build merged entries list. Existing entries with a PMID we already
-    # have a freshly-built citation for are replaced (keeps formatting
-    # consistent); other existing entries are preserved verbatim.
+    # Existing entry with a now-cited PMID is replaced (keeps formatting
+    # consistent); other existing entries are preserved verbatim. New
+    # entries with no matching existing entry are appended.
     merged = []
     seen_pmids = set()
     for ent in existing_entries:
@@ -187,38 +247,87 @@ def convert(text):
 
     merged.sort(key=_entries_sort_key)
 
-    refs_section = ["", "## References", ""]
-    for i, ent in enumerate(merged, start=1):
-        refs_section.append(f"{i}. {ent}")
+    refs_body = "\n\n".join(merged)
+    return _assemble(new_body, refs_body), cited_pmids
 
-    new_text = new_body.rstrip() + "\n" + "\n".join(refs_section) + "\n"
-    return new_text, cited_pmids
+
+def _convert_numbered(text):
+    """--numbered mode: stems -> integer labels; refs as appearance-ordered numbered list."""
+    body_with_refs, existing_entries = _split_existing_section(text)
+
+    ordered_stems = []
+    seen_set = set()
+    missing = []
+    for m in STEM_RE.finditer(body_with_refs):
+        stem = m.group(1)
+        if stem in seen_set:
+            continue
+        seen_set.add(stem)
+        if _load_parsed(stem) is None:
+            missing.append(stem)
+            continue
+        ordered_stems.append(stem)
+
+    _warn_missing(missing)
+
+    stem_to_num = {stem: i + 1 for i, stem in enumerate(ordered_stems)}
+
+    def _replace(match):
+        stem = match.group(1)
+        n = stem_to_num.get(stem)
+        return str(n) if n is not None else match.group(0)
+
+    new_body = STEM_RE.sub(_replace, body_with_refs)
+
+    cited_pmids_set = {derive_pmid(s) for s in ordered_stems}
+    for ent in existing_entries:
+        pmid = _pmid_of(ent)
+        if pmid and pmid in cited_pmids_set:
+            continue
+        ay = _author_year_form_from_entry(ent)
+        if ay and ay in new_body:
+            short = ent[:60] + ("..." if len(ent) > 60 else "")
+            print(f'warning: dropping existing References entry "{short}" but its '
+                  f'"{ay}" form still appears in the body — fix to a stem citation',
+                  file=sys.stderr)
+
+    refs_lines = []
+    for i, stem in enumerate(ordered_stems, start=1):
+        entry = _load_parsed(stem)
+        pmid = derive_pmid(stem)
+        refs_lines.append(f"{i}. {full_citation(entry)} PMID: {pmid}.")
+
+    refs_body = "\n".join(refs_lines)
+    return _assemble(new_body, refs_body), [derive_pmid(s) for s in ordered_stems]
+
+
+def convert(text, numbered=False):
+    """Return (new_text, cited_pmids_in_appearance_order)."""
+    if numbered:
+        return _convert_numbered(text)
+    return _convert_author_year(text)
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("file", type=Path, help="Document to convert (modified in place)")
+    parser.add_argument(
+        "--numbered", action="store_true",
+        help="Replace stems with citation numbers in first-appearance order "
+             "and emit References as a numbered list.",
+    )
     args = parser.parse_args()
-
-    project = current_project_from_cwd()
-    if not project:
-        print("error: cite_refs.py must be run from inside a projects/<name>/ subtree.",
-              file=sys.stderr)
-        sys.exit(1)
 
     if not args.file.exists():
         print(f"file not found: {args.file}", file=sys.stderr)
         sys.exit(1)
 
     text = args.file.read_text(encoding="utf-8")
-    new_text, cited_pmids = convert(text)
+    new_text, cited_pmids = convert(text, numbered=args.numbered)
 
     args.file.write_text(new_text, encoding="utf-8")
 
-    added = add_pmids_to_project(project, cited_pmids)
     print(f"converted {len(set(cited_pmids))} unique citations in {args.file}")
-    if added:
-        print(f"added {len(added)} new PMID(s) to project {project!r}: {', '.join(added)}")
 
 
 if __name__ == "__main__":

@@ -10,6 +10,7 @@ papers/parsed/<stem>.json in the locked schema. PMIDs whose
 papers/parsed/<stem>.json already exists are skipped (no re-fetch).
 
 A list arg is a file containing PMIDs separated by spaces or newlines.
+Lines starting with '#' inside a list are ignored (comments).
 PMIDs and lists can be mixed in the same invocation.
 
 This script does only metadata fetch. HTML retrieval, conversion,

@@ -10,8 +10,10 @@ from ._helpers import (
     format_author_name,
     format_doi,
     get_meta,
+    neutralize_media_queries,
     parse_meta_authors,
     remove_elements_by_id,
+    remove_elements_by_selector,
     strip_common,
     strip_tags,
     tags_to_text,
@@ -40,175 +42,211 @@ _SUPP_RE = re.compile(
 # Banner removal
 # ---------------------------------------------------------------------------
 
+_OVERRIDE_CSS = """<style>
+html, body { background: #ffffff !important; }
+body {
+    max-width: 752px !important;
+    width: auto !important;
+    margin: 0 auto !important;
+    padding: 0 16px !important;
+    box-sizing: border-box !important;
+    background: #ffffff !important;
+}
+/* PLOS pegs the article column at 980 px via:
+       main, #pagehdr      { width: 100%; min-width: 61.25rem;
+                             max-width: 61.25rem; margin: 0 auto; }
+       .set-grid           { width: 61.25rem; }
+   The min-width is what forces the column past the body cap — clear
+   it (and width / max-width) so each wrapper shrinks to its parent.
+   Same for the page footer's .row grid wrapper. */
+:root main,
+:root #main-content,
+:root #pagehdr,
+:root .set-grid,
+:root .plos-row,
+:root #pageftr .row,
+:root .row,
+:root .title-block,
+:root .article-body {
+    max-width: 100% !important;
+    width: auto !important;
+    min-width: 0 !important;
+    margin-left: 0 !important;
+    margin-right: 0 !important;
+    padding-left: 0 !important;
+    padding-right: 0 !important;
+    box-sizing: border-box !important;
+}
+/* The article column is `.article-content` floated left with a 12.5rem
+   `.article-aside` floated right (download / share / related). Drop the
+   float layout so the article column fills the body cap and the aside
+   stacks below at narrow widths. The title-block children
+   (`.article-title-etc` / `.title-authors` / `.classifications`) ship
+   the same fixed `width: 47.1875rem` (755 px) — flatten those too. */
+:root .article-content,
+:root .article-container,
+:root #artText,
+:root .article-aside,
+:root .article-title-etc,
+:root .title-authors,
+:root .classifications,
+:root #author-list,
+:root #artTitle,
+:root .date-doi,
+:root .center {
+    width: auto !important;
+    max-width: 100% !important;
+    min-width: 0 !important;
+    float: none !important;
+    margin-left: 0 !important;
+    margin-right: 0 !important;
+    box-sizing: border-box !important;
+}
+/* Embedded figshare data viewer ships its own viewer at fixed width
+   (550 px) that overflows the column at vw < 550. Cap it. */
+figshare-widget,
+figshare-widget * {
+    max-width: 100% !important;
+    box-sizing: border-box !important;
+}
+figshare-widget {
+    display: block !important;
+    width: 100% !important;
+}
+/* Step 11 — `.carousel-wrapper` (the figure-carousel above the article)
+   ships `overflow: hidden; width: 32rem (512px)` and a child
+   `.slider { width: 99999px }`. At vw < 528 (32rem + body padding) the
+   wrapper escapes the body cap; cap it to fit. */
+:root .carousel-wrapper {
+    width: auto !important;
+    max-width: 100% !important;
+    box-sizing: border-box !important;
+}
+/* Step 8 — figure layout: image above caption, image width-aligned with
+   caption, 8 px gap. PLOS markup is
+       <div class=figure data-doi=...>
+         <div class=img-box> <a> <img alt=thumbnail> </a> </div>
+         <div class=figure-inline-download> ... </div>
+         <div class=figcaption> ... </div>
+         <p class=caption_target> ... </p>
+   The img-box ships fixed pixel widths from the thumbnail (320 px) — let
+   it expand to the column. */
+:root .figure,
+:root .img-box,
+:root .img-box a {
+    display: block !important;
+    width: 100% !important;
+    max-width: 100% !important;
+    margin-left: 0 !important;
+    margin-right: 0 !important;
+    box-sizing: border-box !important;
+}
+:root .img-box img {
+    display: block !important;
+    width: 100% !important;
+    height: auto !important;
+    max-width: 100% !important;
+    margin: 0 0 8px 0 !important;
+}
+:root .figure .figcaption,
+:root .figure .caption_target {
+    display: block !important;
+    width: 100% !important;
+    margin: 4px 0 !important;
+}
+/* Tables ship a fixed pixel width. Cap to the column. */
+:root table,
+:root .table-wrap {
+    max-width: 100% !important;
+    width: auto !important;
+    table-layout: auto !important;
+    box-sizing: border-box !important;
+}
+</style>"""
+
+
 def remove_banners(html):
-    """Normalize PLOS HTML to a single centered text column.
+    """Apply Phase 2 layout rules for journals.plos.org.
 
-    Per format-html-extra.md the reading column starts at "Open Access
-    Peer-reviewed" and the left TOC (#nav-article) is stripped so the
-    body block reclaims its space. Removals fall into (a) instruction-
-    doc items, (b) ads, (c) toolbars. Non-chrome content
-    (#almSignposts metric badges, figure-lightbox modal, etc.) stays
-    in the DOM.
+    Step 1: cap body width at 752 px, center, neutralize @media so the
+            publisher's narrow CSS branch always applies.
+    Step 2: remove the `#cookie-consent` banner and the
+            `.reveal-modal-bg` modal backdrop sibling.
+    Step 3: sticky elements — `#hs-web-interactives-top-anchor` (the
+            HubSpot CTA injection anchor wrapper, `position: fixed`
+            top:0 full-viewport even when no CTA is rendered) and
+            `#floatTitleTop` (the publisher's scroll-triggered title
+            bar, `position: fixed` top:0 full-viewport-wide that pops
+            in once the user scrolls past the article header).
+    Step 5: ad blocks — `<div class=advertisement ...>` placeholders
+            inside the page header.
     """
-    # -------------------------------------------------------------------
-    # Step 3 — strip chrome.
-    # -------------------------------------------------------------------
-    # (a) instruction-doc items --------------------------------------
-    # Cookie banner + dark-filter overlay (#cookie-consent wraps both).
-    html = remove_elements_by_id(html, "cookie-consent")
-    # Left-side TOC (#nav-article). Kept in the DOM below via CSS
-    # display:none — its text ("Abstract Author Summary Introduction..."
-    # / "Reader Comments" / "Figures") is picked up by parse_main_text,
-    # so DOM removal would break JSON parity.
-    # Site footer (<footer id=pageftr>). Falls below the article
-    # wrapper in the formatted layout, so it's bottom chrome per
-    # "ends before bottom chrome".
-    html = _remove_nested_element(
-        html, r'<footer\b[^>]*\bid=["\']?pageftr\b',
-    )
-    # (c) toolbars ---------------------------------------------------
-    # Site <header>: top nav/search bar. First bare <header> (no class)
-    # is the site chrome; inner <header class=title-block> carries the
-    # article title and must stay.
-    html = _remove_nested_element(html, r"<header>")
-    # Filesviewer modal <header>/<footer>: figure-viewer modal chrome.
-    for _ in range(5):
-        before = html
-        html = _remove_nested_element(
-            html,
-            r'<header\b[^>]*\bclass="[^"]*frontend-filesViewer[^"]*"',
-        )
-        html = _remove_nested_element(
-            html,
-            r'<footer\b[^>]*\bclass="[^"]*frontend-filesViewer[^"]*"',
-        )
-        if html == before:
-            break
-    # Right-side <aside class=article-aside>: Download PDF / Cite /
-    # Share / Save / EndNote / Print action toolbar.
-    html = _remove_nested_element(
-        html,
-        r'<aside\b[^>]*\bclass=["\']?[^"\'>]*\barticle-aside\b',
-    )
-    # #figures-list: right-side figure-thumbnail navigation panel.
-    html = remove_elements_by_id(html, "figures-list")
-    # #almSignposts: Save / Citation / Views / Shares metrics widget
-    # that renders above the "Open Access Peer-reviewed" spec start
-    # anchor. The widget's first number (e.g. "75" Saves) became the
-    # first visible text at T=76, violating the start-anchor rule.
-    html = remove_elements_by_id(html, "almSignposts")
-    # #figure-carousel-section: dedicated "Figures" thumbnail carousel at
-    # the bottom of the article (duplicates the inline figures already
-    # embedded in the main text). Remove the whole section heading +
-    # carousel, not the individual in-text figures.
-    html = remove_elements_by_id(html, "figure-carousel-section")
+    html = neutralize_media_queries(html)
 
-    # -------------------------------------------------------------------
-    # Steps 2 + 4 — layout freeze and reading-column cap.
-    # -------------------------------------------------------------------
-    override = (
-        "<style>"
-        "html{width:100% !important;max-width:100% !important;"
-        "margin:0 !important;background:#fff !important}"
-        "body{width:100% !important;min-width:0 !important;"
-        "max-width:752px !important;margin:0 auto !important;"
-        "background:#fff !important;color:#000 !important}"
-        "main#main-content{"
-        "float:none !important;display:block !important;"
-        "width:100% !important;max-width:752px !important;"
-        # PLOS's main stylesheet sets `min-width: 61.25rem` (~980 px) on
-        # <main>, which forces the wrapper to overflow narrow viewports.
-        # Zero it so the cap holds.
-        "min-width:0 !important;"
-        # Override margin including negative right margin some PLOS
-        # stylesheets leave on <main>.
-        # padding-bottom trimmed by 30 to compensate for a ~30 px
-        # trailing margin-collapse gap between the last reference item
-        # and the zero-height final-section-spacer at the bottom of
-        # article-content. Target B = 56 px below the last rendered
-        # text baseline.
-        "margin:0 auto !important;padding:56px 16px 26px 16px !important;"
-        "box-sizing:border-box !important;background:#fff !important}"
-        # Collapse inner grid wrappers (.set-grid, .article-container)
-        # so main-content's children fill the wrapper.
-        ":root main#main-content .set-grid,"
-        ":root main#main-content .article-container,"
-        ":root main#main-content .article-content{"
-        "display:block !important;float:none !important;"
-        "width:auto !important;max-width:100% !important;"
-        "margin:0 !important;padding:0 !important}"
-        # Zero margin along the first-/last-descendant chain so
-        # collapsed margins don't leak through main's padding, while
-        # section titles deeper in the tree keep native margins.
-        "main#main-content>*:first-child,"
-        "main#main-content>*:first-child>*:first-child,"
-        "main#main-content>*:first-child>*:first-child>*:first-child,"
-        "main#main-content>*:first-child>*:first-child>*:first-child>*:first-child,"
-        "main#main-content>*:first-child>*:first-child>*:first-child>*:first-child>*:first-child,"
-        "main#main-content>*:first-child>*:first-child>*:first-child>*:first-child>*:first-child>*:first-child"
-        "{margin-top:0 !important}"
-        "main#main-content>*:last-child,"
-        "main#main-content>*:last-child>*:last-child,"
-        "main#main-content>*:last-child>*:last-child>*:last-child,"
-        "main#main-content>*:last-child>*:last-child>*:last-child>*:last-child,"
-        "main#main-content>*:last-child>*:last-child>*:last-child>*:last-child>*:last-child,"
-        "main#main-content>*:last-child>*:last-child>*:last-child>*:last-child>*:last-child>*:last-child"
-        "{margin-bottom:0 !important}"
-        # Clamp descendants so fixed-width tables/figures don't overflow.
-        "main#main-content *{max-width:100% !important;min-width:0 !important}"
-        "main#main-content table{table-layout:fixed !important;"
-        "width:100% !important}"
-        # PLOS closes the article body with a decorative spacer div
-        # (class=final-section-spacing, inline height ~357 px) that
-        # pushes the bottom gap well past the wrapper padding. Zero it.
-        "main#main-content .final-section-spacing{height:0 !important}"
-        # `.classifications` sits first-visible inside article-meta
-        # with margin-top:18 px, which collapses through the ancestor
-        # chain and pushes T past target. The first-descendant-chain
-        # selectors above don't reach it because script tags (hidden
-        # but still DOM children) short-circuit `*:first-child` at the
-        # title-block level. Zero classifications' top margin explicitly.
-        "main#main-content .classifications{margin-top:0 !important}"
-        # Hide (but keep in DOM) the left-side TOC + article-tabs list.
-        # Text content inside these elements is picked up by
-        # parse_main_text, so removal would break parity.
-        "main#main-content #nav-article,"
-        "main#main-content .article-tab-container,"
-        "main#main-content ul.nav-tabs{display:none !important}"
-        # almSignposts already removed from DOM above (not just hidden) —
-        # keeping it via display:none would block the first-descendant
-        # chain selectors from reaching the first-visible element.
-        # HubSpot interactives top anchor — full-viewport fixed overlay.
-        "#hs-web-interactives-top-anchor,"
-        "#hs-interactives-modal-overlay{display:none !important}"
-        # Figure images: a get_refs.py browser-script swaps `<img src>`
-        # from `size=inline` (320 px wide) to `size=large` (~1500-2000 px
-        # native), and `_plos_inline_figures` post_capture fills any that
-        # the browser-side fetch missed. Force the large image to fill
-        # the figure's caption width so figure aligns with caption.
-        # The publisher's `.img-box` wrapper hard-caps width to 20rem
-        # (320px); override to 100% so the wrapper fills the column,
-        # then `width:100%` on the img makes it fill the wrapper.
-        ":root main#main-content .figure .img-box{"
-        "display:block !important;"
-        "width:100% !important;max-width:100% !important;"
-        "margin:0 !important;padding:0 !important}"
-        ":root main#main-content .figure .img-box img,"
-        ":root main#main-content .figure img{"
-        "display:block !important;width:100% !important;"
-        "height:auto !important;margin:0 auto !important}"
-        "</style>"
+    # Step 2 — cookie consent banner and the paired modal backdrop.
+    # `.reveal-modal-bg` is the dark page-level overlay that ships with
+    # the consent dialog; it sits as a sibling of `#cookie-consent` at
+    # the top of <body>.
+    html = remove_elements_by_id(html, "cookie-consent")
+    html = remove_elements_by_selector(html, "reveal-modal-bg")
+
+    # Step 3 — HubSpot CTA injection anchors. The top-anchor element is
+    # `position: fixed` full-viewport (1200x900 at vw=1200) waiting for
+    # HubSpot to inject a floating call-to-action. Remove the entire
+    # family — top/bottom push/anchor + the floating-container with its
+    # four corner anchors — so none of them paint over the article.
+    html = remove_elements_by_id(
+        html,
+        "hs-web-interactives-top-push-anchor",
+        "hs-web-interactives-top-anchor",
+        "hs-web-interactives-bottom-anchor",
+        "hs-web-interactives-floating-container",
+        "floatTitleTop",
     )
+
+    # Step 5 — ad placeholders. PLOS ships a 728x90 ad slot in the page
+    # header and a 160x600 ad slot in the article aside, both as
+    # `<div class=advertisement id=div-gpt-ad-...>` (unquoted attrs).
+    # The aside also wraps the 160x600 ad in a `<div class=skyscraper-container>`
+    # which keeps reserving 624 px of vertical chrome even after the
+    # inner ad div is removed; drop the wrapper too.
+    while True:
+        prev = html
+        html = _remove_nested_element(
+            html, r'<div[^>]*\bclass=(?:"advertisement"|advertisement\b)[^>]*>',
+        )
+        if html == prev:
+            break
+    while True:
+        prev = html
+        html = _remove_nested_element(
+            html,
+            r'<div[^>]*\bclass=(?:"skyscraper-container"|skyscraper-container\b)[^>]*>',
+        )
+        if html == prev:
+            break
+
+    # Step 10 cleanup — `<div class=final-section-spacing style=height:NNNpx>`
+    # is a JS-injected spacer that pads the article-content column to
+    # match the (taller) article-aside sidebar in the publisher's
+    # 2-column desktop layout. With the aside un-floated and stacked
+    # below the article (Step 1), the spacer becomes a 365 px empty
+    # band between the references and the aside; remove it.
+    while True:
+        prev = html
+        html = _remove_nested_element(
+            html,
+            r'<div[^>]*\bclass=(?:"final-section-spacing"|final-section-spacing\b)[^>]*>',
+        )
+        if html == prev:
+            break
+
     if "</head>" in html:
-        html = html.replace("</head>", override + "</head>", 1)
+        html = html.replace("</head>", _OVERRIDE_CSS + "</head>", 1)
     else:
-        html = re.sub(r"(<body\b)", override + r"\1", html, count=1)
+        html = re.sub(r"(<body\b)", _OVERRIDE_CSS + r"\1", html, count=1)
     return html
 
-
-# ---------------------------------------------------------------------------
-# Metadata
-# ---------------------------------------------------------------------------
 
 def _parse_metadata(html):
     """Extract bundled metadata: title, journal, year, volume, issue, pages, doi.

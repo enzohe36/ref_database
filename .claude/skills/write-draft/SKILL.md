@@ -10,6 +10,10 @@ The skill compiles a fully-written prose draft from an existing outline at `proj
 
 The skill is **project-scoped**. All state lives under `projects/<name>/`. The outline must be inside a project subtree.
 
+## Citation format
+
+A citation is the literal `stem` value (basename of `papers/parsed/<stem>.json`, e.g. `Cao_2024_Nature_38123456`), preserved verbatim from the outline. When auto-revision swaps a citation in Step 5, the replacement is the `stem` field from the new `search_refs.py` result — copied verbatim, no conversion or shortening.
+
 ## When to invoke
 
 User says: "write a draft", "compile the draft", "draft the review", "convert outline.md to prose", "write the review based on outline", "draft each section".
@@ -100,7 +104,7 @@ For each cited bullet in the outline, perform a claim-vs-source check:
 For each bullet whose claim does not match its cited source, generate an auto-revision:
 
 - **Tighten**: trim the claim to what the paper actually supports. Keep the citation.
-- **Replace citation**: if the paper does not support the headline at all but a different paper in the corpus does, switch the citation. Find candidates via `python search_refs.py "<claim keywords>"`.
+- **Replace citation**: if the paper does not support the headline at all but a different paper in the corpus does, switch the citation. Find candidates via `python scripts/search_refs.py "<claim keywords>"` — run from inside `projects/<name>/` so it queries the project's chroma collection (the project-scoped corpus is the right candidate pool for replacement, not `_global`).
 - **Drop**: if no corpus paper supports the headline, drop the bullet entirely.
 
 Apply each revision directly to `outline.md`. Log every change to `projects/<name>/revisions_applied.md` with three fields:

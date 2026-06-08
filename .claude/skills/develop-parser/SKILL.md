@@ -1,6 +1,6 @@
 ---
 name: develop-parser
-description: Two-phase contract for developing or modifying an HTML parser module in scripts/html_parsers/. Phase 1 (parse_html) implements parse_article against unmodified HTML and produces a JSON parity reference. Phase 2 (format_html) implements remove_banners and must preserve bit-identical JSON output. Use when adding a new publisher parser, extending an existing parser to a new alias, or modifying a parser.
+description: Two-phase contract for developing or modifying an HTML parser module in scripts/html_parsers/. Phase 1 (parse_html) implements parse_article against unmodified HTML and produces a JSON parity reference. Phase 2 (format_html) implements remove_banners and must preserve bit-identical JSON output. Use when adding a new publisher parser or modifying an existing one.
 paths: scripts/html_parsers/**/*.py, papers/test/**
 ---
 
@@ -66,20 +66,17 @@ Applies to both `_parse_authors` and `_parse_references`. The contract is the mo
 
 Forbidden patterns inside parsers (greppable): inline `re.split(...)` applied to author names, `p[0] for p in ...split()` for initials, bespoke surname-flip helpers, per-parser `_PARTICLES` / `_NAME_PARTICLES` / `_SURNAME_PREFIXES` sets.
 
-### Aliases
+### One parser per publisher
 
-A parser may serve multiple second-level domains via `_DOMAIN_ALIASES` in `scripts/html_parsers/__init__.py`. The aliases for a parser are: the canonical name (the parser's filename) plus every key in `_DOMAIN_ALIASES` whose value is the canonical name.
-
-The test pool must include at least 3 HTMLs from each alias. Applies to new-parser development, alias extension (adding a key to `_DOMAIN_ALIASES`), and modifications to an existing parser.
+Every publisher gets a dedicated parser module at `scripts/html_parsers/<second_level_domain>.py`. There is no alias mechanism — `detect_domain` returns the raw second-level domain unchanged.
 
 ## Bootstrap
 
 Before Phase 1:
 
-1. Enumerate the parser's aliases (canonical name + every `_DOMAIN_ALIASES` key whose value is the canonical name).
-2. Confirm `papers/raw/` contains at least 3 HTMLs with complete content (all sections, figures, references) per alias. If any alias falls short, ask the user to fetch more before continuing.
-3. Copy 3 HTMLs per alias into `papers/test/<stem>.html`. Flat layout — no per-alias subfolders.
-4. For a brand-new parser, copy `scripts/html_parsers/_template.py` to `scripts/html_parsers/<sld>.py` and update the module docstring. For an existing parser being modified, skip this step.
+1. Confirm `papers/raw/` contains at least 3 HTMLs with complete content (all sections, figures, references) for the publisher. If fewer than 3, ask the user to fetch more before continuing.
+2. Copy the 3 HTMLs into `papers/test/<stem>.html`. Flat layout — no subfolders.
+3. For a brand-new parser, copy `scripts/html_parsers/_template.py` to `scripts/html_parsers/<sld>.py` and update the module docstring. For an existing parser being modified, skip this step.
 
 ## Phase 1 — parse_html
 
@@ -153,47 +150,125 @@ Layer 4 — snapshot for Phase 2 parity:
 
 - Once a clean final round lands, copy each test paper's `_converted.json` to `/tmp/<stem>.ref.json`. These snapshots are the bit-identical-diff baseline for Phase 2.
 
+**IMPORTANT!** If a publisher's HTML files are all confirmed to be abstract-only (no full text, no figures, no references), skip Phase 2 entirely. Flag this issue when reporting verification results.
+
 ## Phase 2 — format_html
 
-Goal: lock the page to its native 720-px-width layout, apply the explicit margins, and remove only the chrome categories listed below. Preserve native typography. Preserve all other site content; do not pre-emptively strip headers, footers, breadcrumbs, related articles, post-article CTAs, etc. After the hard requirements are met, hand off to the user for inspection — the user identifies any additional content to remove.
+Goal: lock the page to its native 720-px-wide layout, apply the publisher-specific cleanup needed for clean reading, and resolve any image/spacing issues before snapshotting parity. Work step-by-step in the order below. Each step has detection criteria and a clear "what to remove or change" rule — implementation (selectors, CSS, regex) is the developer's judgement; do not import from sibling parser modules.
 
-### Hard requirements
+### Setup
 
-The only changes allowed without explicit user direction:
+Open the test HTML in a fresh Edge instance with CDP enabled (`--remote-debugging-port=PORT --remote-allow-origins=*`). After each change to `remove_banners`, apply it, write the result to a sibling `<stem>.formatted.html`, and reload Edge. All inspection runs via CDP.
 
-1. Lock rendering to the publisher's native 720-px-width layout. Apply a body cap (max-width:752px, margin:0 auto, white background). If the publisher's desktop-layout media queries still fire at wider viewports, call `neutralize_media_queries(html)` from `_helpers` to rewrite every `<style>` block so the narrow-form CSS applies unconditionally.
-2. Main reading column margins: 56 px top/bottom, 16 px left/right. Apply via `padding: 56px 16px` on the highest common ancestor of title + authors + affiliations + abstract + body + figures + references.
-3. Remove cookie banner AND any associated dark/semitransparent overlay. The overlay is often a separate sibling element rendered as a fixed/absolute backdrop — both must go.
-4. Remove colored backgrounds. Any background-color that isn't white or transparent and isn't a figure/table border is in scope.
-5. Remove sticky elements. Verify `position: sticky` or `position: fixed` via computed styles before removing — do not remove based on naming alone.
-6. Remove side blocks that prevent the main text column from filling the page width at 720 px. A side block qualifies only when its presence shrinks the rendered text column below the page width.
-7. Remove advertisement blocks.
-8. Figures: use high-res images (extend capture in `get_refs.py` if the publisher serves thumbnails by default — see § Capture-time image resolution); width-align image with caption; image above caption; visible spacing between image and caption. Generic CSS:
+Reusable scripts under `.claude/skills/develop-parser/scripts/`:
 
-   ```css
-   :root WRAPPER FIGURE_SEL,
-   :root WRAPPER FIGURE_SEL > * {
-       display: block !important;
-       width: 100% !important;
-       text-align: left !important;
-       box-sizing: border-box !important;
-   }
-   :root WRAPPER IMG_SEL {
-       display: block !important;
-       width: 100% !important;
-       height: auto !important;
-       max-width: 100% !important;
-       margin: 0 0 5px 0 !important;
-   }
-   ```
+- `scan_sticky.py <parser> <html>` — Step 3 detector. Combines a static computed-style scan with a multi-position scroll test (snapshot viewport-relative tops at multiple `scrollY` positions, flag elements with low std-dev). Catches both declared `position: fixed/sticky` and JS-driven faux-sticky.
+- `scan_gaps.py <parser> <html> [vw1 vw2 ...] [--threshold N]` — Steps 10 + 11 verifier. Runs three pixel-level scans per viewport on a chunked full-page screenshot (Chromium silently corrupts single-shot captures above ~16K px): (1) vertical empty bands ≥ threshold (default 80 px) for spacing, (2) column margins L/R/W (smallest left/right white margin around content + spanned content width) for width adjustment, and (3) bg-around-column — sample near (5–30 px) and far (50+ px) bands on each side of the main reading column and report median RGB per band, catching colored page backgrounds AND box-shadows around the column that the DOM ancestor-chain scan misses. Default viewports cover the three Phase 2 width regimes — narrower than the cap, at the cap, wider than the cap.
 
-   Replace `WRAPPER`, `FIGURE_SEL`, `IMG_SEL` with publisher-specific selectors. Bare `img { width: 100% }` is forbidden — it catches inline icons and journal-meta logos.
+### Workflow
 
-### Out of scope
+Before touching `remove_banners`, create a TaskCreate to-do list with one task per step (Steps 1 through 13). Work strictly in order. Mark a task `in_progress` when you start it, `completed` only after its detection criteria pass on the iteration fixture. Do not skip ahead, do not batch.
 
-Do NOT include in `remove_banners` without user direction: header / site nav, footer, breadcrumbs, related articles, "Cited by", post-article sign-up / newsletter CTAs, metrics widgets, share buttons, accordion expand/collapse fixes, line-box descent compensation, JS-only state hidden in the snapshot.
+**IMPORTANT!** Each step has a detection rule and a "what to remove or change" rule. Act ONLY on what the detection rule flags. Do not pre-emptively remove or restyle anything outside what the step explicitly calls for. Do not remove site chromes (especially header and footer) unless they are flagged by one of the following steps.
 
-The user inspects the rendered page after the hard requirements land and identifies any additional content to remove. Do not pre-emptively strip.
+**Step 1 — Lock layout to 720-px-wide native form and center the main text column.** Two requirements:
+
+- **Cap body width** to the publisher's native 720 + gutters AND center on the page (`max-width: 752px; margin: 0 auto`) so wider viewports don't let content drift to one side. The main text column must remain horizontally centered in the viewport at every viewport ≥ cap.
+- **Force the publisher's CSS to resolve to its narrow-form branch at any viewport** so desktop @media-gated sidebars don't appear when the actual viewport is wide (`neutralize_media_queries` from `_helpers.py` rewrites the relevant `<style>` blocks).
+
+Verification of the locked layout is deferred to Steps 10–13.
+
+**Step 2 — Cookie banner and overlay.** Identify the publisher's consent banner and any dark/semitransparent backdrop that pairs with it. Both go. A banner sometimes carries its own backdrop and sometimes ships the backdrop as a separate sibling — inspect before stripping.
+
+**Step 3 — Sticky elements** (anything that stays put for a section or for the whole page while scrolling). Two scans, both run via `scan_sticky.py`:
+
+1. Static computed-style scan — walk every element, keep those whose computed `position` is `fixed` or `sticky`, filter invisibles (display/visibility/opacity/zero-rect/off-screen).
+2. Multi-position scroll test — snapshot every visible element's viewport-relative `top` at multiple `scrollY` positions, two `requestAnimationFrame` ticks between scroll and re-capture; sticky elements have low std-dev across positions. Catches JS-driven faux-sticky (transform-on-scroll) and `position: sticky` elements that engage only past a scroll threshold.
+
+De-dupe to outermost (a sticky parent has visually-sticky children even if their own `position: static`). Remove the detected outer elements.
+
+**Step 4 — Vertical columns other than the main text column** (typically span from top page-wide chrome to bottom page-wide chrome). Detection: anchor on the main reading column's bounding rect; flag elements with height ≥ ~50% of `document.scrollHeight` AND x-range overlapping main by < ~20% of main's width; de-dupe to outermost. After Step 1 most publishers' narrow CSS has already collapsed sidebars — usually a no-op, but remove explicitly when something remains.
+
+**Step 5 — Ad blocks.** Detection: word-boundary token match against the publisher's ad-naming conventions on element class/id (typical conventions to look for include the literal `ad`/`ads`, common ad-tech suffixes from the GAM/GPT/DFP family, and "sponsored" markers). Use word boundaries so legitimate words like "address" or "addiction" aren't false-matched. Include zero-size reservation wrappers — they still pad vertical space when no ad loads. Remove outer wrappers; ad slots may use any block-level tag, not necessarily `<div>`.
+
+**Step 6 — Colored backgrounds and shadows around the main text block.** Two complementary detectors:
+
+1. **DOM ancestor scan** — walk only the ancestor chain of the main reading column; clear any non-white, non-transparent `backgroundColor` on those ancestors. Do NOT touch siblings of main (footer panels, recommendations) — they sit beside or below main, not behind it.
+2. **Browser-rendered band scan** (`scan_gaps.py` `bg:` line) — sample pixels in two bands on each side of the main column: a **near band** (5–30 px outside the column edge) catches `box-shadow` and visible borders that the ancestor scan completely misses; a **far band** (50+ px outside, out to viewport edge) catches the page-level background as actually painted (covers `background-image` gradients/patterns, `::before`/`::after` pseudo-element backdrops, and z-index sibling overlays — all invisible to a `getComputedStyle().backgroundColor` walk). Verdict per viewport: `clean`, `page-bg-colored` (far band non-white), `shadow` (near band differs from far), or both.
+
+Apply CSS that targets the actual offender — `box-shadow: none` on the wrapper that ships the shadow, `background: transparent` on the colored wrapper, etc. Re-run `scan_gaps.py` until the bg verdict is `clean` at every viewport.
+
+**Step 7 — Image quality check.** Inspect every figure image via CDP — natural dimensions, decode-complete state, and source. Flag every image whose natural dimensions are zero, whose decoding never completed, whose source is a placeholder rather than real bytes, or whose native resolution is meaningfully below the target column width. Categorize and resolve each before continuing:
+
+- **Loading issue** — the image bytes are in the saved HTML but the browser isn't decoding them. Common cause: a deferred-loading attribute that holds off decoding until the image scrolls into view. Fix in the parser (`remove_banners`) by removing whatever defers the load, or scroll-trigger the page before sampling.
+- **Retrieval issue** — the image bytes are missing from the saved HTML (placeholder, broken URL, or publisher serves a thumbnail when a full-res variant exists). Fix in `get_html.py` via a per-publisher post-capture hook: walk the saved HTML, locate the original/full-res URL from whatever the page exposes (machine-readable metadata blocks, alternate-source attributes, parent links to a higher-res asset), fetch deterministically, encode, and write back.
+
+The same per-publisher post-capture hook also runs automatically during `convert_html.py` whenever the saved HTML still carries `<img src=data:,>` placeholders (a transient capture-time fetch failure). Re-running the conversion is enough to heal them — no need to re-fetch the page through `get_html.py`.
+
+Resolve every flagged image before proceeding. Re-inspect after each fix.
+
+**Step 8 — Resize images.** With image data confirmed loaded and at usable resolution, apply CSS so each figure: (a) image width-aligned with caption; (b) image rendered above caption; (c) visible spacing between image and caption.
+
+**Step 9 — Expand collapsed items.** Expand the following collapsed content:
+
+- author list
+- author info/affiliations
+- main text sections
+- tables
+- figure/table captions
+- references
+- supplementary materials
+- boilerplates (footnotes, publication histories, metrics, comments, cited-by etc.).
+
+**IMPORTANT!** Only expand the content if the page's native layout expands the content in-place, pushing other content down. This is a hard requirement -- if the publisher's native behavior is an overlay, DO NOT attempt to replicate the expansion. Determine the native behavior by opening the page in a browser and triggering the publisher's own UI control once; class names that suggest expansion (panel, drawer, info-card) are not evidence either way.
+
+Common examples: "show all authors", "+n authors", "show more", "expand for more", "show all references", page-wide section header with a navigate-down icon.
+
+Common false positives: per-author affiliation popups that appear as a link; inline-citation hover popovers; in-figure "View larger" modal triggers.
+
+The end result should emulate the publisher's native layout after clicking by the user. Three methods of expanding content in order of reliability:
+
+1. DOM strip — neutralize whatever attribute or state flag the publisher uses to mark the element as collapsed.
+2. CSS override — force-reveal selectors gated by a publisher collapse class or visibility attribute.
+3. JS click simulation — only when content is genuinely lazy-loaded after click. SingleFile captures post-JS DOM, so layers 1 and 2 cover the typical case.
+
+**Step 10 — Verify and fix spacing; restore native layout.** Run `scan_gaps.py`. Every reported gap must be resolved before the workflow is complete — either eliminated, or explicitly accepted as a publisher-native blank region.
+
+Gaps caused by site chrome we deliberately keep (the area between the site header and the article column, the area between the article column and the site footer, the lane next to a publisher-native sidebar) are always publisher-native — accept them as-is. Do NOT hide the chrome to close those gaps.
+
+For each remaining gap:
+
+1. Identify what was at that position in the unmodified HTML (inspect by y-coordinate or diff against the raw HTML).
+2. Determine the cause — most commonly: an earlier step removed an element but its parent / wrapper / sibling still reserves the height.
+3. Restore the publisher's native layout around the affected position. Prefer removing the leftover reservation (parent wrapper, fixed height, residual margin/padding) over adding compensating CSS. Do NOT artificially collapse spacing the publisher renders natively (paragraph, section, figure margins) just to silence the scan.
+4. Re-render and re-run `scan_gaps.py`. Repeat until every detected band is resolved or explained.
+
+Tight transitions (sections too close) are out of scope for `scan_gaps`; that needs a text-band density detector.
+
+Re-verify after every iteration with `scan_gaps.py`.
+
+**Step 11 — Verify dynamic width adjustment + main-column centering.** The body cap from Step 1 must shrink to the viewport at narrow widths and clamp to 720 + gutters at wide widths, AND the main text column must remain horizontally centered at every viewport — every page-wide element (including site header / footer chrome that we keep) must honor that envelope. The column-margin scan in `scan_gaps.py` reports L/R/W per viewport; the same run that checks spacing also confirms the width envelope and centering.
+
+Per-viewport rules:
+
+1. **L = R, both ≥ 0 (centering invariant)** — the main text column sits inside the cap with symmetric gutters. At vw < cap, L/R should be the publisher's native gutter (often near zero); at vw ≥ cap, L = R = (vw − cap) / 2 (cap-centered). Asymmetric margins (R > L by hundreds of px) mean either the column is flush-left instead of centered, OR a sidebar / absolutely-positioned element is escaping the cap. Either case fails Step 1's centering requirement.
+2. **W ≤ cap** — the spanned content width must not exceed the body cap. W > cap means a publisher wrapper ships its own fixed pixel width that ignores the cap; cap it so it shrinks to its parent.
+3. **Body's rendered width = min(vw, cap)** — verify via CDP. If body stays at cap when the viewport is narrower, the publisher has set an explicit pixel-valued `width` on body alongside any `max-width`; both need to be overridden so body shrinks to viewport. (Width-overflow elements caught by rule 2 also surface separately when sampled via the per-element CDP scan from earlier steps.)
+
+After each adjustment, re-render the formatted HTML, reload, and re-run `scan_gaps.py`. The check passes when L = R (within a few px), W ≤ cap, and body width tracks `min(vw, cap)` at every default viewport.
+
+**Step 12 — Cross-fixture verification.** Steps 1-11 are typically driven against a single representative test HTML. Once that fixture is clean, re-run Steps 10 and 11 (`scan_gaps.py` for spacing + L/R/W) against every other test HTML for the publisher. Confirm that each problem identified and resolved during single-fixture development stays resolved on the others — the same fixed-position banner class, the same ghost reservation, the same ad wrapper selectors, the same figure CSS, the same width caps. Any regression on a sibling fixture means the fix was over-fit to one DOM variant; tighten the selector or add the missing variant before declaring the parser complete.
+
+**Step 13 — Verify JSON parity (hard invariant).** `remove_banners` must not change what the parser extracts. The Phase 1 reference snapshot (`/tmp/<stem>.ref.json`, captured before any `remove_banners` work) is the parity target.
+
+For every test fixture:
+
+1. Reset the test HTML: `cp papers/raw/<stem>.html papers/test/<stem>.html` (overwrites any in-place mutation `convert_html.py` made on prior runs).
+2. Delete the prior `papers/test/<stem>_converted.json`.
+3. Run `python scripts/convert_html.py papers/test/<stem>.html` — this applies `remove_banners` and re-parses.
+4. `diff /tmp/<stem>.ref.json papers/test/<stem>_converted.json` — must be empty.
+
+A non-empty diff means a chrome-strip selector ate parseable content (most often: the parser was reading a caption, a section heading, or a reference-list element that `remove_banners` removed). Tighten the offending selector — match more narrowly, exclude the parsed element, or move the strip to a visibility-only override instead of DOM removal so the parser still sees the source bytes — and re-run. The parity check must pass on every fixture before the parser is considered complete.
 
 ### Helpers
 
@@ -201,7 +276,7 @@ Available in `_helpers.py`:
 
 - `remove_elements_by_id(html, *ids)` — stable ids. Matches both quoted and unquoted `id=` attributes.
 - `remove_elements_by_selector(html, *class_substrings)` — `<div>` with double-quoted class containing the substring.
-- `_remove_nested_element(html, start_pattern)` — arbitrary opening-tag regex. Use when the helper doesn't match (non-div tags, unquoted attrs). Removes ONE occurrence per call — wrap in a loop if multiple instances may exist.
+- `_remove_nested_element(html, start_pattern)` — arbitrary opening-tag regex. Use when the above helpers don't match (non-`<div>` tags, unquoted attrs). Removes ONE occurrence per call — wrap in a loop if multiple instances may exist.
 - `neutralize_media_queries(html)` — rewrite `<style>` blocks so the publisher's narrow-form CSS applies unconditionally.
 
 ### Injection point
@@ -216,28 +291,9 @@ else:
 
 Some SingleFile outputs omit `</head>`; fall back to injecting before `<body`.
 
-### Verification
+### Visual Handoff
 
-All three are mandatory.
-
-JSON parity (hard invariant):
-
-1. Reset HTML by copying `papers/raw/<stem>.html` back to `papers/test/<stem>.html` (overwrites the in-place mutation `convert_html.py` made on the previous run).
-2. Delete the prior `papers/test/<stem>_converted.json`.
-3. Run `python scripts/convert_html.py papers/test/<stem>.html`.
-4. `diff /tmp/<stem>.ref.json papers/test/<stem>_converted.json` — must be empty for every test paper. Non-empty diff means the chrome strip is too aggressive — tighten the selector.
-
-Margin check at 720-px viewport:
-
-```bash
-python .claude/skills/develop-parser/scripts/measure_layout.py <parser> papers/test/<stem>.html 720
-```
-
-Confirm the reading column reports 56 px top/bottom and 16 px left/right (±4 px tolerance for sub-pixel rendering).
-
-Visual handoff:
-
-Open one test paper at vw=720 in the CDP browser. Hand off to the user for inspection. The user identifies any remaining chrome they want removed (which then becomes a follow-up `remove_banners` change driven by an explicit user request).
+Open the converted HTML in papers/test/ and raw HTML in papers/raw/ side-by-side in different CDP browser windows at vw=720. Hand off to the user for inspection.
 
 ## Resetting test files
 

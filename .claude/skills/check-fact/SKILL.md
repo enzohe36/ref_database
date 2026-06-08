@@ -6,9 +6,13 @@ paths: projects/**/draft*.md, projects/**/factcheck/**
 
 ## Overview
 
-The fact-check workflow runs over a draft markdown file inside a `projects/<name>/` subtree. Each paragraph in the body is sent to a separate Agent that searches the local corpus, reads candidate papers' `main_text`, and emits per-sentence verdicts with stem-format citations. The conclusion runs in a second wave with a closed-stem rule (it may only cite stems already cited in the body). The main session reviews flagged factual errors, applies a `decisions.json` of accepted rewrites, and runs `scripts/apply_verdicts.py` to assemble `<draft_stem>.cited.md`. Finally `python scripts/cite_refs.py <document>` (run from inside the project) converts stems to "Author et al. YYYY" form, generates the References section, and auto-appends every cited PMID to `projects/<name>/pmids.txt`.
+The fact-check workflow runs over a draft markdown file inside a `projects/<name>/` subtree. Each paragraph in the body is sent to a separate Agent that searches the local corpus, reads candidate papers' `main_text`, and emits per-sentence verdicts with stem-format citations. The conclusion runs in a second wave with a closed-stem rule (it may only cite stems already cited in the body). The main session reviews flagged factual errors, applies a `decisions.json` of accepted rewrites, and runs `scripts/apply_verdicts.py` to assemble `<draft_stem>.cited.md`. Finally `python scripts/cite_refs.py <document>` converts stems to "Author et al. YYYY" form and generates the References section.
 
 The skill is **project-scoped**. All state lives under `projects/<name>/factcheck/`. The draft must be inside a project subtree.
+
+## Citation format
+
+A citation is the literal `stem` value (basename of `papers/parsed/<stem>.json`, e.g. `Cao_2024_Nature_38123456`). `search_refs.py` returns the stem in every result; the eligible-papers file lists it under each PMID. Copy the stem verbatim into the verdict's `citations` array — no conversion, no shortening, no author-year reformatting.
 
 ## When to invoke
 
@@ -154,13 +158,12 @@ Re-splits the draft, applies decisions, scrubs inline author-year and stem refs 
 ### Stage 6 — convert stems to readable form
 
 ```
-cd projects/<name>/
-python ../../scripts/cite_refs.py <draft_stem>.cited.md
+python scripts/cite_refs.py projects/<name>/<draft_stem>.cited.md
 ```
 
-`cite_refs.py` is the project's existing canonical citation tool. It must be run from inside the project subtree because it auto-appends every cited PMID to `projects/<name>/pmids.txt`. It converts each stem to "Author et al. YYYY" form, alphabetises the References section by first author + year, and renumbers entries.
+`cite_refs.py` converts each stem to "Author et al. YYYY" form, alphabetises the References section by first author + year, and renumbers entries. Runs from anywhere — no project context needed.
 
-After this step, optionally rebuild the project's embedding collection so newly added PMIDs are searchable in project-scoped queries:
+Optional follow-up: agents may have introduced citations from `_global` papers that aren't yet in `projects/<name>/pmids.txt`. To make those papers searchable in future project-scoped queries, manually append the new PMIDs (visible in the draft's References section) to `projects/<name>/pmids.txt`, then rebuild the project collection:
 
 ```
 python scripts/build_model.py <name>

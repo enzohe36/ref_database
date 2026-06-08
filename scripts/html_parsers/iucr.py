@@ -1,11 +1,4 @@
-"""IUCr (journals.iucr.org) HTML parser.
-
-IUCr paper landing pages carry metadata, abstract, keywords, and
-structured references via citation_* meta tags, plus the full article
-body inside <div id=body>, the back matter inside <div id=bm>
-(Acknowledgements / Conflict of interest / Funding), and the reference
-list inside <div id=bibl>.
-"""
+"""IUCr (journals.iucr.org) HTML parser."""
 
 import re
 from html import unescape
@@ -18,11 +11,10 @@ from ._helpers import (
     format_doi,
     get_all_meta,
     get_meta,
+    neutralize_media_queries,
     remove_elements_by_id,
     strip_common,
-    strip_tags,
     tags_to_text,
-    remove_elements_by_selector,
 )
 
 # Publisher-specific noise strings removed from main_text
@@ -34,205 +26,112 @@ _NOISE = ()
 # ---------------------------------------------------------------------------
 
 def remove_banners(html):
-    """Normalize IUCr HTML to a single centered text column.
+    """Apply Phase 2 layout rules for journals.iucr.org.
 
-    IUCr's article pages are built around <div id=iucr-art> (the reading
-    column: mainheading + title + authors + affiliations + abstract +
-    body + references). The left sidebar (Issue contents / Download PDF /
-    3D view / Previous article thumbnails) is <div id=art_leftbox> and
-    <div id=art_leftbox_narrow>, both positioned fixed. Site chrome
-    (header + footer + cookie bar) plus TrendMD's "We recommend" widget
-    tail the article in sibling DOM.
-
-    Chrome stripped (Step 3):
-      - <div id=header> masthead (journal logo + nav + search).
-      - <div id=footer> + <div id=footersearch> bottom chrome.
-      - <div id=art_leftbox> / <div id=art_leftbox_narrow> sidebars.
-      - <div id=pl> / <div id=pr> hidden popup-left / popup-right
-        panels (fixed-position, nothing readable inside).
-      - <div id=trendmd-suggestions> "We recommend" TrendMD carousel.
-      - Bottom-fixed "We use cookies" banner — matched by its inline
-        z-index:99999 style (the only fixed-position .popup on the page).
-
-    Reading column (Step 4): <div id=iucr-art> (full-text articles).
-    IUCr also publishes issue-landing pages (<div class="articles"
-    id=articlelpNNNN>) and abstract-only minimum-view pages
-    (<div class="articles" id=articlemvNNNN>); the cap is applied to
-    all three via a `[id^=articlelp], [id^=articlemv]` fallback.
+    Step 1: cap body width to 752 px and center; neutralize @media so the
+            narrow-form CSS branch (max-width: 1200/800/600/...) applies
+            unconditionally. IUCr ships only max-width queries, so the
+            narrow rules already apply at vw <= 1200; the call still
+            normalises any min-width-only blocks that future templates
+            might introduce.
+    Step 2: remove the cookie consent banner — `<div class=popup
+            style=...position:fixed...>` placed as the last child of
+            <body>, identified by inline `position:fixed` + the
+            "We use cookies" copy. No separate backdrop.
+    Step 3: remove the page-wide fixed `<div id=header>` (full-width site
+            header) and the article-tools fixed left-rail
+            `<div id=art_leftbox>`. Both are flagged by scan_sticky.
+            (`#art_leftbox_narrow`, the horizontal version that activates
+            at narrower vw, is left as publisher-native chrome — it is
+            not flagged sticky and is part of the article column.)
+    Step 4: no extra vertical columns — IUCr uses a single-column
+            layout (`div.layout_cjo_singlecolumn`). No-op.
+    Step 5: no ad slots in the captured HTML.
+    Step 6: page background is white; main column has no shadow. No-op.
+    Step 8: figures — `<div class=im>` wrappers hold the image (an
+            `<a>` link wrapping `<img>`), and `<div class=imt>` holds
+            the caption. Both already render in document order
+            (image above caption). Force the image to span the column
+            width with a small bottom margin so the caption sits
+            visibly below.
+    Step 9: no collapsed regions to expand — author affiliations are
+            rendered always-visible inside `<div id=aff>` (and also
+            extracted from `citation_author_institution` meta tags by
+            `_parse_authors`). No-op.
     """
-    # Step 3 — strip chrome.
-    html = remove_elements_by_id(
-        html, "header", "footer", "footersearch",
-        "art_leftbox", "art_leftbox_narrow",
-        "pl", "pr",
-        "trendmd-suggestions",
-        "journalsocialmedia",
-    )
-    # Cookie banner: bottom-fixed <div class=popup style="...z-index:99999...">.
-    # Iterate — there is only one, but the helper removes at most one
-    # per call so a loop is safe if the layout changes.
-    for _ in range(3):
-        before = html
-        html = _remove_nested_element(
-            html,
-            r'<div\b[^>]*\bclass=popup\b[^>]*style=[^>]*z-index:99999[^>]*>',
-        )
-        if html == before:
-            break
+    html = neutralize_media_queries(html)
 
-    # Steps 2 + 4 — layout freeze and reading-column cap.
-    # The marker comment makes this injection idempotent — re-running
-    # remove_banners on already-formatted HTML strips the previous
-    # block before injecting the new one (otherwise convert_html
-    # accumulates one duplicate style block per run on the same file).
-    _INJECT_MARKER = "<!--iucr-format-html-->"
-    html = re.sub(
-        re.escape(_INJECT_MARKER) + r"<style>.*?</style>",
-        "", html, flags=re.DOTALL,
+    # Step 2 — cookie consent banner (last <body> child, inline
+    # `position:fixed`, "We use cookies" copy). Match by the inline
+    # `position:fixed` style on a `class=popup` div pinned to bottom.
+    html = _remove_nested_element(
+        html,
+        r'<div\s+class=popup\s+style="bottom:0px;left:0px;[^"]*position:fixed[^"]*">',
     )
+
+    # Step 3 — sticky elements flagged by scan_sticky.
+    # `#header` is the publisher's page-wide top banner (fixed). Removing
+    # it lets the article column flow from the top of the viewport.
+    # `#art_leftbox` is the article-tools left-rail (Issue contents /
+    # PDF / Navigation / Highlighting / Citation / Stats / Previous /
+    # Next), pinned to left:2em via inline `position:fixed`.
+    html = remove_elements_by_id(html, "header", "art_leftbox")
+
     override = (
-        _INJECT_MARKER
-        + "<style>"
-        "html{overflow-y:overlay}"
-        "html::-webkit-scrollbar{width:0}"
-        "html{width:100% !important;max-width:100% !important;"
-        "margin:0 !important;background:#fff !important}"
-        "body{width:100% !important;min-width:0 !important;"
-        "max-width:752px !important;margin:0 auto !important;"
-        "background:#fff !important;color:#000 !important}"
-        # Collapse every wrapper between body and #iucr-art so the cap
-        # on #iucr-art is not shrunk by an inherited fixed width.
-        # Also zero the box-shadow/border that `#main` picks up at
-        # wider viewports (the natural stylesheet draws a 3px/10px
-        # drop-shadow around the article body at vw > 720 px).
-        "#jpage_d,#article,#pagebody,.layout_cjo_singlecolumn,"
-        "#main.article{"
-        "display:block !important;width:100% !important;"
-        "max-width:100% !important;min-width:0 !important;"
-        "margin:0 !important;padding:0 !important;"
-        "background:#fff !important;float:none !important;"
-        "box-shadow:none !important;border:none !important}"
-        # Capped reading column.
-        # Note: the natural stylesheet gives #iucr-art a 5em colored
-        # left border and `float:left; width:calc(100% - 6.5em)`. Zero
-        # the border and override the float+width to reclaim the full
-        # column width; `border:none` is mandatory (padding:56px 16px
-        # alone leaves the 80-px border in place and shifts the text).
-        "#iucr-art,[id^=articlelp],[id^=articlemv]{"
-        "float:none !important;display:block !important;"
-        "width:auto !important;max-width:752px !important;"
-        "margin:0 auto !important;"
-        "padding:56px 16px !important;"
-        "border:none !important;"
-        "box-sizing:border-box !important;"
-        "background:#fff !important}"
-        "#iucr-art *,[id^=articlelp] *,[id^=articlemv] *{"
-        "max-width:100% !important;min-width:0 !important}"
-        # Table intrinsic width beats max-width; force fixed layout.
-        "#iucr-art table,[id^=articlelp] table,[id^=articlemv] table{"
-        "table-layout:fixed !important;width:100% !important;"
-        "word-break:break-word !important}"
-        # Exempt the journal-logo layout table (<table class=layout>)
-        # inside `.jicon_d`: it's a 2-cell icon+title grid whose
-        # natural width is ~124 px. Forcing it to width:100% expands
-        # `.jh_left` to the full column and bumps the float:right
-        # `.jh_right` (Volume|Part|Date|Pages + DOI + Open access +
-        # Cited by) below it, destroying the 2-column metadata row.
-        "#iucr-art .jicon_d table.layout,"
-        "[id^=articlelp] .jicon_d table.layout,"
-        "[id^=articlemv] .jicon_d table.layout{"
-        "table-layout:auto !important;width:auto !important}"
-        # Figure caption tables (<table class=fig>): native layout puts
-        # the thumbnail in a left td (20% width) and the caption in the
-        # right td (80%). At the narrow reading-column width this forces
-        # the caption to start at ~140 px from the column edge and wrap
-        # in a narrow box. Block-stack so the image sits above the
-        # caption.
-        "#iucr-art table.fig,#iucr-art table.fig tbody,"
-        "#iucr-art table.fig tr,#iucr-art table.fig td,"
-        "[id^=articlelp] table.fig,[id^=articlelp] table.fig tbody,"
-        "[id^=articlelp] table.fig tr,[id^=articlelp] table.fig td,"
-        "[id^=articlemv] table.fig,[id^=articlemv] table.fig tbody,"
-        "[id^=articlemv] table.fig tr,[id^=articlemv] table.fig td{"
-        "display:block !important;width:100% !important;"
-        "text-align:left !important;"
-        "box-sizing:border-box !important}"
-        # The publisher's `table.fig{padding-bottom:5px}` is a native
-        # 5-px buffer that visually sits *outside* the table-cell row
-        # baseline in the native side-by-side layout. When the cells are
-        # block-stacked it appears below the caption — duplicating the
-        # caption-text-bot/cell-inner-bot collapse that's already 0 in
-        # raw. Move it to act as the gap *above* the caption (i.e.
-        # below the image) instead, by zeroing the table padding-bottom
-        # and adding the same 5 px as image margin-bottom. This keeps
-        # the publisher's native vertical buffer (same width as the
-        # padding above the image inside the image cell — i.e. the
-        # space natively between fig content and caption-row baseline)
-        # without hardcoding a value the publisher didn't define.
-        "#iucr-art table.fig,"
-        "[id^=articlelp] table.fig,"
-        "[id^=articlemv] table.fig{"
-        "padding-bottom:0 !important}"
-        "#iucr-art table.fig img.figlnkthm,"
-        "[id^=articlelp] table.fig img.figlnkthm,"
-        "[id^=articlemv] table.fig img.figlnkthm{"
-        "margin-bottom:5px !important}"
-        # Post-capture (get_refs.py) swaps the 100-px thumbnail src for
-        # the figure page's full image (usually 640 px wide — iucr's
-        # only public variant). Natural 640 px is narrower than the
-        # caption column (688 px at vw=720), so figures look smaller
-        # than their captions. Force img.figlnkthm to fill the column
-        # width; height auto-scales to preserve aspect ratio.
-        ":root #iucr-art img.figlnkthm,"
-        ":root [id^=articlelp] img.figlnkthm,"
-        ":root [id^=articlemv] img.figlnkthm{"
-        "width:100% !important;height:auto !important;"
-        "max-width:100% !important}"
-        # A stray <hr> sits just below the closing of the outer
-        # <div id=article> wrapper — hide it so the document height
-        # reflects the reading-column bottom, not the horizontal-rule.
-        "body > hr,#article > hr,#jpage_d > hr{display:none !important}"
-        # First-/last-child margin-zero, but only on DIRECT children of
-        # the wrapper — the descendant form `*:first-child` kills every
-        # section h3's native 2em margin-top (each h3 is the first
-        # child of its DIVSECn parent), collapsing the visual break
-        # between sections.
-        ":root #iucr-art > *:first-child,"
-        ":root [id^=articlelp] > *:first-child,"
-        ":root [id^=articlemv] > *:first-child{"
-        "margin-top:0 !important;padding-top:0 !important}"
-        # `.mainheading` sits inside #iucr-art's #fm and is the first
-        # rendered element; native stylesheet adds margin-top:1-2em
-        # depending on viewport. Zero it so the wrapper's 56-px top
-        # padding is the only spacing above the banner.
-        ":root #iucr-art .mainheading{"
-        "margin-top:0 !important;padding-top:0 !important}"
-        # Restore breathing space above the author block: native IUCr
-        # renders a 15 px visual gap between <div id=atl> (title) and
-        # <div id=aug> (authors), created by a <div style=float:right>
-        # CrossMark badge between them. The reading-column width cap
-        # collapses that interaction, so authors render flush against
-        # the title bottom. Explicit margin-top matches the native gap.
-        ":root #iucr-art #aug,"
-        ":root [id^=articlelp] #aug,"
-        ":root [id^=articlemv] #aug{margin-top:16px !important}"
-        # Direct-child only. The descendant form zeros margin/padding on
-        # every last-child descendant — including the <p> inside
-        # `.oainfo` (license box), which collapses the 10.8-px gap
-        # between the license text and the bottom edge of the gray
-        # box. `.jinfo_header_article` has its own rule below.
-        ":root #iucr-art > *:last-child,"
-        ":root [id^=articlelp] > *:last-child,"
-        ":root [id^=articlemv] > *:last-child{"
-        "margin-bottom:0 !important;padding-bottom:0 !important}"
-        # Extra: the bottom `<div id=bm>` ends with a .jinfo_header_article
-        # block whose natural stylesheet ships margin-bottom:3em (~36 px
-        # at the parent's 12-px font-size). Zero it so the bm's rendered
-        # bottom sits flush with its last child and the 56 px wrapper
-        # padding is the sole bottom gap.
-        ":root #iucr-art .jinfo_header_article,"
-        ":root [id^=articlelp] .jinfo_header_article,"
-        ":root [id^=articlemv] .jinfo_header_article{margin-bottom:0 !important}"
+        "<style>"
+        # Step 1 — lock body to 752 px wide, centered. IUCr's body is
+        # otherwise full-bleed; `#jpage_d`, `#article`, `#main` and
+        # `#pagebody` have no fixed widths but inherit body's width.
+        "html{margin:0!important;padding:0!important;"
+        "background:#fff!important;}"
+        "body{max-width:752px!important;width:auto!important;"
+        "min-width:0!important;"
+        "margin:0 auto!important;padding:0 16px!important;"
+        "box-sizing:border-box!important;"
+        "background:#fff!important;"
+        "overflow-wrap:break-word!important;word-wrap:break-word!important;}"
+        # IUCr wraps the article in #jpage_<journal> > #article > #pagebody
+        # > .layout_cjo_singlecolumn > #main > #iucr-art. Keep them all
+        # auto-width and override the publisher's `padding-top:120px` on
+        # #pagebody (which compensated for the now-removed fixed `#header`).
+        # `#iucr-art` ships a 60-px-wide off-white `border-left` that
+        # decorates the publisher's article-tools rail; with the rail
+        # gone, zero the border so the column sits flush inside body.
+        "div#jpage_a,div#jpage_b,div#jpage_c,div#jpage_d,div#jpage_e,"
+        "div#jpage_f,div#jpage_j,div#jpage_m,div#jpage_q,div#jpage_s,"
+        "div#jpage_x,div#article,div#pagebody,div.layout_cjo_singlecolumn,"
+        "div#main,div#main.article,div#iucr-art"
+        "{width:auto!important;min-width:0!important;"
+        "max-width:100%!important;"
+        "margin-left:auto!important;margin-right:auto!important;"
+        "padding-left:0!important;padding-right:0!important;"
+        "box-sizing:border-box!important;}"
+        "div#pagebody{padding-top:0!important;margin-top:0!important;}"
+        "div#iucr-art{border-left:0!important;border-right:0!important;}"
+        # Step 8 — figure layout. IUCr wraps each figure in a
+        # `<table class=fig>` with two cells per row: the image cell
+        # (`td.td_align_center.width_20`) holds the figure thumbnail
+        # `<img class=figlnkthm>` (HTML width=3000 attribute) inside an
+        # `<a>` link, and a side-caption cell holds `<span class="font_size_2 caption">`.
+        # Force the table to render as a column-spanning block, the image
+        # to scale down to column width above its caption, and the side
+        # caption cell to flow below the image instead of beside it.
+        "table.fig{display:block!important;width:100%!important;"
+        "max-width:100%!important;margin:0 0 16px 0!important;"
+        "padding:0!important;table-layout:auto!important;}"
+        "table.fig tbody,table.fig tr"
+        "{display:block!important;width:100%!important;max-width:100%!important;}"
+        "table.fig td,table.fig td.td_align_center,"
+        "table.fig td.width_20"
+        "{display:block!important;width:100%!important;max-width:100%!important;"
+        "padding:0!important;}"
+        "table.fig img,img.figlnkthm"
+        "{display:block!important;width:100%!important;"
+        "max-width:100%!important;height:auto!important;"
+        "margin:0 0 12px 0!important;padding:0!important;"
+        "box-sizing:border-box!important;}"
+        "table.fig a{display:block!important;width:100%!important;"
+        "max-width:100%!important;margin:0!important;padding:0!important;}"
         "</style>"
     )
     if "</head>" in html:
@@ -240,12 +139,6 @@ def remove_banners(html):
     else:
         html = re.sub(r"(<body\b)", override + r"\1", html, count=1)
     return html
-
-
-# ---------------------------------------------------------------------------
-# Metadata
-# ---------------------------------------------------------------------------
-
 def _longest(values):
     """Return the longest string from values (descriptive variant)."""
     return max(values, key=len) if values else ""

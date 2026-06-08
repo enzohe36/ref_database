@@ -1,6 +1,6 @@
 """Shared PubMed E-utilities helpers.
 
-Functions used across get_refs.py and get_pmids.py.
+Functions used across get_refs.py and get_pmid.py.
 """
 
 import json
@@ -13,6 +13,7 @@ import xml.etree.ElementTree as ET
 from itertools import combinations
 from pathlib import Path
 
+from _net import polite_urlopen
 from _project import repo_root, parsed_path
 
 _PUBMED_API_FILE = repo_root() / "api_pubmed.txt"
@@ -78,7 +79,7 @@ def fetch_xml(pmid):
         f"https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi"
         f"?db=pubmed&id={pmid}&rettype=xml&retmode=xml{api_suffix}"
     )
-    with urllib.request.urlopen(url) as resp:
+    with polite_urlopen(url) as resp:
         return resp.read().decode("utf-8")
 
 
@@ -286,7 +287,7 @@ def read_parsed(path):
 
 
 # ---------------------------------------------------------------------------
-# Reference query (used by get_pmids.py)
+# Reference query (used by get_pmid.py)
 # ---------------------------------------------------------------------------
 
 def _surname(author):
@@ -368,7 +369,7 @@ def _fetch_publication_types(pmids):
         f"https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi"
         f"?db=pubmed&id={','.join(pmids)}&rettype=xml&retmode=xml{api_suffix}"
     )
-    with urllib.request.urlopen(url) as resp:
+    with polite_urlopen(url) as resp:
         xml_data = resp.read().decode("utf-8")
     root = ET.fromstring(xml_data)
     out = {}
@@ -443,7 +444,7 @@ def _search_pmid(query):
         f"?db=pubmed&term={urllib.parse.quote(query)}&retmax=5&retmode=xml"
         f"{api_suffix}"
     )
-    with urllib.request.urlopen(url) as resp:
+    with polite_urlopen(url) as resp:
         xml_data = resp.read().decode("utf-8")
     root = ET.fromstring(xml_data)
     count = int(root.findtext(".//Count", "0"))

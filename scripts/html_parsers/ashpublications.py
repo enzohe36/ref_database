@@ -1,4 +1,4 @@
-"""American Association for Cancer Research (aacrjournals) HTML parser."""
+"""American Society of Hematology (ashpublications) HTML parser."""
 
 import re
 from html import unescape
@@ -27,13 +27,6 @@ _NOISE = (
     "Crossref",
     "Search ADS",
     "PubMed",
-    "View largeDownload slide",
-    "View large",
-    "Download slide",
-    "Close modal",
-    "ShareDownload",
-    "figshare",
-    "- pdf file",
 )
 
 # Reference section heading pattern
@@ -45,7 +38,7 @@ _SUPP_RE = re.compile(
     re.IGNORECASE,
 )
 
-# h2 classes for section types in AACR (Silverchair platform)
+# h2 classes for section types in ASH (Silverchair platform)
 _BODY_HEADING = "section-title"
 _BACK_HEADING = "backsection-title"
 _REF_HEADING = "backreferences-title"
@@ -58,33 +51,56 @@ _BACK_OTHER = "backacknowledgements-title"
 # ---------------------------------------------------------------------------
 
 def remove_banners(html):
-    """Apply Phase 2 layout rules for aacrjournals.org (Silverchair).
+    """Apply Phase 2 layout rules for ashpublications.org (Silverchair).
 
     Step 1: cap body width at 752 px, center, neutralize @media queries
             so the publisher's narrow CSS branch always applies.
-    Step 2: remove the GdprCookieBanner (position: fixed bottom).
-    Step 3: remove sticky elements — the off-canvas left InfoColumn
-            (position: fixed, holds ArticleJumpLinks + IssueInfo +
-            ArticleNavLinks; pushed off-screen at narrow viewports but
-            still flagged by Step 3) and the focus-only #skipnav skip
-            link (position: fixed top:-100, visible only on tab focus).
+    Step 2: remove the GdprCookieBanner widget (position: fixed bottom).
+            No separate backdrop ships with it.
+    Step 3: remove sticky elements detected by scan_sticky.py — the
+            focus-only `<a class=skipnav>` (position: fixed top:-100,
+            visible only on tab focus; unquoted-class `<a>` so the
+            generic by-selector helper does not match it) and the
+            entire `widget-ArticleJumpLinks` widget (its inner
+            `jumplink-flyout-trigger-wrap` is the position-fixed
+            launcher; its sibling `jumplink-list-flyout-container` is
+            also position:fixed, opens via JS click on the trigger,
+            and at vw=1200 paints its 1152-px-wide jump-link list
+            outside the body cap — leaving it behind after stripping
+            only the trigger violates Step 1's width envelope). The
+            skip-link `<a>` ships with an unquoted `class=skipnav`,
+            so it goes through `_remove_nested_element` with an
+            explicit anchored pattern.
+    Step 5: remove ad blocks. ASH uses the same two Silverchair classes
+            as AACR: `ad-banner` (visible shells) and `widget-AdBlock`
+            (the inner widgets). Both can appear multiple times.
+    Step 8: figure CSS so each image sits above its caption, full width
+            of the column.
+    Step 9: per-author affiliation popups (`.al-author-info-wrap`) are
+            floating tooltips, NOT push-down expansions — leaving them
+            collapsed. Affiliations are extracted from publisher metadata
+            by `_parse_authors`, so the popup contributes nothing.
     """
     html = neutralize_media_queries(html)
 
-    # Step 2 — GDPR cookie banner (position: fixed at bottom). The whole
-    # widget wrapper is removed; no separate backdrop ships with it.
+    # Step 2 — GDPR cookie banner.
     html = remove_elements_by_selector(html, "widget-GdprCookieBanner")
 
-    # Step 3 — sticky elements. InfoColumn is the publisher's left
-    # off-canvas drawer (page-column page-column--left); skipnav is the
-    # accessibility skip link.
-    html = remove_elements_by_id(html, "InfoColumn", "skipnav")
+    # Step 3 — sticky elements detected by scan_sticky. ASH ships these
+    # with unquoted attribute values, so the by-selector helper (which
+    # only matches double-quoted class on `<div>`) does not apply.
+    # `<a href=#skipNav class=skipnav>` — focus-only skip link.
+    html = _remove_nested_element(
+        html, r'<a\s[^>]*\bclass=skipnav\b[^>]*>',
+    )
+    # The position-fixed jumplink-flyout-trigger-wrap is the launcher;
+    # the click-revealed jumplink-list-flyout-container is its sibling
+    # inside `widget-ArticleJumpLinks`. Strip the whole widget so the
+    # orphan list does not paint outside the body cap at wide viewports.
+    html = remove_elements_by_selector(html, "widget-ArticleJumpLinks")
 
-    # Step 5 — ad blocks. AACR uses two complementary wrapper classes:
-    # `ad-banner` (the visible banner shell, header/footer/riser/
-    # interstitial/revealer variants) and `widget-AdBlock` (the inner
-    # AdBlock widget, sidebar/footer/sticky/riser variants). Loop both
-    # because multiple instances exist; the helper removes one per call.
+    # Step 5 — ad blocks. Loop because the helper removes one element per
+    # call and multiple instances exist.
     for cls in ("ad-banner", "widget-AdBlock"):
         while True:
             prev = html
@@ -101,11 +117,12 @@ def remove_banners(html):
         "box-sizing:border-box!important;"
         "background:#fff!important;"
         "overflow-wrap:break-word!important;word-wrap:break-word!important;}"
-        # Step 8 — figures: image width-aligned with caption, image above
-        # caption, 12 px gap. AACR markup is
+        # Step 8 — figures. Same Silverchair markup as AACR, with the
+        # caption wrapper named `caption fig-caption` (no `-wrap` suffix
+        # like AACR uses):
         #   <div class="fig fig-section"> > <div class=fig-label>
         #     <div class=graphic-wrap> > <a><img class=content-image></a>
-        #     <div class=fig-caption-wrap>caption</div>
+        #     <div class="caption fig-caption">caption</div>
         ".fig.fig-section,.graphic-wrap"
         "{display:block!important;width:100%!important;"
         "max-width:100%!important;"
@@ -117,7 +134,7 @@ def remove_banners(html):
         "max-width:100%!important;height:auto!important;"
         "margin:0 0 12px 0!important;"
         "box-sizing:border-box!important;}"
-        ".fig-caption-wrap"
+        ".fig-caption"
         "{display:block!important;width:100%!important;"
         "margin-left:0!important;margin-right:0!important;}"
         # Table-wrap shells use absolute pixel widths from the publisher
@@ -127,21 +144,16 @@ def remove_banners(html):
         "margin-left:0!important;margin-right:0!important;"
         "table-layout:auto!important;}"
         ".table-wrap{overflow-x:auto!important;}"
-        # Embedded figshare data viewer ships its own widths that exceed
-        # the column on some papers (Hong_2022). Cap the wrapper and let
-        # internal CSS-module classes (hashed names like
-        # `*viewerContainer--HLGmA`) inherit via universal selector.
-        "figshare-widget,figshare-widget *"
-        "{max-width:100%!important;box-sizing:border-box!important;}"
-        "figshare-widget"
-        "{display:block!important;width:100%!important;}"
-        # Step 9 — no expansions. The Silverchair .al-author-info-wrap is
-        # an overlay tooltip card (closed state: display:none;
-        # position:absolute; open state: position:absolute; z-index:1;
-        # box-shadow; fixed width 284-300px; background:#fff; border).
-        # Per Step 9, overlay-style expansions must NOT be replicated.
-        # Affiliations are already captured from citation_author_institution
-        # meta tags by _parse_authors.
+        # Step 10 — collapse the empty cadmore podcast/video iframe
+        # placeholder. SingleFile captures the static DOM only; the
+        # iframe is wired to load via JS at view-time and never gets
+        # populated in the snapshot, so it sits as a 150-220 px blank
+        # reservation between section headings (e.g. y=2033-2253 on
+        # the ZNF467 fixture). Hiding via display:none preserves the
+        # surrounding `Podcast` label + audio-caption text and the
+        # parser's text-extraction path is untouched.
+        "div.cmpl_iframe_div,iframe.cmpl_iframe"
+        "{display:none!important;}"
         "</style>"
     )
     if "</head>" in html:
@@ -149,6 +161,12 @@ def remove_banners(html):
     else:
         html = re.sub(r"(<body\b)", override + r"\1", html, count=1)
     return html
+
+
+# ---------------------------------------------------------------------------
+# Metadata
+# ---------------------------------------------------------------------------
+
 def _parse_metadata(html):
     """Extract bundled metadata: title, journal, year, volume, issue, pages, doi.
 
@@ -211,32 +229,29 @@ def _parse_authors(html):
 def _extract_ref_field(entry, cls):
     """Extract text of a child div with given class (e.g. article-title, source).
 
-    Biologists wraps the journal name in <em>...</em> inside <div class=source>,
-    so accept nested tags and strip them. Stops at the first </div>, which is
-    fine because these fields are not nested.
+    Stops at the first </div>, which is fine because these fields are not
+    nested. Accepts nested tags inside the field and strips them.
     """
     m = re.search(rf'class=["\']?{cls}["\']?[^>]*>(.*?)</div>', entry, re.DOTALL)
     return strip_tags(m.group(1)).strip() if m else ""
 
 
 def _parse_inline_authors_title(entry):
-    """Parse authors and title from inline citation text (older AACR format).
+    """Parse authors and title from inline citation text (older Silverchair format).
 
-    In older AACR papers, references have format:
-      "Rodier F, Kim SH, Nijjar T, Campisi J. Cancer and aging: ... <div class=source>..."
+    In older ASH papers, references have format:
+      "Smith JA, Jones B. Article title here. <div class=source>..."
     i.e. authors and title are plain text before the first structured div
     (source/article-title). Authors end with a period; title follows up to
     the next period before the source div.
 
     Returns (authors_list, title) where authors are "LastName IN" strings.
     """
-    # Find citation container
     cm = re.search(r'class="citation mixed-citation"[^>]*>(.*?)</div>', entry, re.DOTALL)
     if not cm:
         return [], ""
     cit_html = cm.group(1)
 
-    # Take text before the first source/article-title/year div (whichever first)
     first_div = re.search(
         r'<div\s+class=["\']?(?:source|article-title|year|volume|fpage)["\']?',
         cit_html,
@@ -245,9 +260,6 @@ def _parse_inline_authors_title(entry):
     pre_text = unescape(re.sub(r'<[^>]+>', ' ', pre)).strip()
     pre_text = re.sub(r'\s+', ' ', pre_text)
 
-    # Split authors from title: authors end with ". " before title
-    # Authors part ends with "LastName IN." or "et al."
-    # Title begins after. Find last "<Initials>[.] " or "et al. " boundary.
     m = re.search(r'(.*?(?:et\s+al\.?|\b[A-Z]{1,5}))\.\s+(.+?)\.?\s*$', pre_text)
     if m:
         author_text = m.group(1).strip().rstrip('.').strip()
@@ -256,24 +268,10 @@ def _parse_inline_authors_title(entry):
         author_text = pre_text
         title = ""
 
-    # Parse authors: "LastName IN, LastName IN, ...". Standalone suffix
-    # tokens (III, Jr., 2nd, ...) emitted between commas (e.g. "Wilson DM,
-    # III, Bohr VA") attach to the preceding author rather than becoming
-    # their own entry. Uses the same suffix test as the helpers' name
-    # parser to stay consistent.
-    raw_parts = []
+    authors = []
     for part in re.split(r',\s*', author_text):
         part = part.strip().rstrip('.').strip()
         if part and part.lower() != "et al":
-            raw_parts.append(part)
-    suffix_set = {"jr", "sr", "ii", "iii", "iv", "v", "phd", "md"}
-    authors = []
-    for part in raw_parts:
-        norm = part.rstrip('.').lower()
-        is_ordinal = bool(re.match(r"^\d+(?:st|nd|rd|th)$", norm))
-        if (norm in suffix_set or is_ordinal) and authors:
-            authors[-1] = f"{authors[-1]} {part}"
-        else:
             authors.append(part)
     return authors, title
 
@@ -281,16 +279,10 @@ def _parse_inline_authors_title(entry):
 def _parse_structured_authors(entry):
     """Parse authors from <div class=surname>/<div class=given-names> pairs.
 
-    AACR stores given names as pre-concatenated initials (e.g. "RK", "H. Tomas",
-    "MA."). When the value is all-uppercase with no interior space, treat it
-    as already-formatted initials and keep it verbatim; otherwise split on
-    whitespace/period and take the first letter of each part.
+    Silverchair stores given names as pre-concatenated initials. Hand each
+    pair to format_name; helpers handle initial-only vs. full-name input.
     """
     authors = []
-    # Between the surname and given-names divs the markup varies:
-    #   AACR:       </div> <div class=given-names>
-    #   Biologists: </div>, <div class=given-names>   (comma-space in text)
-    # Allow any short run of characters (no angle brackets) between them.
     for nm in re.finditer(
         r'class=["\']?surname["\']?[^>]*>([^<]*)</div>'
         r'[^<]{0,6}'
@@ -309,11 +301,12 @@ def _parse_references(html):
 
     Returns list of {"": {title, journal, year, volume, issue, pages, doi, authors}}.
     Each reference dict uses the same field formats as the main paper, with
-    one exception: authors is a list of "LastName IN" strings (plain strings,
-    not dicts with affiliation). Empty fields are "". Empty authors is [].
-    AACR-specific: each ref is wrapped in <div data-content-id=b...>; newer
-    papers have structured surname/given-names/article-title divs, older
-    papers have inline author/title text before structured source/year/volume.
+    one exception: authors is a list of "LastName IN" strings.
+    ASH-specific: each ref is wrapped in <div data-content-id=b<N>...> or
+    <div data-content-id=bib<N>...>; both carry an `xmlns` attribute that
+    distinguishes the ref wrapper from surrounding chrome. Newer papers have
+    structured surname/given-names/article-title divs; older papers have
+    inline author/title text before structured source/year/volume.
     """
     refs = []
     m = re.search(r'class="ref-list[^"]*"', html)
@@ -322,12 +315,6 @@ def _parse_references(html):
 
     ref_section = html[m.start():]
 
-    # Locate each ref entry. Different Silverchair journals use different
-    # ID attribute names:
-    #   AACR:       <div data-content-id=bN xmlns=...>
-    #   Biologists: <div content-id=<paperid>cN xmlns=...>
-    # Both variants carry an `xmlns` attribute that distinguishes the ref
-    # wrapper from surrounding chrome.
     items = list(re.finditer(
         r'<div\s+(?:data-)?content-id=[^\s>]+\s+xmlns',
         ref_section,
@@ -335,7 +322,6 @@ def _parse_references(html):
     if not items:
         return refs
 
-    # Boundary for last ref: find widget/footnote/copyright after it
     last_end = len(ref_section)
     after_last = ref_section[items[-1].end():]
     boundary = re.search(
@@ -349,7 +335,6 @@ def _parse_references(html):
         end = items[idx + 1].start() if idx + 1 < len(items) else last_end
         entry = ref_section[im.start():end]
 
-        # Structured fields
         title = _extract_ref_field(entry, "article-title")
         if not title:
             title = _extract_ref_field(entry, "chapter-title")
@@ -359,8 +344,6 @@ def _parse_references(html):
         year = _extract_ref_field(entry, "year")
         fpage = _extract_ref_field(entry, "fpage")
         lpage = _extract_ref_field(entry, "lpage")
-        # Older AACR refs wrap only fpage in a div; lpage is plain text
-        # right after (e.g. "<div class=fpage>977</div>–90.").
         if fpage and not lpage:
             fm = re.search(
                 rf'class=["\']?fpage["\']?[^>]*>{re.escape(fpage)}</div>\s*[–—-]\s*(\d[\w]*)',
@@ -370,7 +353,6 @@ def _parse_references(html):
                 lpage = fm.group(1)
         pages = f"{fpage}-{lpage}" if fpage and lpage else fpage
 
-        # Authors: structured first, then fall back to inline text
         authors = _parse_structured_authors(entry)
         if not authors or not title:
             inline_authors, inline_title = _parse_inline_authors_title(entry)
@@ -379,7 +361,6 @@ def _parse_references(html):
             if not title:
                 title = inline_title
 
-        # DOI from Crossref link
         doi = ""
         dm = re.search(
             r'href=["\']?https?://(?:dx\.)?doi\.org/([^"\'>\s]+)', entry
@@ -449,12 +430,10 @@ def _parse_body(html):
       - End: first references h2.
       - After references: keep only supplementary-matched sections.
     """
-    # Find article-body container (AACR uses unquoted class=article-body)
     body_m = re.search(r'<div\s+class=article-body\b[^>]*>', html)
     if not body_m:
         return ""
 
-    # Scope to matching </div> to avoid pulling page chrome at the tail
     content = html[body_m.end():]
     pos = body_m.end()
     depth = 1
@@ -476,7 +455,6 @@ def _parse_body(html):
     if not h2s:
         return ""
 
-    # Start: after abstract section
     start = 0
     for pos, text, kind in h2s:
         if kind == "abstract":
@@ -487,7 +465,6 @@ def _parse_body(html):
                 start = pos + 200
             break
 
-    # Find first references heading
     first_ref_idx = None
     for i, (pos, text, kind) in enumerate(h2s):
         if kind == "ref" or _REF_RE.search(text):
@@ -496,7 +473,6 @@ def _parse_body(html):
 
     parts = []
 
-    # Capture un-headed intro content between abstract and first body h2
     first_non_abs_pos = None
     for pos, text, kind in h2s:
         if pos >= start and kind != "abstract":
@@ -505,7 +481,6 @@ def _parse_body(html):
     if first_non_abs_pos is not None and first_non_abs_pos > start:
         parts.append((start, first_non_abs_pos))
     elif first_non_abs_pos is None and first_ref_idx is None:
-        # No headings after abstract: take everything until end
         parts.append((start, len(content)))
 
     for i, (pos, text, kind) in enumerate(h2s):
@@ -531,7 +506,8 @@ def _parse_body(html):
     # render the same caption a second time and inflate main_text. The
     # parent <a> opens this hidden modal at runtime; in the static
     # snapshot it sits in the DOM with aria-hidden=true and re-emits
-    # fig-label + caption alongside the inline figure.
+    # fig-label + caption alongside the inline figure. Same Silverchair
+    # idiom as aacrjournals.
     while True:
         body_html2 = _remove_nested_element(
             body_html, r'<div[^>]*\bclass="?fig fig-modal\b',
@@ -542,9 +518,8 @@ def _parse_body(html):
 
     # Heading attributes like data-section-title="... <em>EZH2</em> ..."
     # contain inline emphasis tags whose '>' breaks the h2/h3/h4 regex in
-    # tags_to_text (e.g. truncates the heading mid-attribute). Drop these
-    # attributes from h2-h4 tags before the text pipeline. The h-tag's
-    # inner text already carries the heading; the attribute is redundant.
+    # tags_to_text. Drop these attributes from h2-h4 tags before the text
+    # pipeline. The h-tag's inner text already carries the heading.
     body_html = re.sub(
         r'(<h[2-4]\b[^>]*?)\s+data-section-title="[^"]*(?:<[^>]*>[^"]*)+"',
         r'\1',
@@ -567,7 +542,7 @@ def _parse_main_text(html):
       - Remove all references sections.
     Pipeline: locate article container -> slice body zones -> extract_captions
     -> strip_common -> tags_to_text -> drop_noise.
-    AACR-specific: main_text is composed of abstract + body with "## Abstract"
+    ASH-specific: main_text is composed of abstract + body with "## Abstract"
     prepended to the abstract section.
     """
     parts = []
@@ -585,7 +560,7 @@ def _parse_main_text(html):
 # ---------------------------------------------------------------------------
 
 def parse_article(html):
-    """Parse AACR HTML into a papers/*.json-format dict."""
+    """Parse ASH HTML into a papers/*.json-format dict."""
     meta = _parse_metadata(html)
     return {
         "title": meta["title"],

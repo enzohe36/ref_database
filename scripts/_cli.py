@@ -1,12 +1,14 @@
 """Shared CLI argument parser used by get_refs.py, get_html.py, convert_html.py,
-get_pmids.py, merge_refs.py.
+get_pmid.py, merge_refs.py.
 
 Tokenizes positional args into:
   - PMIDs (digits-only token)
   - URLs (token starting with http)
   - .html paths
   - .json paths
-  - lists (anything else): paths to list-files whose contents are re-tokenized
+  - lists (anything else): paths to list-files whose contents are re-tokenized.
+    Inside a list-file, lines whose first non-whitespace character is '#' are
+    ignored (comment lines).
 
 Each script declares which token types it accepts via the `accept` set.
 """
@@ -14,6 +16,14 @@ Each script declares which token types it accepts via the `accept` set.
 import re
 import sys
 from pathlib import Path
+
+
+def _strip_comment_lines(text):
+    """Drop lines whose first non-whitespace character is '#'."""
+    return "\n".join(
+        line for line in text.splitlines()
+        if not line.lstrip().startswith("#")
+    )
 
 
 def _classify(token):
@@ -72,12 +82,13 @@ def parse_tokens(tokens, accept):
                 json_seen.add(ap)
                 jsons.append(ap)
         else:
-            # list: read file and re-tokenize its content
+            # list: read file and re-tokenize its content (comment lines stripped)
             path = Path(value)
             if not path.exists():
                 print(f"path not found: {value}", file=sys.stderr)
                 sys.exit(1)
             content = path.read_text(encoding="utf-8")
+            content = _strip_comment_lines(content)
             queue = re.split(r"\s+", content) + queue
 
     return {"pmids": pmids, "urls": urls, "htmls": htmls, "jsons": jsons}

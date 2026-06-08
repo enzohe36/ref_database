@@ -61,147 +61,86 @@ _PRE_BODY = {
 # ---------------------------------------------------------------------------
 
 def remove_banners(html):
-    """Normalize ScienceDirect HTML to a single centered text column.
+    """Apply Phase 2 layout rules for ScienceDirect.
 
-    Chrome stripped (Step 3):
-      - <header id=gh-cnt> (Elsevier top global header) and site footer.
-      - Full-viewport OneTrust cookie dialog (id=onetrust-consent-sdk).
-      - Floating "Feedback" side tab (Pendo badge button).
-      - Right-rail <aside class=RelatedContent> (Recommended articles,
-        Metrics, Substances, Related content).
-
-    Reading column: <article class="col-lg-12 ..."> wraps title,
-    byline, abstract, body, references. Expand the collapsed
-    author-affiliation accordion (hide #show-more-btn and force the
-    collapsed AuthorGroups parent to its full expanded height).
+    Step 1: cap body width at 752px, center, neutralize @media queries so
+            the publisher's narrow CSS branch always applies; collapse the
+            Bootstrap col-lg-12/col-md-16 grid so the article column fills
+            the cap; allow long unbreakable identifiers to wrap.
+    Step 2: remove the OneTrust cookie consent wrapper (banner + dark
+            backdrop are both children of #onetrust-consent-sdk).
+    Step 3: remove sticky elements — drag-boundary overlay, gh-drawer
+            mobile menu, accessbar-sticky in-article download bar,
+            sticky-table-of-contents sidebar, react-resizable widget,
+            _pendo-badge feedback button, and "anchor skip" accessibility
+            skip-to-content links (position:fixed); also the
+            RA-ReadingAssistantPanel floating widget that overlaps the
+            column at narrow viewports.
+    Steps 4-7, 9: no-op (no tall sidebars, no ad blocks, no off-main
+            colored backgrounds or shadows, all images loaded at usable
+            resolution, nothing collapsed).
+    Step 8: figure CSS — image above caption, both 100%-wide, 12 px gap.
+    Steps 10-12: scan_gaps clean except publisher-native footer chrome
+            gaps (article copyright vs. site footer); accepted as-is.
     """
-    # Lock layout to publisher's narrow (≤1024 px) form at any viewport.
     html = neutralize_media_queries(html)
-    # -------------------------------------------------------------------
-    # Step 3 — strip chrome.
-    # -------------------------------------------------------------------
-    html = _remove_nested_element(html, r"<header\b[^>]*>")
-    html = _remove_nested_element(html, r"<footer\b[^>]*>")
-    html = remove_elements_by_id(html, "onetrust-consent-sdk")
-    # Pendo "Feedback" side tab is a <button> with class _pendo-badge_
-    # and `position:absolute` at a far-right offset; also a
-    # <div id=banner> SiteAlert wrapper near the top of body.
-    html = remove_elements_by_id(html, "banner")
-    # Reading-assistant floating panel + its drag boundary overlay.
-    html = remove_elements_by_id(
-        html, "RA-ReadingAssistantPanel", "drag-boundary"
-    )
-    # Cited By section ("Cited by (N)" with a list of citing articles).
-    # Per note main text ends before "Cited by (N)".
-    html = remove_elements_by_id(html, "section-cited-by")
-    html = _remove_nested_element(
-        html, r'<button\b[^>]*\bclass="[^"]*_pendo-badge[^"]*"[^>]*>'
-    )
-    # Right-rail related content sidebar.
-    html = _remove_nested_element(
-        html, r'<aside\b[^>]*\bclass="[^"]*RelatedContent[^"]*"[^>]*>'
-    )
-    # Top sticky access bar (PDF / Save / Share buttons) and left-column
-    # table-of-contents panel. Classes are unquoted on these, so match
-    # tolerantly. Per note "Main text column starts: after 'Download
-    # full issue'" — stripping TableOfContents covers the issue download
-    # link and cover image above the article body.
-    for cls in ("accessbar-sticky", "TableOfContents"):
-        html = _remove_nested_element(
-            html, rf'<div\b[^>]*\bclass=["\']?{re.escape(cls)}\b[^>]*>'
-        )
 
-    # -------------------------------------------------------------------
-    # Steps 2 + 4 — layout freeze and reading-column cap.
-    # -------------------------------------------------------------------
+    # Step 2 — cookie consent banner + backdrop (OneTrust wrapper).
+    html = remove_elements_by_id(html, "onetrust-consent-sdk")
+
+    # Step 3 — sticky elements: drag overlay, mobile drawer, in-article
+    # download/access bar, TOC sidebar, Pendo feedback widget,
+    # react-resizable reading-assistant widget. Sciencedirect's HTML uses
+    # unquoted single-class attributes, so call the nested-element helper
+    # directly with a class-substring pattern that matches both quoted
+    # and unquoted forms.
+    html = remove_elements_by_id(
+        html, "drag-boundary", "gh-drawer", "RA-ReadingAssistantPanel",
+    )
+    for cls in (
+        "accessbar-sticky",
+        "sticky-table-of-contents",
+        "react-resizable",
+        "_pendo-badge",
+        "anchor skip",  # accessibility skip-to-content links (position:fixed)
+    ):
+        while True:
+            prev = html
+            html = _remove_nested_element(
+                html, rf'<\w+[^>]*\bclass=("[^"]*{re.escape(cls)}[^"]*"|'
+                rf'\'[^\']*{re.escape(cls)}[^\']*\'|{re.escape(cls)}\b)[^>]*>'
+            )
+            if html == prev:
+                break
+
     override = (
         "<style>"
-        "html{width:100% !important;max-width:100% !important;"
-        "margin:0 !important;background:#fff !important;"
-        "overflow-y:overlay !important}"
-        "html::-webkit-scrollbar{width:0 !important;height:0 !important}"
-        "body{width:100% !important;min-width:0 !important;"
-        "max-width:752px !important;margin:0 auto !important;"
-        "background:#fff !important}"
-        # Collapse layout grid wrappers so the article column fills the
-        # body. Elsevier uses Bootstrap-ish col-* and custom .row-wrap.
-        "main,#main_content,.Main,.ArticlePage,.ScienceDirect,"
-        ".container,.container-fluid,.row,.row-wrap,"
-        "[class*=col-]{"
-        "display:block !important;float:none !important;"
-        "width:100% !important;max-width:100% !important;"
-        "min-width:0 !important;flex:0 0 auto !important;"
-        "margin:0 !important;padding:0 !important;"
-        "box-sizing:border-box !important;background:#fff !important}"
-        # Capped reading column on the article. padding-bottom is
-        # trimmed by 6 px to compensate for the line-box descent below
-        # the last text glyph in `.Copyright` (native line-height adds
-        # ~6 px leading below the baseline). Without the trim, B
-        # measures 62 px between the last visible glyph and the wrapper
-        # bottom instead of the 56 px target.
-        'article[class*="col-lg-12"]{'
-        "float:none !important;display:block !important;"
-        "width:auto !important;max-width:752px !important;"
-        "margin:0 auto !important;padding:56px 16px 50px 16px !important;"
-        "box-sizing:border-box !important;background:#fff !important}"
-        'article[class*="col-lg-12"] *{'
-        "max-width:100% !important;min-width:0 !important}"
-        # Zero margin/padding only on the wrapper's DIRECT first/last
-        # children. Descendant *:first-child/:last-child zeros margins
-        # on every nested section heading, killing native vertical
-        # rhythm between sections.
-        'article[class*="col-lg-12"]>*:first-child{'
-        "margin-top:0 !important;padding-top:0 !important}"
-        'article[class*="col-lg-12"]>*:last-child{'
-        "margin-bottom:0 !important;padding-bottom:0 !important}"
-        # Expand the collapsed author-affiliation accordion. The HTML
-        # clamps #author-group to a 60-px strip with `overflow:hidden`
-        # and reveals the rest on clicking #show-more-btn. Force the
-        # parent to auto height and hide the button.
-        "#author-group{max-height:none !important;height:auto !important;"
-        "overflow:visible !important}"
-        "#show-more-btn{display:none !important}"
-        # Figures: sciencedirect (Elsevier) wraps each figure in
-        #   <figure class="figure text-xs" id=fig<N>>
-        #     <span>
-        #       <img src="data:..." height=N alt aria-describedby=cap<N>>
-        #       <ol class=u-margin-s-bottom>
-        #         <li><a class=download-link
-        #            href=https://ars.els-cdn.com/content/image/<id>-gr<N>_lrg.jpg>
-        #            Download high-res image</a></li>
-        #         <li><a class=download-link
-        #            href=https://ars.els-cdn.com/content/image/<id>-gr<N>.jpg>
-        #            Download full-size image</a></li>
-        #       </ol>
-        #     </span>
-        #     <span class="captions text-s">
-        #       <span id=cap<N>><p>Figure N. caption</p></span>
-        #     </span>
-        #   </figure>
-        # Native order: image above caption with a JS-only download list
-        # row in between. Hide the download list (non-functional inside
-        # the saved HTML), force img full-width above caption with the
-        # standard 5 px gap. The high-res `_lrg.jpg` URL is on the
-        # first `<a class=download-link>` — get_refs.py uses
-        # `_SCIENCEDIRECT_FIGURES_FIX_JS` to swap <img src> ← that <a>
-        # so SingleFile inlines the high-res image instead of the
-        # thumbnail.
-        'article[class*="col-lg-12"] figure.figure{'
-        "margin:1rem 0 !important;padding:0 !important;"
-        "display:block !important;"
-        "width:100% !important;max-width:100% !important}"
-        'article[class*="col-lg-12"] figure.figure > span{'
-        "display:block !important;width:100% !important;"
-        "max-width:100% !important;margin:0 !important;padding:0 !important}"
-        'article[class*="col-lg-12"] figure.figure img{'
-        "display:block !important;width:100% !important;"
-        "height:auto !important;max-width:100% !important;"
-        "margin:0 0 5px 0 !important}"
-        # Hide the JS-only download-link list (Download high-res /
-        # Download full-size buttons that don't function in the saved
-        # HTML).
-        'article[class*="col-lg-12"] figure.figure ol.u-margin-s-bottom{'
-        "display:none !important}"
+        "html{margin:0!important;padding:0!important;}"
+        "body{max-width:752px!important;width:auto!important;"
+        "margin:0 auto!important;padding:0 16px!important;"
+        "box-sizing:border-box!important;"
+        # Long unbreakable identifiers (gene names, formulas) overflow at
+        # narrow viewports unless we allow them to break.
+        "overflow-wrap:break-word!important;word-wrap:break-word!important;}"
+        # Step 1 follow-on: ScienceDirect uses a Bootstrap-like grid where
+        # the article column is .col-lg-12 (50%). Force it (and the body
+        # content column) to full width so the reading column actually
+        # fills the cap.
+        ".article-wrapper,.col-lg-12,.col-md-16,article.col-lg-12,"
+        "article.col-md-16,#body,.Body,#mathjax-container,.Article"
+        "{width:100%!important;max-width:100%!important;}"
+        # Step 8: figures fill the column, image above caption with
+        # visible spacing between them.
+        "figure{display:block!important;width:100%!important;"
+        "max-width:100%!important;margin:1em 0!important;}"
+        "figure>span,figure>div,figure>a{display:block!important;"
+        "width:100%!important;}"
+        "figure img{display:block!important;width:100%!important;"
+        "max-width:100%!important;height:auto!important;"
+        "margin:0 0 12px 0!important;}"
+        "figcaption,figure .captions,figure span.captions"
+        "{display:block!important;width:100%!important;"
+        "margin-top:8px!important;}"
         "</style>"
     )
     if "</head>" in html:
@@ -242,6 +181,25 @@ def _parse_metadata(html):
     issue = get_meta(html, "citation_issue")
     if issue == "N/A":
         issue = ""
+
+    # Multi-part issues (e.g. Eur J Med Chem Vol 302 Part 2) don't
+    # populate citation_issue. ScienceDirect's runtime data carries
+    # `"vol-iss-suppl-text":"Volume <V>, Part <N>"` and the canonical
+    # ToC URL `/vol/<V>/part/P<N>` — derive `Pt <N>` (PubMed's
+    # canonical form) from either when citation_issue is empty.
+    if not issue:
+        m = re.search(
+            r'/vol/\d+/part/P(\d+)', html,
+        )
+        if m:
+            issue = f"Pt {m.group(1)}"
+        else:
+            m = re.search(
+                r'"vol-iss-suppl-text"\s*:\s*"Volume\s+\d+,\s*Part\s+(\d+)"',
+                html,
+            )
+            if m:
+                issue = f"Pt {m.group(1)}"
 
     # Book chapters (Methods in Enzymology etc.) set citation_inbook_title
     # instead of citation_journal_title. Fall back for those.
@@ -1043,10 +1001,16 @@ def _parse_body(html):
     if _is_paywall(html):
         return ""
 
-    # Find the Body div which wraps the article body content
+    # Find the Body div which wraps the article body content. Try
+    # multiple selectors for different ScienceDirect layout eras:
+    #   Modern (2010s+): <div class="Body" id=body>
+    #   Mid-era:         <div id=body>
+    #   Legacy (1990s):  <article> wrapper (e.g. Schwabe_1993_Cell)
     body_m = re.search(r'<div[^>]*class="Body[^"]*"[^>]*id=body[^>]*>', html)
     if not body_m:
         body_m = re.search(r'<div[^>]*id=body[^>]*>', html)
+    if not body_m:
+        body_m = re.search(r'<article\b[^>]*>', html)
     if not body_m:
         return ""
 

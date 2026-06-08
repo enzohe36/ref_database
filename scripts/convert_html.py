@@ -14,7 +14,7 @@ HTML file arg: parse that file, write _converted.json next to it (so files
 in papers/test/ produce output in papers/test/).
 
 List arg: file containing PMIDs and/or HTML paths separated by spaces or
-newlines.
+newlines. Lines starting with '#' are ignored (comments).
 """
 
 import json
@@ -30,15 +30,18 @@ from html_parsers import (
     detect_domain,
     detect_url,
     get_parser,
-    _DOMAIN_ALIASES,
 )
 from get_html import (
     start_browser,
     stop_browser,
     apply_publisher_rule,
     CDP_PORT,
+    _get_post_capture,
+    _has_broken_figures,
+    _post_capture_needs_browser,
 )
 from _cli import parse_argv
+from _net import polite_urlopen
 from _project import parsed_path, pmid_to_stem, raw_dir, raw_html_path
 
 MIN_MAIN_TEXT_LEN = 5000
@@ -83,7 +86,11 @@ def _fetch_direct(url, output_path, port, wait_until="networkIdle"):
             text=True,
             timeout=300,
         )
-        if os.path.exists(tmp_path) and os.path.getsize(tmp_path) > 1000:
+        # Reject too-small payloads — tiny HTMLs are publisher 403/404 stubs
+        # or maintenance pages, not the article. Real fetched articles are
+        # tens of KB minimum (the previous 1000-byte threshold let
+        # 1174-byte error stubs overwrite the original publisher HTML).
+        if os.path.exists(tmp_path) and os.path.getsize(tmp_path) > 50000:
             os.replace(tmp_path, output_path)
             return True
         if os.path.exists(tmp_path):
@@ -108,7 +115,7 @@ def _pmcid_for_doi(doi):
         f"?ids={bare_doi}&format=json"
     )
     try:
-        with urllib.request.urlopen(url, timeout=15) as resp:
+        with polite_urlopen(url, timeout=15) as resp:
             data = json.loads(resp.read())
         for record in data.get("records", []):
             pmcid = record.get("pmcid", "")
@@ -186,7 +193,7 @@ def ensure_journals():
     the J_Entrez flat text in memory.
     """
     print(f"Downloading {_JOURNALS_URL}...", flush=True)
-    with urllib.request.urlopen(_JOURNALS_URL) as resp:
+    with polite_urlopen(_JOURNALS_URL, timeout=60) as resp:
         data = resp.read().decode("utf-8")
 
     entries = []
@@ -555,6 +562,168 @@ def _converted_path(html_path):
     return os.path.join(os.path.dirname(html_path), f"{stem}_converted.json")
 
 
+def _pmc_html_path(html_path):
+    """Map an html_path to its <stem>_pmc.html sidecar.
+
+    The PMC fallback writes its captured page here instead of overwriting
+    the publisher's HTML — this keeps publisher-side metadata (authors,
+    journal-specific volume/issue/pages, doi) intact when the PMC page
+    is, e.g., an old scanned-PDF stub that drops them.
+    """
+    stem = os.path.splitext(os.path.basename(html_path))[0]
+    return os.path.join(os.path.dirname(html_path), f"{stem}_pmc.html")
+
+
+def _main_text_quality_ok(parsed):
+    """True iff parsed['main_text'] passes the per-field threshold."""
+    if not parsed:
+        return False
+    return len(parsed.get("main_text", "") or "") >= MIN_MAIN_TEXT_LEN
+
+
+def _references_quality_ok(parsed):
+    """True iff parsed['references'] passes the per-field threshold."""
+    if not parsed:
+        return False
+    return len(parsed.get("references") or []) >= MIN_REFERENCES
+
+
+def _merge_pmc_into_converted(json_path, pmc_parsed):
+    """Merge PMC-side `main_text` and `references` into the publisher-
+    side _converted.json, leaving every other key untouched.
+
+    Replacement rule (per-field):
+      - main_text: replace with PMC's only when PMC's main_text passes
+        the per-field threshold (so we don't downgrade good publisher
+        text with a worse PMC stub).
+      - references: replace with PMC's only when PMC's reference list
+        passes the per-field threshold AND it has at least as many
+        entries as the existing publisher list (avoids overwriting a
+        well-extracted publisher list with a shorter PMC one).
+
+    Other keys (title / doi / journal / year / volume / issue / pages /
+    authors / publication_types) stay as the publisher parser produced
+    them. Returns the merged dict (also written to disk).
+
+    If json_path doesn't exist (publisher parse produced nothing), the
+    PMC parse is written as the entire result so the fixture isn't
+    silently dropped.
+    """
+    pmc_built = _build_converted(pmc_parsed) if pmc_parsed else None
+
+    if not os.path.exists(json_path):
+        # Phase 1 publisher parse produced nothing — fall back to PMC
+        # alone, matching the legacy behaviour for that case.
+        if pmc_built is None:
+            return None
+        with open(json_path, "w", encoding="utf-8") as f:
+            json.dump(pmc_built, f, indent=2, ensure_ascii=False)
+            f.write("\n")
+        return pmc_built
+
+    try:
+        with open(json_path, encoding="utf-8") as f:
+            existing = json.load(f)
+    except (json.JSONDecodeError, OSError):
+        existing = None
+
+    if existing is None:
+        if pmc_built is None:
+            return None
+        with open(json_path, "w", encoding="utf-8") as f:
+            json.dump(pmc_built, f, indent=2, ensure_ascii=False)
+            f.write("\n")
+        return pmc_built
+
+    if pmc_parsed is None:
+        return existing
+
+    merged = dict(existing)
+    pmc_main_text = pmc_parsed.get("main_text", "") or ""
+    if (
+        len(pmc_main_text) >= MIN_MAIN_TEXT_LEN
+        and len(pmc_main_text) > len(existing.get("main_text", "") or "")
+    ):
+        merged["main_text"] = pmc_main_text
+
+    pmc_refs = pmc_parsed.get("references") or []
+    pub_refs = existing.get("references") or []
+    if len(pmc_refs) >= MIN_REFERENCES and len(pmc_refs) >= len(pub_refs):
+        # Re-shape PMC refs through the same _converted ref schema the
+        # publisher refs use — ensures key order and typing match.
+        merged["references"] = [_converted_ref_from(r) for r in pmc_refs]
+
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(merged, f, indent=2, ensure_ascii=False)
+        f.write("\n")
+    return merged
+
+
+def _heal_broken_figures(html_path, html):
+    """Re-fetch broken figures via the matching publisher's post_capture hook.
+
+    Generic check (`_has_broken_figures`) gates the call: only fires when
+    the saved HTML still contains `<img src=data:,>` placeholders left over
+    from SingleFile fetches that failed during capture. Healed HTML is
+    written back to `html_path` by the publisher hook itself; this returns
+    the freshly-loaded contents so downstream parsing sees the heal.
+
+    When the matched publisher's post_capture hook needs CDP (ACS / BMJ /
+    IUCR — they open same-origin tabs to bypass Cloudflare), start a
+    browser around the call and pass the live port. Hooks that only call
+    urllib (cshlp, plos, nature, ...) get `port=None`.
+
+    Returns the HTML, healed-or-unchanged. Never raises -- a hook failure
+    leaves the placeholders in place and the parser sees the broken
+    figures, matching the pre-heal status quo.
+    """
+    n = _has_broken_figures(html)
+    if not n:
+        return html
+    url = detect_url(html) or ""
+    if not url:
+        return html
+    post = _get_post_capture(url)
+    if not post:
+        return html
+    print(
+        f"  {os.path.basename(html_path)}: {n} broken figure(s); "
+        f"calling heal hook",
+        flush=True,
+    )
+    needs_browser = _post_capture_needs_browser(url)
+    proc = None
+    profile_dir = None
+    port = None
+    if needs_browser:
+        try:
+            proc, port, profile_dir = start_browser()
+        except Exception as e:
+            print(
+                f"    heal hook skipped: browser failed to start "
+                f"({type(e).__name__}: {e})",
+                flush=True,
+            )
+            return html
+    try:
+        try:
+            post(html_path, port)
+        except Exception as e:
+            print(
+                f"    heal hook failed: {type(e).__name__}: {e}",
+                flush=True,
+            )
+            return html
+        try:
+            with open(html_path, encoding="utf-8") as f:
+                return f.read()
+        except Exception:
+            return html
+    finally:
+        if proc is not None:
+            stop_browser(proc, profile_dir)
+
+
 def process_html(html_path):
     """Process a single HTML file (parse only, no browser retrieval).
 
@@ -603,6 +772,11 @@ def process_html(html_path):
             "attempts": attempts,
             "terminal": ("failure", reason),
         }
+
+    # Heal broken figures (publisher's post_capture hook re-fetches any
+    # `<img src=data:,>` placeholders left by failed inline fetches during
+    # capture). No-op when no broken images are present.
+    html = _heal_broken_figures(html_path, html)
 
     # Remove banners and write cleaned HTML back
     cleaned = parser.remove_banners(html)
@@ -869,8 +1043,16 @@ def _fetch_round(fetch_items, port):
         t.start()
         threads.append(t)
 
-    for i, (html_path, _, _, _) in enumerate(fetch_items):
-        task_queue.put((i, resolved_urls[i], html_path))
+    for i, (html_path, fetch_type, _, _) in enumerate(fetch_items):
+        # PMC fetches must NEVER overwrite the publisher HTML — write
+        # PMC content to <stem>_pmc.html and merge per-field into the
+        # already-written publisher _converted.json. Retry fetches keep
+        # the legacy behaviour of writing back to <stem>.html (the
+        # captured publisher page is the one we want to upgrade).
+        out_path = (
+            _pmc_html_path(html_path) if fetch_type == "pmc" else html_path
+        )
+        task_queue.put((i, resolved_urls[i], out_path))
         time.sleep(1)
 
     task_queue.join()
@@ -887,15 +1069,24 @@ def _fetch_round(fetch_items, port):
             _record_attempt(stem, f"fetch ({fetch_type}): {outcome or 'no result'}")
             still_needed.append((html_path, fetch_type, url_or_id, _preload))
             continue
+
+        # Decide which file we just wrote. PMC fetches go to the
+        # <stem>_pmc.html sidecar; retry fetches to the original
+        # <stem>.html (upgraded publisher capture).
+        parse_path = (
+            _pmc_html_path(html_path) if fetch_type == "pmc" else html_path
+        )
+
         # Re-parse
         try:
-            with open(html_path, encoding="utf-8") as f:
+            with open(parse_path, encoding="utf-8") as f:
                 html = f.read()
             publisher = detect_domain(html)
             parser = get_parser(publisher)
+            html = _heal_broken_figures(parse_path, html)
             cleaned = parser.remove_banners(html)
             if cleaned != html:
-                with open(html_path, "w", encoding="utf-8") as f:
+                with open(parse_path, "w", encoding="utf-8") as f:
                     f.write(cleaned)
                 html = cleaned
             parsed = _parse_html(html, parser)
@@ -908,31 +1099,43 @@ def _fetch_round(fetch_items, port):
         if not doi:
             doi = _resolve_doi(stem)
         is_pmc = publisher == "nih"
+        json_path = _converted_path(html_path)
 
-        if _quality_ok(parsed):
+        if fetch_type == "pmc":
+            # Merge PMC's main_text / references into the publisher-side
+            # _converted.json (publisher metadata stays intact even when
+            # PMC's content wins). When publisher Phase 1 produced
+            # nothing, the merge writes the PMC parse alone.
+            if not _has_metadata(parsed):
+                _record_attempt(stem, "pmc: no metadata; retrying")
+                still_needed.append((html_path, fetch_type, url_or_id, _preload))
+                continue
+            merged = _merge_pmc_into_converted(json_path, parsed)
+            if merged and _quality_ok(merged):
+                _mark_success(stem)
+            else:
+                _record_attempt(stem, "pmc: fallback insufficient")
+                _log_parse_failure(stem, doi, "pmc: fallback insufficient")
+        elif _quality_ok(parsed):
             _mark_success(stem)
-            with open(_converted_path(html_path), "w", encoding="utf-8") as f:
+            with open(json_path, "w", encoding="utf-8") as f:
                 json.dump(_build_converted(parsed), f, indent=2, ensure_ascii=False)
                 f.write("\n")
         elif fetch_type == "retry" and _has_metadata(parsed):
+            # Publisher refetch came back with metadata but still
+            # below the quality bar — write what we have so far, then
+            # try PMC fallback (it merges into this JSON next round).
+            with open(json_path, "w", encoding="utf-8") as f:
+                json.dump(_build_converted(parsed), f, indent=2, ensure_ascii=False)
+                f.write("\n")
             if not is_pmc:
                 pmcid = _pmcid_for_doi(doi)
                 if pmcid:
                     _record_attempt(stem, "retry: abstract only; pmc scheduled")
                     still_needed.append((html_path, "pmc", pmcid, False))
                     continue
-            with open(_converted_path(html_path), "w", encoding="utf-8") as f:
-                json.dump(_build_converted(parsed), f, indent=2, ensure_ascii=False)
-                f.write("\n")
             _record_attempt(stem, "retry: abstract only; no pmc available")
             _log_parse_failure(stem, doi, "retry: abstract only; no pmc available")
-        elif fetch_type == "pmc":
-            if parsed:
-                with open(_converted_path(html_path), "w", encoding="utf-8") as f:
-                    json.dump(_build_converted(parsed), f, indent=2, ensure_ascii=False)
-                    f.write("\n")
-            _record_attempt(stem, "pmc: fallback insufficient")
-            _log_parse_failure(stem, doi, "pmc: fallback insufficient")
         else:
             _record_attempt(stem, f"{fetch_type}: no content after fetch")
             still_needed.append((html_path, fetch_type, url_or_id, _preload))
@@ -994,12 +1197,11 @@ def main():
                 html = f.read()
             original_url = detect_url(html)
             doi = result["doi"]
-            _aliased = any(a in original_url for a in _DOMAIN_ALIASES)
-            # Preload always: resolves redirects for aliased domains and
-            # sets session cookies so publishers with rate-limit / WAF
-            # challenges (e.g. academic.oup.com 429) don't block single-file.
+            # Preload always: sets session cookies so publishers with
+            # rate-limit / WAF challenges (e.g. academic.oup.com 429)
+            # don't block single-file.
             needs_preload = True
-            url = doi if _aliased else (original_url or doi)
+            url = original_url or doi
             # Publisher rule sheet (get_refs._PUBLISHER_RULES) is applied
             # inside _fetch_round after preload resolves the redirect chain,
             # so no transform is applied here.

@@ -55,176 +55,75 @@ _CHROME_RE = re.compile(
 # ---------------------------------------------------------------------------
 
 def remove_banners(html):
-    """Normalize JCI HTML to a single centered text column.
+    """Apply Phase 2 layout rules for jci.org (Foundation 5.5.3 platform).
 
-    JCI is built on Zurb Foundation. The article wrapper is
-    `<div class="row content-wrapper">` (class contains two tokens).
-    Inside it, the article sits in a `small-12 large-9 columns` grid
-    cell and is accompanied by a `large-2 medium-3 hide-for-small
-    columns` cell that hosts a Google Ad Manager skyscraper.
-
-    Chrome stripped (Step 3):
-      - `.fixed.show-for-large-up` band (logo-bar + content-bar nav).
-      - `#small-navbar` (mobile top bar, position:fixed).
-      - `#article-tools-nav` (mobile tools toolbar).
-      - `.left-off-canvas-menu` (off-canvas side nav).
-      - `#jci-article-interior-leaderboard-top` / `-bottom` ads +
-        their `.ad-leaderboard-wrapper` container.
-      - The skyscraper ad column (`large-2 medium-3` sibling of the
-        main column).
-      - `#footer` site footer.
-
-    Reading column (Step 4): `.content-wrapper` (the two-token class).
+    Step 1: cap body width at 752 px, center, neutralize @media queries
+            so the publisher's narrow CSS branch always applies.
+    Step 2: remove the cookieConsentContainer (position: fixed bottom).
+    Step 3: remove sticky elements — the desktop top header
+            (.fixed.show-for-large-up), the small-viewport navbar
+            (#small-navbar) and article-tools-nav (both
+            position:fixed in Foundation), and the grecaptcha-badge
+            iframe wrapper (inline position:fixed bottom-right).
+    Step 5: remove ad blocks — JCI ships googletag-driven ad slots
+            (jci-article-interior-leaderboard-top/bottom and
+            jci-article-interior-skyscraper-right-col), each wrapped
+            in .ad-leaderboard-wrapper / .ad-interior-r-sideboard.
+    Step 8: figures (.figure) — image above caption, image width-aligned
+            with caption, 12 px gap.
     """
-    # Lock layout to publisher's narrow (≤1024 px) form at any viewport.
     html = neutralize_media_queries(html)
-    # Step 3 — strip chrome.
-    html = remove_elements_by_id(
-        html, "logo-bar", "content-bar", "small-navbar",
-        "article-tools-nav", "article-tools",
-        "footer",
-        # Subscription-access notice: a green-bordered box reading e.g.
-        # "Access provided by UNIV OF KANSAS MEDICAL CENTER" that JCI
-        # injects above the article title. Not article content.
-        "subscriber_label",
-        "jci-article-interior-leaderboard-top",
-        "jci-article-interior-leaderboard-bottom",
-        "jci-article-interior-skyscraper-right-col",
-        # `#sidebar-container` holds the whole right-rail widget stack:
-        # Article tools + Metrics (altmetric donut) + Authors + Version
-        # history + the sticky "Go to" TOC. At narrow viewports this
-        # column reflows below the article, so removing it kills all
-        # four boxes from the bottom of the cleaned page.
-        "sidebar-container",
-    )
-    # Fixed top band — `<div class="fixed show-for-large-up">` wraps
-    # logo-bar + content-bar. Unquoted class helper doesn't match
-    # multi-token classes; use _remove_nested_element directly.
-    for _ in range(3):
-        before = html
-        html = _remove_nested_element(
-            html,
-            r'<div\b[^>]*\bclass="fixed show-for-large-up"[^>]*>',
-        )
-        if html == before:
-            break
-    # Left off-canvas navigation — the hamburger menu DOM.
+
+    # Step 2 — cookie consent banner (position:fixed bottom).
+    html = remove_elements_by_selector(html, "cookieConsentContainer")
+
+    # Step 3 — sticky chrome.
+    # Desktop fixed top header (logo + journal bars). Both bars sit
+    # inside the same `.fixed.show-for-large-up` wrapper.
     html = _remove_nested_element(
-        html,
-        r'<aside\b[^>]*\bclass=[^>]*left-off-canvas-menu[^>]*>',
+        html, r'<div\s+class="fixed show-for-large-up"',
     )
-    # Right-sidebar ad column: `<div class="large-2 medium-3 hide-for-small columns">`.
-    for _ in range(3):
-        before = html
-        html = _remove_nested_element(
-            html,
-            r'<div\b[^>]*\bclass="large-2 medium-3 hide-for-small columns"[^>]*>',
-        )
-        if html == before:
-            break
-    # Ad-leaderboard wrapper (parent of the already-removed leaderboard ids).
-    for _ in range(3):
-        before = html
-        html = _remove_nested_element(
-            html,
-            r'<div\b[^>]*\bclass=ad-leaderboard-wrapper\b[^>]*>',
-        )
-        if html == before:
-            break
-    # Google reCAPTCHA v3 badge — a fixed-position widget renders as a
-    # white box pinned to the bottom-right of the viewport (256x60 px).
-    # Site-chrome, not article content.
-    for _ in range(3):
-        before = html
-        html = _remove_nested_element(
-            html,
-            r'<div\b[^>]*\bclass=[^>]*\bgrecaptcha-badge\b[^>]*>',
-        )
-        if html == before:
-            break
-# Steps 2 + 4 — layout freeze and reading-column cap.
+    # Small-viewport fixed navs.
+    html = remove_elements_by_id(html, "small-navbar", "article-tools-nav")
+    # reCAPTCHA badge — inline `position:fixed` style on
+    # .grecaptcha-badge wrapper.
+    html = _remove_nested_element(
+        html, r'<div\s+class=grecaptcha-badge\b',
+    )
+
+    # Step 5 — ad blocks. Wrappers carry stable ad-* class names; the
+    # leaderboard-top wrapper is .ad-leaderboard-wrapper; the right-col
+    # is .ad-interior-r-sideboard. The bottom leaderboard ships only as
+    # the ad slot id.
+    for sel in ("ad-leaderboard-wrapper", "ad-interior-r-sideboard"):
+        while True:
+            prev = html
+            html = remove_elements_by_selector(html, sel)
+            if html == prev:
+                break
+    html = remove_elements_by_id(html, "jci-article-interior-leaderboard-bottom")
+
     override = (
         "<style>"
-        "html{overflow-y:overlay}"
-        "html::-webkit-scrollbar{width:0}"
-        "html{width:100% !important;max-width:100% !important;"
-        "margin:0 !important;background:#fff !important}"
-        "body{width:100% !important;min-width:0 !important;"
-        "max-width:752px !important;margin:0 auto !important;"
-        "padding-top:0 !important;"
-        "background:#fff !important;color:#000 !important}"
-        # At vw >= 1025 the site reserves 142 px for the fixed
-        # logo-bar + content-bar via `body{padding-top:142px!important}`.
-        # The band is already removed; neutralize the padding.
-        "@media only screen and (min-width:64.0625em){"
-        "body{padding-top:0 !important}}"
-        # Collapse the Foundation grid wrappers above `.content-wrapper`.
-        ".off-canvas-wrap,.inner-wrap{"
-        "display:block !important;width:100% !important;"
-        "max-width:100% !important;margin:0 !important;padding:0 !important;"
-        "background:#fff !important}"
-        # Cap the reading column.
-        ".content-wrapper{"
-        "float:none !important;display:block !important;"
-        "width:auto !important;max-width:752px !important;"
-        "margin:0 auto !important;"
-        "padding:56px 16px !important;"
-        "box-sizing:border-box !important;"
-        "background:#fff !important}"
-        # Foundation `.row` inside the wrapper carries a max-width and
-        # `.columns` has horizontal padding; zero both so the inner
-        # text measures from the wrapper's 16-px side padding.
-        ".content-wrapper .row,"
-        ".content-wrapper .menu-align,"
-        ".content-wrapper [class*='columns']{"
-        "display:block !important;float:none !important;"
-        "width:100% !important;max-width:100% !important;"
-        "min-width:0 !important;margin:0 !important;padding:0 !important;"
-        "box-sizing:border-box !important}"
-        ".content-wrapper *{"
-        "max-width:100% !important;min-width:0 !important}"
-        ".content-wrapper table{"
-        "table-layout:fixed !important;width:100% !important;"
-        "word-break:break-word !important}"
-        # Direct-child only — the descendant form kills section
-        # headings' native top margin AND the publisher's natural
-        # margin-bottom on figure caption paragraphs (caption P inside
-        # `div.figure` has mb=20px; descendant *:last-child{mb:0} zeros
-        # it, collapsing the gap between caption text and figure
-        # bottom border from 35 px to 15 px).
-        ":root .content-wrapper > *:first-child{"
-        "margin-top:0 !important;padding-top:0 !important}"
-        ":root .content-wrapper > *:last-child{"
-        "margin-bottom:0 !important;padding-bottom:0 !important}"
-        # Inline `style=padding-bottom:141px` on the wrapper itself;
-        # force 56 px so our cap's padding rule takes effect.
-        ":root .content-wrapper{padding-bottom:56px !important}"
-        # `.tag-list` (article type chip row, the first child of the
-        # article column) carries a 45-px `margin-top` under the
-        # publisher's narrow-viewport CSS branch, which our 752-px body
-        # cap doesn't suppress. Zero it so the chip sits flush against
-        # the wrapper's 56-px top padding at every viewport.
-        ":root .content-wrapper p.tag-list{margin-top:0 !important}"
-        # `.content_well` has an asymmetric publisher pr=12 (gutter
-        # reserved for the now-removed right rail) — zero pr only so the
-        # body text reaches the wrapper's 16-px right padding. Keep pb=12
-        # because that is the publisher's natural separator between the
-        # `.content_well` (article body + references) and the trailing
-        # `<dl class=article-section>` containing Version history (a
-        # sibling outside `.content_well`).
-        ":root .content-wrapper .content_well{padding-right:0 !important}"
-        # Figures: native `<img class=figure_thumbnail>` is float:left
-        # 125 px wide and the caption text wraps around it. The browser-
-        # script in get_refs.py rewrites the thumbnail's <img src> to
-        # the medium-resolution CloudFront URL during capture, so the
-        # image is now ~700 px native. Block-stack so the medium-res
-        # image sits above the caption at full column width with 5 px
-        # margin-bottom (no hardcoded values — 5 px mirrors the
-        # publisher's natural figure-block bottom padding).
-        ":root .content-wrapper .figure img.figure_thumbnail{"
-        "float:none !important;display:block !important;"
-        "width:100% !important;height:auto !important;"
-        "margin:0 0 5px 0 !important}"
+        "html{margin:0!important;padding:0!important;"
+        "background:#fff!important;}"
+        "body{max-width:752px!important;width:auto!important;"
+        "margin:0 auto!important;padding:0 16px!important;"
+        "box-sizing:border-box!important;"
+        "background:#fff!important;"
+        "overflow-wrap:break-word!important;word-wrap:break-word!important;}"
+        # Step 8 — figures: image above caption, full-width, 12 px gap.
+        # JCI markup: <div class=figure> > <a><img class=figure_thumbnail></a>
+        # then caption text. The thumbnail is left-floated and 50% wide
+        # natively; force block + full-width.
+        ".figure{display:block!important;width:100%!important;"
+        "max-width:100%!important;margin:0 0 12px 0!important;"
+        "box-sizing:border-box!important;}"
+        ".figure a,.figure img.figure_thumbnail"
+        "{display:block!important;float:none!important;"
+        "width:100%!important;max-width:100%!important;height:auto!important;"
+        "margin:0 0 12px 0!important;"
+        "box-sizing:border-box!important;}"
         "</style>"
     )
     if "</head>" in html:
@@ -232,12 +131,6 @@ def remove_banners(html):
     else:
         html = re.sub(r"(<body\b)", override + r"\1", html, count=1)
     return html
-
-
-# ---------------------------------------------------------------------------
-# Metadata
-# ---------------------------------------------------------------------------
-
 def _parse_metadata(html):
     """Extract bundled metadata: title, journal, year, volume, issue, pages, doi.
 
@@ -268,11 +161,16 @@ def _parse_metadata(html):
 
     # Fallback: parse "Reference information: <i>Journal</i>. Year;Vol(Issue):Pages."
     # from the footnotes panel (used for elocator IDs like e178278 where
-    # citation_firstpage meta is absent).
+    # citation_firstpage meta is absent). Pages must stop before any DOI
+    # URL ("e147025.https://doi.org/..."): allow only an optional letter
+    # prefix + digits, optionally followed by a hyphen + page tail. A
+    # trailing ".https..." is NOT swallowed because the page token bans
+    # internal dots.
     if not pages or not volume or not issue:
         fm = re.search(
             r"Reference information[^<]*</b>\s*<i>[^<]+</i>\s*\.\s*"
-            r"(\d{4})\s*;\s*(\w+)\s*\(([^)]+)\)\s*:\s*([\w.\-\u2013]+)",
+            r"(\d{4})\s*;\s*(\w+)\s*\(([^)]+)\)\s*:\s*"
+            r"([A-Za-z]?\d+(?:[\-\u2013][A-Za-z0-9]+)?)",
             html,
         )
         if fm:
@@ -348,6 +246,11 @@ def _jci_format_name(name):
     surname = " ".join(surname_parts)
     given = " ".join(parts[:i + 1])
     pieces = re.split(r"[\s.\-\u2010\u2011\u2012\u2013]+", given)
+    # Initials capped at 2 to match PubMed convention (e.g. 'Reijns MA'
+    # from given 'Martin A. M.'). Some authors with 3 PubMed-recorded
+    # initials (e.g. 'Fenor de La Maza MLD') are not recoverable from JCI
+    # meta because PubMed's truncation rule is not fully deterministic
+    # given the meta-tag input alone \u2014 known caveat.
     initials = "".join(p[0] for p in pieces if p and p[0].isupper())[:2]
     return f"{surname} {initials}" if initials else surname
 

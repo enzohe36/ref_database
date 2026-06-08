@@ -1,50 +1,30 @@
-"""Molecular Biology of the Cell (molbiolcell.org) HTML parser.
-
-Literatum-based journal platform shared with other ASCB titles. Despite
-the shared class naming conventions, no existing parser under
-html_parsers/ matches molbiolcell's specific fingerprints
-(<li class="references__item">, <h2 class="article-section__title">,
-<section class="abstractSection">).
-"""
+"""American Society for Cell Biology (molbiolcell) HTML parser."""
 
 import re
 from html import unescape
 
 from ._helpers import (
-    _remove_nested_element,
     drop_noise,
     extract_captions,
+    format_author_name,
     format_doi,
     get_meta,
-    remove_elements_by_id,
+    neutralize_media_queries,
     strip_common,
     strip_tags,
     tags_to_text,
-    remove_elements_by_selector,
 )
 
-# Publisher-specific noise strings removed from main_text
+# Lines starting with any string in this tuple are dropped from main_text
+# after the text pipeline runs.
 _NOISE = (
     "Crossref",
     "Medline",
     "Google Scholar",
     "Open in a new tab",
     "Search for more papers by this author",
-)
-
-# Reference section heading pattern
-_REF_RE = re.compile(r"\breferences\b", re.IGNORECASE)
-
-# Supplementary section patterns
-_SUPP_RE = re.compile(
-    r"supplement|extended data|source data|expanded view|powerpoint|appendix",
-    re.IGNORECASE,
-)
-
-# Sections excluded from main_text (site chrome appearing after the body)
-_CHROME_RE = re.compile(
-    r"^(?:related articles?|cited by|figures|tables|references)$",
-    re.IGNORECASE,
+    "Previous Section",
+    "Next Section",
 )
 
 
@@ -53,158 +33,97 @@ _CHROME_RE = re.compile(
 # ---------------------------------------------------------------------------
 
 def remove_banners(html):
-    """Normalize molbiolcell HTML to a single centered text column.
+    """Apply Phase 2 layout rules for molbiolcell.org (Atypon Literatum).
 
-    The article body lives in `.article__content` (a Bootstrap col-sm-8).
-    Its sibling `.col-sm-4.sticko__parent.fixed-element` hosts the
-    figures/references/related floating tabs panel. Site chrome
-    includes `<header class="header fixed ...">`, `<footer>`, a
-    `<nav class="coolBar stickybar">` floating action bar ("About /
-    Sections / Tools / Share"), plus `#figure-viewer` modal.
-
-    Chrome stripped (Step 3):
-      - <header>, <footer>, <nav> (coolBar stickybar).
-      - #main-menu (drawer nav, nested already inside header).
-      - .col-sm-4.sticko__parent.fixed-element (right tab sidebar).
-      - #figure-viewer (modal, hidden by default).
-
-    Reading column (Step 4): `.article__content`.
-    The inline script on the page calls
-    `.article__body:not(.show-references) .article__references { display:none }`
-    via JS at load time. Override by adding `.show-references` class to
-    `.article__body` via CSS so the visibility check never matches.
+    Step 1: cap body width at 752 px, center, neutralize @media queries
+            so the publisher's narrow CSS branch always applies (the
+            wide-viewport CSS adds a right-rail sticky sidebar).
+    Step 2: no cookie banner ships in the captured HTML (the publisher
+            relies on a runtime JS prompt that doesn't fire under
+            SingleFile).
+    Step 3: sticky elements — `header.header.fixed.base` (top sticky
+            site banner), `.scroll-to-target.fixed-element` (back-to-
+            top button), `.sticko__parent.fixed-element` (the right-
+            rail tools/issue/metrics column at wide viewports), and
+            `.w-slide` / `.w-slide_head` (off-canvas drawer panels
+            position:fixed off-screen).
+    Step 4: hide the `.col-sm-4` / `.col-md-4` right rail (Support &
+            Resources panel + sticky tools sidebar) — the publisher's
+            wide CSS lays it out alongside `.col-sm-8 .article__content`
+            but it does not belong in the 720-px reading layout.
+    Step 5: no ad slots ship in the captured HTML (no `gpt-ad`,
+            `ad-banner`, or `widget-AdBlock` markers; the publisher's
+            adblocker__* warning panel is hidden by default and only
+            renders when ad-block is detected).
+    Step 6: page background already white; html/body forced to white
+            for symmetry so the bg-around-column scan stays clean.
+    Step 8: figures — `<figure class=article__inlineFigure>` carries
+            `<img class=figure__image>` with sibling `<figcaption>`.
+            Force figure to block, image full column width above
+            caption with 12 px gap.
+    Step 9: no in-place push-down expansion to perform. The only
+            collapsed item, `.author-info.accordion-tabbed__content`,
+            is rendered by the publisher as a floating overlay
+            (`position:absolute; z-index:10; max-width:22.5rem`,
+            solid border framing it as a popover next to the author
+            name) — Step 9 forbids replicating overlays as push-down.
+            The affiliation text is already harvested directly from
+            the HTML source by `_parse_authors`, so visual expansion
+            is unnecessary.
     """
-    # Step 3 — strip chrome.
-    # Purge all <script> tags: one SingleFile-embedded script hides
-    # `.article__references` at load via JS, and other embedded scripts
-    # push Edge into a memory-heavy render loop that crashes the tab
-    # on navigation. Scripts add nothing to a static reading snapshot.
-    html = re.sub(r"<script\b[^>]*>.*?</script>", "", html, flags=re.DOTALL)
-    html = _remove_nested_element(html, r"<header\b[^>]*>")
-    html = _remove_nested_element(html, r"<footer\b[^>]*>")
-    # Floating coolBar sticky action bar.
-    for _ in range(3):
-        before = html
-        html = _remove_nested_element(
-            html,
-            r'<nav\b[^>]*\bclass="[^"]*\bstickybar\b[^"]*"[^>]*>',
-        )
-        if html == before:
-            break
-    # Right-rail tabs panel (fixed-position sidebar).
-    for _ in range(3):
-        before = html
-        html = _remove_nested_element(
-            html,
-            r'<div\b[^>]*\bclass="col-sm-4 hidden-xs hidden-sm sticko__parent fixed-element"[^>]*>',
-        )
-        if html == before:
-            break
-    html = remove_elements_by_id(html, "figure-viewer", "main-menu")
-    # Fixed-position `<div class=w-slide>` sibling of </article>: the
-    # references/related-figure overlay. Empty until triggered, but its
-    # fixed-position div still fills the viewport.
-    html = _remove_nested_element(
-        html, r'<div\b[^>]*\bclass=w-slide\b[^>]*>'
-    )
-    # `<div class=response><div class=sub-article-title></div></div>`
-    # is an empty placeholder at the end of .article__body that renders
-    # as a 16-px trailing block (its computed-style defaults have no
-    # margin but the box still contributes to docH).
-    html = _remove_nested_element(
-        html, r'<div\b[^>]*\bclass=response\b[^>]*>'
-    )
-    # `.pb-widget-placeholder` blocks sit below the article and carry
-    # "Related articles" / "Cited by" h3 headings. The class attr is
-    # unquoted — match directly.
-    for _ in range(10):
-        before = html
-        html = _remove_nested_element(
-            html,
-            r'<div\b[^>]*\bclass=pb-widget-placeholder\b[^>]*>',
-        )
-        if html == before:
-            break
+    html = neutralize_media_queries(html)
 
-    # Steps 2 + 4 — layout freeze and reading-column cap.
     override = (
         "<style>"
-        "html{overflow-y:overlay}"
-        "html::-webkit-scrollbar{width:0}"
-        "html{width:100% !important;max-width:100% !important;"
-        "margin:0 !important;background:#fff !important}"
-        "body{width:100% !important;min-width:0 !important;"
-        "max-width:752px !important;margin:0 auto !important;"
-        "padding:0 !important;"
-        "background:#fff !important;color:#000 !important}"
-        # Collapse the Bootstrap grid wrappers between body and
-        # .article__content so the cap rule isn't shrunk by the
-        # col-sm-8 two-thirds width.
-        "#pb-page-content,main.content,"
-        "article,article.container,article > .row,"
-        "article .container,article .row,"
-        ".col-sm-8,.col-md-8,.article__content{"
-        "display:block !important;float:none !important;"
-        "width:100% !important;max-width:100% !important;"
-        "min-width:0 !important;margin:0 !important;padding:0 !important;"
-        "box-sizing:border-box !important;"
-        "background:#fff !important}"
-        # Cap the reading column on .article__content. (The outer
-        # grid wrappers above are collapsed to full width, so this
-        # cap is the only width constraint left in the chain.)
-        "main.content{"
-        "max-width:752px !important;margin:0 auto !important;"
-        "padding:56px 16px !important;"
-        "box-sizing:border-box !important}"
-        "main.content *{"
-        "max-width:100% !important;min-width:0 !important}"
-        "main.content table{"
-        "table-layout:fixed !important;width:100% !important;"
-        "word-break:break-word !important}"
-        # Zero margin-top/margin-bottom only at the very top/bottom of
-        # the reading flow, NOT on every descendant last-child. The
-        # native abstract wrapper's margin-bottom creates the 16-px gap
-        # above "INTRODUCTION"; zeroing all descendant `*:last-child`
-        # margins collapses that inter-section break.
-        #
-        # Target the first-child chain from main.content down through
-        # article > .row > .article__content > .citation > .citation__top
-        # (the citation_top's native margin-top:.9375rem is the only
-        # spacer above the reading flow) plus the last-child of
-        # .article__content (the references block with margin-bottom).
-        ":root .article__content > *:first-child,"
-        ":root .citation > *:first-child,"
-        ":root .citation__top{"
-        "margin-top:0 !important;padding-top:0 !important}"
-        ":root .article__content > *:last-child{"
-        "margin-bottom:0 !important;padding-bottom:0 !important}"
-        # The reference list (`ul.references`) is the final content
-        # block and ships `margin-bottom:16px`; collapses through to
-        # extend docH past the 56-px wrapper padding. Zero it.
-        ":root ul.references{"
-        "margin-bottom:0 !important;padding-bottom:0 !important}"
-        # Override the inline script that hides references. The script
-        # queries `.article__body:not(.show-references) .article__references`
-        # and sets display:none. Force display:block regardless.
-        ":root .article__body .article__references{"
-        "display:block !important}"
-        # MathJax hover/tooltip absolutely-positioned helpers below
-        # the article extend docH by a couple of pixels.
-        ".MJX_HoverRegion,.MJX_ToolTip{display:none !important}"
-        # Figures: `<figure id=FIG<N> class=article__inlineFigure>` wraps
-        # `<img class=figure__image>` followed by `<figcaption>`.
-        # Native `<figure>` browser default has 40 px horizontal margin
-        # which shaves the image off the column edges, and the inlined
-        # JPEG is rendered at its intrinsic pixel dimensions (often
-        # narrower than the 720-px column). Force the wrapper to zero
-        # horizontal margin and the img to block + 100% width above the
-        # caption. Scoped via `:root` to beat `.figure__image` rules.
-        ":root .article__content figure.article__inlineFigure{"
-        "margin:1rem 0 !important;padding:0 !important}"
-        ":root .article__content figure.article__inlineFigure > img.figure__image{"
-        "display:block !important;width:100% !important;"
-        "height:auto !important;max-width:100% !important;"
-        "margin:0 0 5px 0 !important}"
+        # Step 1 / Step 6 — lock layout to 752 px wide, white background.
+        "html{margin:0!important;padding:0!important;"
+        "background:#fff!important;}"
+        "body{max-width:752px!important;width:auto!important;"
+        "min-width:0!important;"
+        "margin:0 auto!important;padding:0 16px!important;"
+        "box-sizing:border-box!important;"
+        "background:#fff!important;"
+        "overflow-wrap:break-word!important;word-wrap:break-word!important;}"
+        # Atypon ships fixed-pixel `.container` widths from Bootstrap;
+        # let them shrink to body.
+        ".container,#pb-page-content,main.content"
+        "{width:auto!important;max-width:100%!important;"
+        "margin-left:auto!important;margin-right:auto!important;}"
+        # Step 3 — hide sticky chrome (site header, back-to-top button,
+        # sticky right-rail wrapper, off-canvas drawer panels).
+        "header.header.fixed,header.header.fixed.base,"
+        ".scroll-to-target.fixed-element,"
+        ".sticko__parent,.sticko__parent.fixed-element,"
+        ".w-slide,.w-slide_head"
+        "{display:none!important;}"
+        # Step 4 — hide right-rail Support & Resources column.
+        "div.col-sm-4,div.col-md-4"
+        "{display:none!important;}"
+        # Make the article column (col-sm-8 col-md-8) span the body cap.
+        "div.col-sm-8.article__content,div.col-md-8.article__content,"
+        "div.col-sm-8,div.col-md-8"
+        "{width:100%!important;max-width:100%!important;"
+        "float:none!important;margin-left:0!important;"
+        "margin-right:0!important;}"
+        # Step 8 — figures: image above caption, both fill column.
+        "figure.article__inlineFigure"
+        "{display:block!important;width:100%!important;"
+        "max-width:100%!important;float:none!important;"
+        "margin:0 0 16px 0!important;padding:0!important;"
+        "box-sizing:border-box!important;}"
+        "figure.article__inlineFigure img.figure__image"
+        "{display:block!important;width:100%!important;"
+        "max-width:100%!important;height:auto!important;"
+        "margin:0 0 12px 0!important;"
+        "box-sizing:border-box!important;}"
+        "figure.article__inlineFigure figcaption"
+        "{display:block!important;width:100%!important;"
+        "margin:0!important;}"
+        # Step 9 — no expansion. The .author-info.accordion-tabbed__content
+        # block opens as a floating popover (position:absolute, z-index:10,
+        # 360px max-width, bordered card); replicating it as push-down would
+        # violate Step 9. Affiliations are already extracted by _parse_authors
+        # straight from the HTML source.
         "</style>"
     )
     if "</head>" in html:
@@ -221,23 +140,27 @@ def remove_banners(html):
 def _parse_metadata(html):
     """Extract bundled metadata: title, journal, year, volume, issue, pages, doi.
 
-    Returns dict with those 7 keys. molbiolcell lacks citation_* meta for
-    volume/issue/pages — volume/issue parsed from the breadcrumb URL
-    (/toc/mboc/<vol>/<issue>); pages absent from HTML and returned as "".
-    citation_journal_abbrev is absent, so journal falls back to the full
-    citation_journal_title ("Molecular Biology of the Cell").
+    molbiolcell exposes minimal Literatum citation_* meta — only
+    citation_journal_title is present. Title comes from dc.Title;
+    DOI from publication_doi. Volume/issue parsed from the breadcrumb
+    /toc/<journal>/<vol>/<issue> link constrained by article__tocHeading
+    so the nav-menu /toc/mboc/0/0 ("In Press") link is skipped. Pages
+    come from a sibling `<div class=meta>X-Y</div>` next to the
+    Vol/No/<date> meta block (the only place a page range appears in
+    Atypon's molbiolcell template; citation_firstpage / citation_pages
+    are not emitted).
+
+    Year sources, in order of reliability:
+      1. dc.Rights "Copyright © YYYY ..." — original publication year.
+      2. <span class=epub-section__date>DD Mon YYYY</span>.
+      3. dc.Date.
     """
     title = get_meta(html, "dc.Title") or get_meta(html, "citation_title")
 
-    journal = get_meta(html, "citation_journal_title") or ""
+    journal = (get_meta(html, "citation_journal_abbrev")
+               or get_meta(html, "citation_journal_title") or "")
     journal = journal.rstrip(".")
 
-    # Year sources, in order of reliability:
-    #   1. dc.Rights "Copyright © YYYY ..." — original publication year.
-    #   2. <span class=epub-section__date>DD Mon YYYY</span> — matches dc.Rights
-    #      for modern papers, but can reflect a re-indexing date for older
-    #      articles (e.g. Scherthan 2000 shows "13 Oct 2017").
-    #   3. dc.Date fallback.
     year = ""
     rights = get_meta(html, "dc.Rights")
     if rights:
@@ -263,11 +186,6 @@ def _parse_metadata(html):
         get_meta(html, "publication_doi") or get_meta(html, "citation_doi")
     )
 
-    # Volume/issue: from the breadcrumb TOC link
-    # (/toc/<journal>/<vol>/<issue>). Require the article__tocHeading
-    # class so a nav-menu link like /toc/mboc/0/0 ("In Press") does not
-    # match. Class value may be quoted or unquoted; digits must both be
-    # positive (skip 0/0).
     volume = ""
     issue = ""
     for bm in re.finditer(
@@ -280,11 +198,22 @@ def _parse_metadata(html):
             issue = bm.group(2)
             break
 
-    # Pages: Mol Biol Cell HTML does not expose a first/last page pair
-    # anywhere (no citation_firstpage / citation_lastpage, no
-    # schema.org pageStart/pageEnd, no body byline). Leave empty when
-    # absent rather than returning an incomplete firstpage-only value.
+    # Pages live in a sibling <div class=meta>X-Y</div> next to the
+    # Vol/No header block. Capture every <div class=meta>...</div> and
+    # take the first whose visible text matches a numeric `start-end`
+    # range. Other meta divs hold a Vol/No anchor or a publication date
+    # (e.g. "December 01, 2000") so the explicit numeric-range filter
+    # picks out the right one without misreading the date.
     pages = ""
+    for pm in re.finditer(
+        r'<div\s+class=["\']?meta["\']?[^>]*>\s*(.*?)\s*</div>',
+        html, re.DOTALL,
+    ):
+        text = re.sub(r'<[^>]*>', '', pm.group(1)).strip()
+        rm = re.match(r'^(\d+)\s*[-–—]\s*(\d+)\s*$', text)
+        if rm:
+            pages = f"{rm.group(1)}-{rm.group(2)}"
+            break
 
     return {
         "title": title,
@@ -301,63 +230,23 @@ def _parse_metadata(html):
 # Authors
 # ---------------------------------------------------------------------------
 
-_SURNAME_PARTICLES = {
-    "de", "del", "della", "dell'", "di", "da", "dos", "du",
-    "van", "von", "vander", "der", "den", "ten", "ter",
-    "la", "le", "el", "al", "zu", "af",
-}
-
-
-def _format_display_name(name):
-    """Convert 'Given Middle LastName' to 'LastName IN'.
-
-    dc.Creator values are full names without commas; same particle-aware
-    formatter as jci/jove parsers.
-    """
-    name = (name.replace("\u2018", "'").replace("\u2019", "'")
-                .replace("\u201c", '"').replace("\u201d", '"')
-                .replace("\u2009", " ").replace("\u00a0", " ")).strip()
-    if not name:
-        return ""
-    parts = name.split()
-    if len(parts) == 1:
-        return parts[0]
-
-    i = len(parts) - 1
-    surname_parts = [parts[i]]
-    i -= 1
-    while i >= 0 and parts[i].lower().rstrip(".") in _SURNAME_PARTICLES:
-        surname_parts.insert(0, parts[i])
-        i -= 1
-    if (len(surname_parts) > 1 and i >= 1 and parts[i] and
-            parts[i][0].isupper() and not parts[i].endswith(".")):
-        surname_parts.insert(0, parts[i])
-        i -= 1
-
-    surname = " ".join(surname_parts)
-    given = " ".join(parts[:i + 1])
-    pieces = re.split(r"[\s.\-\u2010\u2011\u2012\u2013]+", given)
-    initials = "".join(p[0] for p in pieces if p and p[0].isupper())[:2]
-    return f"{surname} {initials}" if initials else surname
-
-
 def _parse_authors(html):
     """Extract authors with affiliations.
 
     Returns list of {"author": "LastName IN", "affiliation": [str, ...]}.
-    Uses dc.Creator meta tags (ordered) for names and the per-author
-    <div class="author-info accordion-tabbed__content"> blocks for
-    affiliations. Some papers omit affiliations entirely (empty list).
+    Names come from dc.Creator meta tags (ordered, full display "Given
+    Last") and go through format_author_name. Affiliations come from
+    per-author <div class="author-info accordion-tabbed__content"> blocks
+    in the same document order. Some papers omit affiliations entirely
+    (empty list).
     """
-    # Names from dc.Creator meta tags (preserve order)
     names = []
     for m in re.finditer(
-        r'<meta[^>]*name=["\']?dc\.Creator["\']?[^>]*content=["\']([^"\']*)',
+        r'<meta[^>]*name=["\']?dc\.Creator["\']?[^>]*content=["\']?([^"\'>]*)',
         html,
     ):
         names.append(unescape(m.group(1)).strip())
 
-    # Author info blocks, in order
     affiliations = []
     info_pat = re.compile(
         r'class=["\']?author-info\s+accordion-tabbed__content["\']?[^>]*>',
@@ -384,17 +273,21 @@ def _parse_authors(html):
                 depth -= 1
                 if depth == 0:
                     chunk = html[start:nxt_c.start()]
-                    # Drop the bottom-info block (contains "Search for more
-                    # papers by this author" link)
                     chunk = re.sub(
                         r'<div\s+class=["\']?bottom-info["\']?.*?</div>',
                         "", chunk, flags=re.DOTALL,
                     )
                     text = strip_tags(chunk)
                     text = re.sub(r"\s+", " ", text).strip()
-                    # Trim leading "author-type" artifact and "Search for"
                     text = re.sub(
                         r"^(?:Corresponding author.*?\.)?\s*", "", text,
+                    )
+                    # Strip leading "*Address correspondence to: ... )." block
+                    # MBC inserts before the affiliation for the corresponding
+                    # author.
+                    text = re.sub(
+                        r"^\*?\s*Address correspondence to:.*?\)\.?\s*",
+                        "", text, flags=re.IGNORECASE,
                     )
                     text = text.rstrip(";").rstrip(".").strip()
                     affiliations.append(text)
@@ -408,7 +301,7 @@ def _parse_authors(html):
     for i, name in enumerate(names):
         aff = affiliations[i] if i < len(affiliations) else ""
         authors.append({
-            "author": _format_display_name(name),
+            "author": format_author_name(name),
             "affiliation": [aff] if aff else [],
         })
     return authors
@@ -422,22 +315,23 @@ def _parse_references(html):
     """Extract the reference list.
 
     Returns list of {"": {title, journal, year, volume, issue, pages, doi, authors}}.
-    Each reference dict uses the same field formats as the main paper, with
-    one exception: authors is a list of "LastName IN" strings (plain strings,
-    not dicts with affiliation). Empty fields are "". Empty authors is [].
-    molbiolcell references follow the pattern:
+    Authors are flat "LastName IN" strings (no affiliation).
+
+    molbiolcell references follow the Literatum pattern:
       <li class=references__item>
         <span class=references__note>
           Authors (<span class=references__year>YYYY</span>). Title.
           <span class=references__source><strong>Journal.</strong></span>
-          <i>Vol</i>, fpage-lpage. [links]
+          <i>Vol</i>, fpage-lpage. [link panel]
         </span>
       </li>
+    Older MBC papers wrap authors in <span class=references__authors> and
+    title in <span class=references__article-title>; newer ones (2020+)
+    omit those structured spans and require plain-text parsing.
     """
     refs = []
-    # molbiolcell HTML embeds the reference list twice (one inline under
-    # the article body, another inside a tabbed "References" panel). Scope
-    # to the first <ul class=references> and parse only that list.
+    # MBC embeds the reference list twice (inline body + tabbed
+    # "References" panel). Scope to the first <ul class=references>.
     ul_m = re.search(
         r'<ul[^>]*class=["\']?(?:[^"\'>]*\s)?references(?:\s[^"\'>]*)?["\']?[^>]*>',
         html,
@@ -459,21 +353,20 @@ def _parse_references(html):
 
     for i in range(len(li_starts) - 1):
         entry = list_html[li_starts[i]:li_starts[i + 1]]
-        # Strip numeric label prefix (older MBC papers wrap the list
-        # number in <span class=label>N </span>).
         entry = re.sub(
             r'<span\s+class=["\']?label["\']?[^>]*>[^<]*</span>',
             "", entry,
         )
 
-        # Extract structured pieces
         year = ""
         ym = re.search(
             r'<span\s+class=["\']?references__year["\']?[^>]*>([^<]+)</span>',
             entry,
         )
         if ym:
-            year = re.search(r"\d{4}", ym.group(1)).group(0) if re.search(r"\d{4}", ym.group(1)) else ""
+            ym2 = re.search(r"\d{4}", ym.group(1))
+            if ym2:
+                year = ym2.group(0)
 
         journal = ""
         jm = re.search(
@@ -484,8 +377,7 @@ def _parse_references(html):
         if jm:
             journal = strip_tags(jm.group(1)).strip().rstrip(".").rstrip(",")
 
-        # DOI from Crossref linkout. URL params are HTML-entity encoded
-        # (&amp;); match dbid=16 (Crossref) and extract the key= value.
+        # DOI from Crossref linkout (dbid=16) preferred over generic link.
         doi = ""
         for lm2 in re.finditer(
             r'href=["\']?(https?://[^"\'>\s]*servlet/linkout[^"\'>\s]*)',
@@ -507,20 +399,17 @@ def _parse_references(html):
             if dm2:
                 doi = format_doi(unescape(dm2.group(1)))
 
-        # Strip the trailing link block (Crossref/Medline/Google Scholar)
-        # and the references__suffix span to isolate the citation text.
         cite = re.sub(
             r'<span\s+class=["\']?references__suffix["\']?.*?</span>',
             "", entry, flags=re.DOTALL,
         )
-        cite = re.sub(
-            r"<a\b[^>]*>.*?</a>", "", cite, flags=re.DOTALL,
-        )
+        cite = re.sub(r"<a\b[^>]*>.*?</a>", "", cite, flags=re.DOTALL)
         plain = strip_tags(cite).strip()
         plain = re.sub(r"\s+", " ", plain)
 
-        # Prefer structured fields when present (older MBC papers wrap
-        # authors/title in <span class=references__authors / __article-title>).
+        # Pull structured author/title spans first (older MBC). Authors
+        # are emitted as combined "Surname I.N." strings — pass each
+        # through format_author_name to satisfy the author-name contract.
         authors = []
         title = ""
         vol_pages = ""
@@ -537,29 +426,21 @@ def _parse_references(html):
             author_text = strip_tags(sa.group(1)).strip().rstrip(",").rstrip(";")
             author_text = re.sub(r"\s+", " ", author_text)
             title = strip_tags(st.group(1)).strip().rstrip(".")
-            # Parse authors: "Surname I.N., Surname I.N., ..."
-            # Older MBC uses no comma between surname and initials.
-            tokens = re.split(r",\s*", author_text)
-            for t in tokens:
-                t = t.strip().rstrip(".")
-                if not t or t.lower().startswith("et al"):
+            for tok in re.split(r",\s*", author_text):
+                tok = tok.strip().rstrip(".")
+                if not tok or tok.lower().startswith("et al"):
                     continue
-                mm = re.match(r"^(.+?)\s+([A-Z]\.?(?:\s*[A-Z]\.?)*)$", t)
-                if mm:
-                    surname = mm.group(1).strip()
-                    initials = re.sub(r"[.\s]", "", mm.group(2))
-                    authors.append(f"{surname} {initials}")
-                else:
-                    authors.append(t)
-            # vol_pages from plain text after the journal
+                authors.append(format_author_name(tok))
             if journal:
                 jpos = plain.find(journal)
                 if jpos >= 0:
                     vol_pages = plain[jpos + len(journal):].strip()
 
         if not authors:
-            # Newer MBC papers lack the structured spans; parse from plain
-            # text. Authors segment ends at "(YYYY)."; title follows.
+            # Newer MBC: parse from plain text. Authors segment ends at
+            # "(YYYY).", title follows up to the journal name. Each name
+            # token is "Surname I.N." — combine surname + initials and
+            # route through format_author_name.
             sm = re.search(r"\((\d{4}[a-z]?)\)\.\s*", plain)
             if sm:
                 author_str = plain[:sm.start()].strip().rstrip(",").rstrip(";")
@@ -576,37 +457,36 @@ def _parse_references(html):
                 author_str = re.sub(r"\band\b", ",", author_str)
                 tokens = [t.strip() for t in author_str.split(",") if t.strip()]
                 initials_re = re.compile(r"^[A-Z]\.?(?:\s*[A-Z]\.?)*\.?$")
-                i = 0
-                while i < len(tokens):
-                    s = tokens[i]
+                j = 0
+                while j < len(tokens):
+                    s = tokens[j]
                     if s.lower().startswith("et al"):
-                        i += 1
+                        j += 1
                         continue
-                    if i + 1 < len(tokens) and initials_re.match(tokens[i + 1]):
-                        initials = re.sub(r"[.\s]", "", tokens[i + 1])
-                        authors.append(f"{s} {initials}" if initials else s)
-                        i += 2
+                    if j + 1 < len(tokens) and initials_re.match(tokens[j + 1]):
+                        combined = f"{s} {tokens[j + 1]}"
+                        authors.append(format_author_name(combined))
+                        j += 2
                     else:
-                        authors.append(s)
-                        i += 1
+                        authors.append(format_author_name(s))
+                        j += 1
             else:
                 title = plain.rstrip(".")
 
-        # Parse volume/pages from vol_pages: "Vol, fpage-lpage." or variants.
-        # vol_pages typically starts with stray punctuation after the journal
-        # name was sliced out (", 22, 3474-3487" or "., 22, 3474-3487.").
+        # Volume/pages from the trailing tail. Format is typically
+        # ", 22, 3474-3487" (after the journal slice).
         volume = ""
         issue = ""
         pages = ""
         vp = re.sub(r"\s+", " ", vol_pages).strip()
         vp = vp.lstrip(".,; ").rstrip(".,; ")
         vm = re.match(
-            r"(\d+)\s*(?:\(([^)]+)\))?\s*,\s*(\w[\w\-\u2013]*?)\s*$", vp,
+            r"(\d+)\s*(?:\(([^)]+)\))?\s*,\s*(\w[\w\-–]*?)\s*$", vp,
         )
         if vm:
             volume = vm.group(1)
             issue = (vm.group(2) or "").strip()
-            pages = re.sub(r"[\u2013\u2014]", "-", vm.group(3))
+            pages = re.sub(r"[–—]", "-", vm.group(3))
 
         refs.append({"": {
             "title": title,
@@ -629,19 +509,20 @@ def _parse_main_text(html):
     """Extract body text.
 
     Boundary rules (from CLAUDE.md):
-      - Body sections: keep everything from abstract to before first references.
+      - Body sections: keep everything from abstract to before first
+        references section.
       - Supplementary: after first references, keep only sections matching
-        supplement/extended data/source data/expanded view/powerpoint/appendix.
-      - Remove all references sections.
-    Pipeline: locate article container -> slice body zones -> extract_captions
-    -> strip_common -> tags_to_text -> drop_noise.
-    molbiolcell-specific: full-text lives inside <div class=hlFld-Fulltext>.
-    Section titles are <h2 class="article-section__title ...">; iterate
-    sequential sections, stop at References.
+        supplement / extended data / source data / expanded view /
+        powerpoint / appendix.
+      - Remove all references sections from main_text.
+
+    Pipeline: locate article container -> slice body zones ->
+    extract_captions -> strip_common -> tags_to_text -> drop_noise.
+    molbiolcell-specific: full-text lives inside <div class=hlFld-Fulltext>;
+    abstract sits in a separate <div class=abstractSection>.
     """
     parts = []
 
-    # Abstract: <div class="abstractSection abstractInFull"><p>...</p></div>
     am = re.search(
         r'<div[^>]*class=["\']?[^"\'>]*abstractSection[^"\'>]*["\']?[^>]*>'
         r"(.*?)</div>",
@@ -663,9 +544,9 @@ def _parse_main_text(html):
     if not fm:
         return "\n\n".join(parts).strip()
     body_start = fm.end()
-    # Bound at whichever comes first: a REFERENCES heading, or the first
-    # <ul class=references> (older MBC papers put the reference list
-    # directly after Acknowledgments with no intervening h2).
+    # Bound at whichever comes first: a REFERENCES h2 heading, or the
+    # first <ul class=references> (older MBC papers put the reference
+    # list directly after Acknowledgments with no intervening h2).
     candidates = []
     ref_h2 = re.search(
         r'<h2[^>]*>\s*REFERENCES\s*</h2>', html[body_start:], re.IGNORECASE,
@@ -681,8 +562,6 @@ def _parse_main_text(html):
     body_end = body_start + (min(candidates) if candidates else len(html) - body_start)
     body_html = html[body_start:body_end]
 
-    # Strip "Previous/Next section" navigation links and the citedByEntry/
-    # related list if present.
     body_html = re.sub(
         r"<a[^>]*>\s*(?:Previous|Next)\s+section\s*</a>",
         "", body_html, flags=re.IGNORECASE,

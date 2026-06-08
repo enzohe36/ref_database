@@ -8,6 +8,7 @@ No args: every papers/parsed/<stem>.json with a corresponding
 papers/raw/<stem>_converted.json.
 
 A list arg is a file containing PMIDs separated by spaces or newlines.
+Lines starting with '#' are ignored (comments).
 
 For each pair (parsed/<stem>.json, raw/<stem>_converted.json):
   - authors: fill empty author affiliations from _converted.json (matched by
@@ -21,7 +22,7 @@ For each pair (parsed/<stem>.json, raw/<stem>_converted.json):
 
 Runs in parallel (ThreadPoolExecutor). PMID resolution for empty `pmid`
 fields in `_converted.json`'s references[] is a separate step; run
-get_pmids.py before merge_refs.py if needed.
+get_pmid.py before merge_refs.py if needed.
 """
 
 import json

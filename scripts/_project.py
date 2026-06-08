@@ -58,36 +58,19 @@ def project_pmids_file(name):
 
 
 def project_pmids(name):
-    """Read projects/<name>/pmids.txt; return set of PMID strings."""
+    """Read projects/<name>/pmids.txt; return set of PMID strings.
+
+    Lines whose first non-whitespace character is '#' are ignored (comments).
+    """
     path = project_pmids_file(name)
     if not path.exists():
         return set()
     text = path.read_text(encoding="utf-8")
+    text = "\n".join(
+        line for line in text.splitlines()
+        if not line.lstrip().startswith("#")
+    )
     return set(re.findall(r"\d+", text))
-
-
-def add_pmids_to_project(name, pmids):
-    """Append given PMIDs to projects/<name>/pmids.txt, deduping. Creates the file
-    and parent dirs if missing. Returns the list of newly added PMIDs (may be empty).
-    """
-    pdir = projects_dir() / name
-    pdir.mkdir(parents=True, exist_ok=True)
-    path = project_pmids_file(name)
-    existing = project_pmids(name)
-    new = []
-    for p in pmids:
-        if not p or not re.fullmatch(r"\d+", str(p)):
-            continue
-        if p not in existing:
-            existing.add(p)
-            new.append(p)
-    if not new:
-        return []
-    with open(path, "a", encoding="utf-8") as f:
-        if path.stat().st_size > 0 and not path.read_text().endswith("\n"):
-            f.write("\n")
-        f.write("\n".join(new) + "\n")
-    return new
 
 
 def pmid_to_stem(pmid):

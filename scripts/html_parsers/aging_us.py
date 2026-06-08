@@ -39,7 +39,153 @@ _NOISE = (
 
 
 # ---------------------------------------------------------------------------
-# JSON-LD + HTML shared helpers
+# Banner removal
+# ---------------------------------------------------------------------------
+
+def remove_banners(html):
+    """Normalize aging-us HTML to a centered 720-px reading column.
+
+    Layout: site `<header>` (fixed top bar) + page-wide gray wrapper that
+    holds a flex row of three columns — left ad rail (`w-[240px]` div),
+    article column (`flex-1 min-w-[400px]`), right `<aside>` containing
+    a sticky TOC. Site `<footer>` follows. The article column is the
+    only content surface; everything else is chrome we strip.
+    """
+    # Step 1 — collapse desktop @media branches so the publisher's narrow
+    # CSS applies at any viewport.
+    html = neutralize_media_queries(html)
+
+    # Step 3 — remove the fixed-position site header (sticky scan flagged
+    # `<header class="fixed top-0 ...">`) and the corresponding `<footer>`
+    # which we treat as page-wide chrome. The TOC `<aside>` is removed in
+    # Step 4 below.
+    for _ in range(3):
+        before = html
+        html = _remove_nested_element(html, r"<header\b[^>]*>")
+        if html == before:
+            break
+    for _ in range(3):
+        before = html
+        html = _remove_nested_element(html, r"<footer\b[^>]*>")
+        if html == before:
+            break
+
+    # Step 4 — vertical sidebars. Two siblings of the article column:
+    #   (a) `<div class="hidden min-[970px]:block shrink-0 w-[240px]">`
+    #       — left ad/banner rail (also matches the older `space-y-6 ml-2`
+    #       class on legacy DOM variants).
+    #   (b) `<aside class="hidden min-[970px]:flex flex-col shrink-0
+    #       w-[270px] ...">` — right column hosting the sticky
+    #       "PAPER SECTIONS" TOC (which scan_sticky flagged).
+    for _ in range(4):
+        before = html
+        html = _remove_nested_element(
+            html,
+            r'<div\b[^>]*\bclass="[^"]*\bw-\[240px\][^"]*"[^>]*>',
+        )
+        if html == before:
+            break
+    for _ in range(4):
+        before = html
+        html = _remove_nested_element(html, r"<aside\b[^>]*>")
+        if html == before:
+            break
+    for _ in range(4):
+        before = html
+        html = _remove_nested_element(
+            html,
+            r'<div\b[^>]*\bclass="[^"]*\bspace-y-6\b[^"]*\bml-2\b[^"]*"[^>]*>',
+        )
+        if html == before:
+            break
+
+    # Step 5 — third-party altmetric popover. The page ships a direct
+    # body-child `<div class="altmetric-popover">` with inline
+    # `display:none` that pairs with the article's altmetric badge as a
+    # hover-only overlay. The body-cap CSS below would otherwise force
+    # it visible at fixed pixel size + z-index 1010, escaping the cap.
+    for _ in range(6):
+        before = html
+        html = _remove_nested_element(
+            html,
+            r'<div\b[^>]*\bclass="[^"]*\baltmetric-popover\b[^"]*"[^>]*>',
+        )
+        if html == before:
+            break
+
+    # Steps 1 + 6 + 8 + 11 — body cap, page background, figure CSS.
+    # Wrapper: div[class*="min-w-[400px]"] uniquely tags the article
+    # column. Brackets are literal characters in the Tailwind utility
+    # value and are valid inside a quoted attribute selector.
+    override = (
+        "<style>"
+        # Step 1 — body cap + center.
+        "html{width:100% !important;max-width:100% !important;"
+        "margin:0 !important;background:#fff !important}"
+        "body{width:100% !important;min-width:0 !important;"
+        "max-width:752px !important;margin:0 auto !important;"
+        "background:#fff !important;color:#000 !important}"
+        # Step 6 — collapse outer flex / max-width wrappers so the
+        # article column inherits the body cap. Strip residual bg
+        # colours from page-level wrappers (`bg-[#e7e8ec]`,
+        # `bg-[#f6f7f9]`).
+        'body>div,body>div>div,[class*="max-w-["]{'
+        "display:block !important;width:auto !important;"
+        "max-width:100% !important;min-width:0 !important;"
+        "margin:0 auto !important;padding:0 !important;"
+        "float:none !important;background:#fff !important;"
+        "box-shadow:none !important}"
+        # Step 1 — capped reading-column wrapper.
+        ':root div[class*="min-w-[400px]"]{'
+        "float:none !important;display:block !important;"
+        "width:auto !important;max-width:752px !important;"
+        "margin:0 auto !important;padding:24px 16px !important;"
+        "box-sizing:border-box !important;background:#fff !important}"
+        ':root div[class*="min-w-[400px]"] *{'
+        "max-width:100% !important;min-width:0 !important;"
+        "box-sizing:border-box !important;"
+        "overflow-wrap:break-word !important;"
+        "word-break:break-word !important}"
+        # The publisher inset the article block another ~30 px on top
+        # and 15 px each side via Tailwind utilities; zero only the
+        # axes those utilities control.
+        ':root div[class*="min-w-[400px]"] > div[class*="pt-[30px]"]{'
+        "padding-top:0 !important}"
+        ':root div[class*="min-w-[400px]"] > div[class*="px-[15px]"]{'
+        "padding-left:0 !important;padding-right:0 !important}"
+        ':root div[class*="min-w-[400px]"] > *:first-child{'
+        "margin-top:0 !important;padding-top:0 !important}"
+        ':root div[class*="min-w-[400px]"] > *:last-child{'
+        "margin-bottom:0 !important;padding-bottom:0 !important}"
+        # Step 11 — wide tables fixed-layout so cells don't push past
+        # the body cap.
+        ':root div[class*="min-w-[400px]"] table{'
+        "width:100% !important;max-width:100% !important;"
+        "table-layout:fixed !important}"
+        # Step 8 — figure layout. aging-us wraps each figure in
+        #   <div class="my-8 bg-white shadow-... p-8">
+        #     <a data-figure-id=fN href=.../figure/fN/large/>
+        #       <img class="max-w-full mx-auto border border-slate-200">
+        # Tailwind `max-w-full mx-auto` only scales DOWN. Force the
+        # img to span column width above its caption with a small gap.
+        ':root div[class*="min-w-[400px]"] a[data-figure-id]{'
+        "display:block !important;width:auto !important;"
+        "margin:0 !important;padding:0 !important}"
+        ':root div[class*="min-w-[400px]"] a[data-figure-id] > img{'
+        "display:block !important;width:100% !important;"
+        "height:auto !important;max-width:100% !important;"
+        "margin:0 0 5px 0 !important}"
+        "</style>"
+    )
+    if "</head>" in html:
+        html = html.replace("</head>", override + "</head>", 1)
+    else:
+        html = re.sub(r"(<body\b)", override + r"\1", html, count=1)
+    return html
+
+
+# ---------------------------------------------------------------------------
+# Metadata
 # ---------------------------------------------------------------------------
 
 def _load_jsonld(html):
@@ -83,131 +229,6 @@ def _extract_pub_line(html):
         out["pages"] = f"{m.group(1)}-{m.group(2)}"
     return out
 
-
-# ---------------------------------------------------------------------------
-# Banner removal
-# ---------------------------------------------------------------------------
-
-def remove_banners(html):
-    """Normalize aging-us HTML to a single centered text column.
-
-    Chrome stripped (Step 3):
-      - Site `<header>` / `<footer>`.
-      - Left sidebar column (`aside` tag or `.space-y-6.ml-2` container
-        holding journal banners / ad art / EPIC awards).
-
-    Reading column (Step 4): `div[class*="min-w-[400px]"]` — the Tailwind
-    article-column wrapper that contains the metadata row, h1 title,
-    author list, abstract, body (`.article-text`), and references.
-    """
-    # Lock layout to publisher's narrow (≤1024 px) form at any viewport.
-    html = neutralize_media_queries(html)
-    # Step 3 — strip chrome.
-    for _ in range(5):
-        before = html
-        html = _remove_nested_element(html, r"<header\b[^>]*>")
-        if html == before:
-            break
-    for _ in range(5):
-        before = html
-        html = _remove_nested_element(html, r"<footer\b[^>]*>")
-        if html == before:
-            break
-    # Left sidebar column: a flex sibling of the article column.
-    # Identify by an `<aside>` with content, OR a <div> whose class
-    # contains `space-y-6 ml-2` (journal banner / award column).
-    for _ in range(4):
-        before = html
-        html = _remove_nested_element(html, r"<aside\b[^>]*>")
-        if html == before:
-            break
-    for _ in range(4):
-        before = html
-        html = _remove_nested_element(
-            html,
-            r'<div\b[^>]*\bclass="[^"]*\bspace-y-6\b[^"]*\bml-2\b[^"]*"[^>]*>',
-        )
-        if html == before:
-            break
-
-    # Steps 2 + 4 — layout freeze and reading-column cap.
-    # Wrapper: div[class*="min-w-[400px]"] — Tailwind arbitrary value
-    # used uniquely on the article column. The brackets are literal
-    # characters inside the quoted attribute selector value.
-    override = (
-        "<style>"
-        "html{width:100% !important;max-width:100% !important;"
-        "margin:0 !important;background:#fff !important}"
-        "body{width:100% !important;min-width:0 !important;"
-        "max-width:752px !important;margin:0 auto !important;"
-        "background:#fff !important;color:#000 !important}"
-        # Collapse the outer flex / max-width containers that shape the
-        # site's full-viewport layout.
-        'body>div,body>div>div,[class*="max-w-["]{'
-        "display:block !important;width:auto !important;"
-        "max-width:100% !important;min-width:0 !important;"
-        "margin:0 auto !important;padding:0 !important;"
-        "float:none !important;background:#fff !important;"
-        "box-shadow:none !important}"
-        # Capped reading-column wrapper.
-        ':root div[class*="min-w-[400px]"]{'
-        "float:none !important;display:block !important;"
-        "width:auto !important;max-width:752px !important;"
-        "margin:0 auto !important;padding:56px 16px !important;"
-        "box-sizing:border-box !important;background:#fff !important}"
-        ':root div[class*="min-w-[400px]"] *{'
-        "max-width:100% !important;min-width:0 !important;"
-        "box-sizing:border-box !important}"
-        # Strip the utility-class inner padding that natively inset the
-        # content column by 15-30 px on each side. Zero only the axes
-        # the matched utility actually controls (`pt-[30px]` → padding-
-        # top; `px-[15px]` → padding-left/right) so a `pb-[15px]` on the
-        # same div keeps its native bottom padding.
-        ':root div[class*="min-w-[400px]"] > div[class*="pt-[30px]"]{'
-        "padding-top:0 !important}"
-        ':root div[class*="min-w-[400px]"] > div[class*="px-[15px]"]{'
-        "padding-left:0 !important;padding-right:0 !important}"
-        # Direct-child first-/last-child margin zero.
-        ':root div[class*="min-w-[400px]"] > *:first-child{'
-        "margin-top:0 !important;padding-top:0 !important}"
-        ':root div[class*="min-w-[400px]"] > *:last-child{'
-        "margin-bottom:0 !important;padding-bottom:0 !important}"
-        # Tables: fixed layout so wide cells don't push past the wrapper.
-        ':root div[class*="min-w-[400px]"] table{'
-        "width:100% !important;max-width:100% !important;"
-        "table-layout:fixed !important}"
-        # Figures: aging-us renders each figure inside a Tailwind card
-        #   <div class="my-8 bg-white shadow-... p-8">
-        #     <a data-figure-id=F<N> href=<sub-page>/figure/F<N>/large/>
-        #       <img alt class="max-w-full mx-auto border ...">
-        # The img has Tailwind `max-w-full mx-auto`, which lets it scale
-        # DOWN to container but not UP past its intrinsic size — at
-        # narrow column the image renders at native pixel width
-        # (~400-700 px), narrower than the 720-px column. Force block +
-        # 100% width above the caption. The high-res JPEG lives on a
-        # sub-page (`.../figure/F<N>/large/`) which requires sub-page
-        # traversal to inline (not a single-URL swap) — deferred to a
-        # post_capture pass in get_refs.py; this CSS just handles the
-        # visible layout.
-        ':root div[class*="min-w-[400px]"] a[data-figure-id]{'
-        "display:block !important;width:auto !important;"
-        "margin:0 !important;padding:0 !important}"
-        ':root div[class*="min-w-[400px]"] a[data-figure-id] > img{'
-        "display:block !important;width:100% !important;"
-        "height:auto !important;max-width:100% !important;"
-        "margin:0 0 5px 0 !important}"
-        "</style>"
-    )
-    if "</head>" in html:
-        html = html.replace("</head>", override + "</head>", 1)
-    else:
-        html = re.sub(r"(<body\b)", override + r"\1", html, count=1)
-    return html
-
-
-# ---------------------------------------------------------------------------
-# Metadata
-# ---------------------------------------------------------------------------
 
 def _parse_metadata(html):
     """Extract bundled metadata via JSON-LD + HTML fallbacks."""
@@ -356,7 +377,7 @@ def _parse_authors(html):
 # ---------------------------------------------------------------------------
 
 _REF_LI_RE = re.compile(
-    r'<li\s+id=["\']?R\d+["\']?[^>]*>(.*?)(?=<li\s+id=["\']?R\d+["\']?|</ul>)',
+    r'<li\s+id=["\']?[Rr]\d+["\']?[^>]*>(.*?)(?=<li\s+id=["\']?[Rr]\d+["\']?|\Z)',
     re.DOTALL,
 )
 
@@ -364,11 +385,18 @@ _REF_LI_RE = re.compile(
 def _parse_ref_text(text):
     """Parse one aging-us reference's plain text into structured fields.
 
-    Observed format after `strip_tags`:
-      "Author1, Author2 and Author3. Title. Journal. Year; Volume:FP-LP."
-    or with issue:
-      "... Year; Volume(Issue):FP-LP."
-    Some older entries omit the period after author list.
+    Observed citation tails (after `strip_tags`):
+      "... Journal. Year; Volume:FP-LP."           (canonical)
+      "... Journal. Year; Volume(Issue):FP-LP."    (issue in parens)
+      "... Journal. Year (Suppl 1); Volume:FP-LP." (NIH supplement form)
+      "... Journal. Year."                         (forthcoming/online-only)
+      "... (Year). Title. Publisher. pp. FP-LP."   (book chapter)
+
+    Pages may include letter prefixes (S1–3, R115), en-dashes, and
+    space-padded hyphens (`161 -170`) introduced by the publisher's
+    span-per-token markup. Older Aging entries also drop the period
+    between author list and title (`Martin GM Genetics and aging...`),
+    so we detect that shape after the canonical split fails.
     """
     text = re.sub(r"\s+", " ", text).strip()
     text = re.sub(r"\[\s*PubMed\s*\]\.?", "", text).strip()
@@ -378,18 +406,46 @@ def _parse_ref_text(text):
         "pages": "", "doi": "", "authors": [],
     }
 
+    # Canonical: "YEAR[ (Suppl X)]; VOL[(ISSUE)]: PAGES". The optional
+    # parenthesized supplement label between year and `;` becomes the
+    # issue; the in-volume `(ISSUE)` form takes precedence when both
+    # are present (older PMC-style entries don't use the suppl form).
+    # Pages alternative covers digit-led ('161-170', 'S1-3', 'R115',
+    # 'e4825'), Roman ('v-vii' for editorial front-matter), and
+    # space-padded hyphens introduced by the publisher's span markup.
+    pages_pat = (
+        r"(?:[A-Za-z]?\d[\w\d]*\s*[\-–]\s*[A-Za-z]?\d[\w\d]*"
+        r"|[A-Za-z]?\d[\w\d]*"
+        r"|[ivxIVX]+\s*[\-–]\s*[ivxIVX]+"
+        r"|[ivxIVX]+)"
+    )
     m = re.search(
-        r"(\d{4})\s*;\s*(\w+)"
+        r"(\d{4})\s*(?:\(([^)]+)\))?\s*;\s*(\w+)"
         r"(?:\s*\(([^)]+)\))?"
-        r"\s*:\s*([\w\d\-–]+)",
+        r"\s*:\s*(" + pages_pat + r")",
         text,
     )
     if m:
         result["year"] = m.group(1)
-        result["volume"] = m.group(2)
-        if m.group(3):
-            result["issue"] = m.group(3)
-        result["pages"] = m.group(4).replace("–", "-")
+        result["volume"] = m.group(3)
+        # Prefer in-volume `(ISSUE)` over the year-side `(Suppl X)`.
+        if m.group(4):
+            result["issue"] = m.group(4)
+        elif m.group(2):
+            result["issue"] = m.group(2)
+        result["pages"] = re.sub(r"\s*[\-–]\s*", "-", m.group(5))
+    else:
+        # Year-only tail ("... Journal. 2017.") — keep year, leave
+        # volume/issue/pages empty so downstream code knows the citation
+        # is incomplete rather than fabricating values.
+        m = re.search(r"(\d{4})\s*\.\s*(?:https?://|$)", text)
+        if m:
+            result["year"] = m.group(1)
+        else:
+            # Book chapter: "Author. (YEAR). Title. ..."
+            m = re.search(r"\((\d{4})\)\s*\.", text)
+            if m:
+                result["year"] = m.group(1)
 
     if m:
         pre = text[:m.start()].strip().rstrip(".").strip()
@@ -536,6 +592,15 @@ def _parse_main_text(html):
                     end = pos + nc.start()
                 pos += nc.end()
         body_html = html[body_m.end():end]
+        # Truncate at the References heading — both old and new aging-us
+        # DOMs nest the references list inside the same `article-text`
+        # wrapper that holds the body, so the depth-balanced extraction
+        # above otherwise pulls References into main_text.
+        ref_h = re.search(
+            r'<h2[^>]*>\s*References\s*</h2>', body_html, re.IGNORECASE,
+        )
+        if ref_h:
+            body_html = body_html[:ref_h.start()]
         body_html = extract_captions(body_html)
         body_html = strip_common(body_html)
         text = tags_to_text(body_html).strip()

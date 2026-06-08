@@ -26,29 +26,6 @@ def detect_url(html):
     return m.group(1) if m else ""
 
 
-# Domains that share the same HTML structure and parser.
-# When an alias is used, the original URL is unreliable for retry;
-# use DOI with preloading to resolve the correct publisher URL.
-_DOMAIN_ALIASES = {
-    "elsevier": "sciencedirect",
-    "springer": "nature",
-    "portlandpress": "oup",
-    "royalsocietypublishing": "oup",
-    "rupress": "oup",
-    # science.org and sagepub both run on Atypon Literatum and share the
-    # same dc.* meta tags, core-author/core-collateral DOM, and
-    # <div id=R/B class=citations> reference markup.
-    "sagepub": "science",
-    # ashpublications (Blood etc.) uses the same Silverchair article-body /
-    # data-content-id=b / ref-list layout as aacrjournals.
-    "ashpublications": "aacrjournals",
-    # biologists.com (J Cell Sci etc.) uses the same Silverchair article-body
-    # and ref-list layout as aacrjournals; refs use content-id=<paperid>cN
-    # instead of data-content-id=bN — aacrjournals handles both.
-    "biologists": "aacrjournals",
-}
-
-
 def detect_domain(html):
     """Extract second-level domain from SingleFile's url comment.
 
@@ -66,8 +43,7 @@ def detect_domain(html):
     parts = [p for p in netloc.split(".") if p != "www"]
     sld = parts[-2] if len(parts) >= 2 else parts[0]
     # Replace punctuation with _ for valid Python module names
-    sld = re.sub(r"[^A-Za-z0-9]", "_", sld)
-    return _DOMAIN_ALIASES.get(sld, sld)
+    return re.sub(r"[^A-Za-z0-9]", "_", sld)
 
 
 

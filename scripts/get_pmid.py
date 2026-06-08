@@ -2,7 +2,7 @@
 """Resolve every empty `pmid` field in JSON files via PubMed search.
 
 Usage:
-    python get_pmids.py [<pmid|json|list> ...]
+    python get_pmid.py [<pmid|json|list> ...]
 
 No args: every papers/raw/<stem>_converted.json on disk.
 
@@ -15,7 +15,7 @@ sibling bibliographic fields (doi, title, journal, year, etc.) to form
 a useful query.
 
 A list arg is a file containing PMIDs and/or JSON paths, separated by
-spaces or newlines.
+spaces or newlines. Lines starting with '#' are ignored (comments).
 
 Resolution scope: the script walks the JSON recursively and, for every
 dict that contains an empty (or missing-value) `pmid` key, builds a

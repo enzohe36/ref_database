@@ -1,7 +1,6 @@
 """American Chemical Society (acs) HTML parser."""
 
 import re
-import urllib.parse
 from html import unescape
 
 from ._helpers import (
@@ -11,7 +10,6 @@ from ._helpers import (
     format_author_name,
     format_doi,
     neutralize_media_queries,
-    remove_elements_by_id,
     remove_elements_by_selector,
     strip_common,
     strip_tags,
@@ -38,9 +36,12 @@ _ALL_SECTION_RE = re.compile(
     r'<div\s+(?:id=sec\d+\s+)?class="NLM_sec\s+NLM_sec_level_1"[^>]*>', re.DOTALL
 )
 
-# Supplementary section patterns (kept after first references)
+# Supplementary section patterns (kept after first references). ACS uses
+# "Supporting Information" as the canonical heading for supplementary
+# materials; the generic "supplement" token doesn't match it.
 _SUPP_RE = re.compile(
-    r"supplement|extended data|source data|expanded view|appendix",
+    r"supplement|supporting information|extended data|source data|"
+    r"expanded view|appendix",
     re.IGNORECASE,
 )
 
@@ -50,295 +51,171 @@ _SUPP_RE = re.compile(
 # ---------------------------------------------------------------------------
 
 def remove_banners(html):
-    """Normalize ACS HTML to a single centered text column.
+    """Apply Phase 2 layout rules for pubs.acs.org.
 
-    Chrome stripped (Step 3):
-      - Site `<header>` and `<footer>`.
-      - Outer `<main id=main-desktop>` wrapper attributes are kept; the
-        article wrapper is the inner `<main class="content article">`
-        which holds `<article>`.
-      - Pre-title chrome inside `.article_header-left` (breadcrumbs,
-        mobile logo, access-icons, share dropdown) — strip via the
-        targeted classes so only the publication-type/date row + title
-        remain at the top of the reading column.
-      - "Cited By" section (`<div class=cited-by>`) and every following
-        post-article block (Citing/Recommended/Subjects/Comments).
-
-    Visibility tweaks (Step 4):
-      - Force-expand the "View Author Information" affiliations accordion
-        (`#affiliations-popup`).
-      - Hide the `.figure-viewer` modal via CSS only — its `cit-fg-*`
-        spans are read by `_parse_metadata`, so it must not be removed
-        from the DOM.
-
-    Reading column wrapper: `<main class="content article">`. Cap at
-    752 px with 56 px top/bottom + 16 px side padding.
+    Step 1: cap body width at 752 px, center, neutralize @media queries
+            so the publisher's narrow CSS branch always applies.
+    Step 2: no native cookie banner ships in the captured DOM (the
+            "Manage Cookies" link in the footer opens the Osano drawer
+            on demand, but the drawer itself is not in the static
+            snapshot).
+    Step 3: sticky/fixed elements — the page-wide top `<header
+            class=header>` (position: fixed, 130 px tall, lives at
+            top:0); the off-canvas right-side `.recentlyViewed` drawer
+            (1200 px wide, parked off-screen until activated); and the
+            `.w-slide` / `.w-slide_head` slide-in modal pair (also
+            off-screen until activated). All four are removed in DOM so
+            the page no longer reserves their space.
+    Step 5: ad blocks — `<div class=advertisement>` (and its inner
+            `advertisement-link`) wrappers ship empty in the static
+            snapshot but reserve vertical space, and the `<li
+            class="sponsoredContent show-recommended__item">` slot in
+            the post-article recommendations row is a sponsored
+            placeholder. All removed.
+    Step 8: figures — cap `.article__inlineFigure`, its inner
+            `.figure-viewer__trigger` button and `img.inline-fig` to
+            the column width; image above caption with 12 px gap.
+            `.NLM_table-wrap` gets `overflow-x:auto` so wide native
+            tables scroll within the column instead of overflowing.
+    Step 9: expand the `#affiliations-popup` drawer (publisher hides
+            with `display:none` until the user clicks "View Author
+            Information") so each author's affiliation renders inline
+            beneath the author block.
+    Step 10: zero out `main.content`'s `margin-top:77px` (publisher
+             reserves it for the fixed header removed in Step 3).
+    Step 11: drop the `.article-grid` `padding-inline:16px` and force
+             a single full-width grid column; cap `.article__left-side`
+             so it shrinks to the body cap at every viewport.
     """
-    # Lock layout to publisher's narrow (≤1024 px) form at any viewport.
     html = neutralize_media_queries(html)
-    # -------------------------------------------------------------------
-    # Step 3 — strip chrome.
-    # -------------------------------------------------------------------
-    # The site header is `<header class="header header_...">`. Inline
-    # sub-headers (`<header class=article__tags__header>` for the Subjects
-    # block, `<header class=...>` inside reference lists) must NOT be
-    # stripped — the parser captures their text. Match only on the
-    # site-header class prefix.
-    for _ in range(5):
-        before = html
-        html = _remove_nested_element(
-            html, r'<header\b[^>]*class="header(?:\s+|")',
-        )
-        if html == before:
-            break
-    # Footer: `<footer class=footer ...>`. Inline figshare-widget footer
-    # `<footer class=frontend-filesViewer-...>` carries the
-    # "Share / Download / figshare" caption that the parser emits into
-    # main_text — match only the site footer's `class=footer` token.
-    for _ in range(5):
-        before = html
-        html = _remove_nested_element(
-            html, r'<footer\b[^>]*\bclass=(?:"footer"|footer\b)',
-        )
-        if html == before:
-            break
-    # Cookie / CCPA / chat widgets that float over the article.
-    for sel in (
-        "onetrust-consent-sdk", "onetrust-banner-sdk",
-        "SnapABug_CMW", "SnapABug_CM",
-    ):
-        html = remove_elements_by_id(html, sel)
-    # Pre-title chrome inside article_header-left.
-    for cls in (
-        "article_header-dropzone-1", "article_header-logo",
-        "article_header-icons", "article_header-share",
-        # Mobile layout surfaces a headerLogo/e-alerts block at the very
-        # top of article_header-left (visible only below the desktop
-        # breakpoint). Strip so the publication-type line is the first
-        # rendered text at every viewport.
-        "headerLogo_e-alertsMobile_container",
-        "e-alertsMobile_container",
-    ):
-        for _ in range(8):
-            before = html
-            html = _remove_nested_element(
-                html, rf'<div\b[^>]*class="?{cls}\b[^>]*>',
-            )
-            if html == before:
-                break
-    # Sticky duplicate header that appears on scroll (article_stickyheader).
-    html = _remove_nested_element(
-        html, r'<div\b[^>]*class="?[^"]*\barticle_stickyheader\b[^"]*"?[^>]*>',
-    )
-    # Right-rail content column (cover image, PDF buttons, alerts).
-    html = remove_elements_by_id(html, "article_content-right")
-    # Cited By + everything after (block has class=cited-by; the trailing
-    # widgets sit inside article-side panes the wrapper still contains).
-    html = _remove_nested_element(
-        html, r'<div\b[^>]*\bclass="?cited-by\b[^>]*>',
-    )
-    # Floating section-tab navigator (Abstract / Figures / References /
-    # Supporting Info shortcuts). It is position:absolute with a dummy
-    # body ~29,000 px tall that extends docH, and overlaps the article
-    # when pinned sticky. Drop the wrapper.
-    html = _remove_nested_element(
-        html, r'<nav\b[^>]*\bclass=[\'"]?tab-nav-shortcut__wrapper\b[^>]*>',
-    )
-    # Recommended-articles drawer. (Don't strip subjects__heading —
-    # Subjects sits before Cited By per the user's column-end anchor
-    # and feeds main_text. Don't strip #about-article-metrics — it's
-    # a hidden popup whose `margin-top:15px` participates in the
-    # margin cascade above the Abstract heading; removing it
-    # collapses 15 px of spacing.)
-    for sel in (
-        "show-recommended__list",
-        "article_drawer_RecommendedShowMore",
-        "article_drawer_RecommendedShowLess",
-    ):
-        html = remove_elements_by_id(html, sel)
-    # Skip-link anchors that occupy a line at the top of body.
-    html = remove_elements_by_id(html, "skip-to-article", "skip-to-sidebar")
 
-    # -------------------------------------------------------------------
-    # Steps 2 + 4 — layout freeze, column cap, expand author-info,
-    # hide figure-viewer modal (DOM-preserved for parser).
-    # -------------------------------------------------------------------
+    # Step 3 — page-wide fixed header (always-on top chrome). Use the
+    # full opening-tag pattern so we don't false-match other <header>s
+    # (the article body has its own <header class=article__tags__header>).
+    while True:
+        new = _remove_nested_element(
+            html,
+            r'<header\s+class="?header header_article_inactive[^"]*"?[^>]*>',
+        )
+        if new == html:
+            break
+        html = new
+    # Step 3 — off-canvas drawers (faux-sticky / fixed at off-screen x).
+    while True:
+        new = _remove_nested_element(
+            html,
+            r'<div\s+class=("[^"]*\brecentlyViewed\b[^"]*"|recentlyViewed\b)[^>]*>',
+        )
+        if new == html:
+            break
+        html = new
+    for cls in ("article__w-slide", "w-slide_head"):
+        while True:
+            prev = html
+            html = remove_elements_by_selector(html, cls)
+            if html == prev:
+                break
+
+    # Step 5 — ad slots. Empty in static capture but reserve vertical
+    # space, plus the sponsored-content slot in the recommendations row.
+    for cls in ("advertisement", "sponsoredContent"):
+        while True:
+            prev = html
+            html = remove_elements_by_selector(html, cls)
+            if html == prev:
+                break
+    # The advertisement wrapper inside ACS pages is `<div class=advertisement>`
+    # (unquoted) — remove_elements_by_selector matches double-quoted classes
+    # only. Use _remove_nested_element to catch the unquoted form.
+    while True:
+        new = _remove_nested_element(
+            html,
+            r'<div\s+class=advertisement\b[^>]*>',
+        )
+        if new == html:
+            break
+        html = new
+    while True:
+        new = _remove_nested_element(
+            html,
+            r'<li\s+class="sponsoredContent[^"]*"[^>]*>',
+        )
+        if new == html:
+            break
+        html = new
+
     override = (
         "<style>"
-        "html{width:100% !important;max-width:100% !important;"
-        "margin:0 !important;background:#fff !important}"
-        "body{width:100% !important;min-width:0 !important;"
-        "max-width:752px !important;margin:0 auto !important;"
-        "background:#fff !important;color:#000 !important}"
-        # Outer main wrapper + ancestor grids collapse to plain block.
-        # `.article-grid` ships as a 2-column CSS grid (article__left-side
-        # + article__right-side) that pins the left side to track 1 with
-        # track 2 reserved for the sidebar. Override to single-column so
-        # the left-side content takes the full wrapper width.
-        "#main-desktop,#pb-page-content,#pb-page-content>div,"
-        ".article__pubdate,.article-grid,"
-        "#article__left-side,.article__left-side,.article_fullPage{"
-        "display:block !important;"
-        "width:100% !important;max-width:100% !important;"
-        "margin:0 !important;padding:0 !important;float:none !important;"
-        "grid-template-columns:none !important;"
-        "grid-template-areas:none !important;"
-        "background:#fff !important}"
-        # Capped reading-column wrapper.
-        ":root main.content.article{"
-        "float:none !important;display:block !important;"
-        "width:auto !important;max-width:752px !important;"
-        "margin:0 auto !important;padding:56px 16px !important;"
-        "box-sizing:border-box !important;background:#fff !important}"
-        ":root main.content.article *{"
-        "max-width:100% !important;min-width:0 !important;"
-        "box-sizing:border-box !important}"
-        # The article header splits into a 2-col flex row at desktop
-        # widths (article_header-left ~ calc(100% - 16.25rem), right
-        # 16.25rem). After right column removal the left is calc-clamped
-        # to less than 100%. Force flex children to plain block + 100%
-        # width.
-        ":root main.content.article .article_header,"
-        ":root main.content.article .article_header-left,"
-        ":root main.content.article .article_header-meta,"
-        ":root main.content.article .article_header-meta-left,"
-        ":root main.content.article .article_header-meta-right,"
-        ":root main.content.article .article_header-meta-center,"
-        ":root main.content.article .article_header-footer,"
-        ":root main.content.article .article_header-footer-left,"
-        ":root main.content.article .article_header-footer-right,"
-        ":root main.content.article #articleBody,"
-        ":root main.content.article .NLM_sec,"
-        ":root main.content.article .article__content,"
-        ":root main.content.article article{"
-        "display:block !important;width:auto !important;"
-        "max-width:100% !important;min-width:0 !important;"
-        "margin-left:0 !important;margin-right:0 !important;"
-        "padding-left:0 !important;padding-right:0 !important;"
-        "float:none !important;clear:none !important}"
-        # `.article_header` has `padding-top: 32px` (publisher chrome
-        # to vertically separate the metadata block from the journal
-        # logo above), pushing T from 56 to 88. Zero — the wrapper's
-        # 56 px padding-top already provides the gap. Keep pb=16 —
-        # that's the publisher's natural gap between the metric block
-        # and the Abstract heading; zeroing it collapses 16 px of
-        # spacing before "Abstract" and other downstream sections.
-        ":root main.content.article .article_header{"
-        "padding-top:0 !important}"
-        # Force-expand the "View Author Information" affiliations accordion.
-        # Site CSS keeps it hidden via height:0 / display:none.
-        "#affiliations-popup{display:block !important;"
-        "max-height:none !important;height:auto !important;"
-        "overflow:visible !important;visibility:visible !important}"
-        # Hide the figure-viewer fullscreen modal (lives at fixed position
-        # over the page). Cannot DOM-remove: it carries cit-fg-* spans
-        # that _parse_metadata reads.
-        ".figure-viewer{display:none !important}"
-        # Figshare embedded-PDF loaders render below the article (~1200 px
-        # canvas) and add docH past the wrapper bottom on newer captures.
-        ".figshare-loader,.fs-page-wrapper,"
-        ".fs-figshare-loader-holder,.fs-canvas-document-container{"
-        "display:none !important}"
-        # Trailing display:inline canvas element generates a baseline
-        # line-box at the bottom of body (~16 px below wrapper).
-        "canvas.hiddenCanvasElement{display:none !important}"
-        # Tables: force fixed layout + word-break so wide DNA/sequence
-        # cells don't push past the wrapper.
-        ":root main.content.article table{"
-        "width:100% !important;max-width:100% !important;"
-        "table-layout:fixed !important}"
-        ":root main.content.article td,:root main.content.article th{"
-        "word-break:break-all !important;overflow-wrap:anywhere !important;"
-        "white-space:normal !important}"
-        # First-child margin reset — DIRECT children only (`>`) per the
-        # SKILL.md pitfall. Descendant `*:first-child{margin-top:0}`
-        # zeroes every section heading's top margin (headings are
-        # typically the first child of their section container),
-        # causing the body paragraph right below each heading to
-        # overlap the heading text. Descendant `*:last-child
-        # {margin-bottom:0}` is safe for the margin cascade; but
-        # descendant `padding-bottom:0` would zero the inner padding
-        # of nested last-children (e.g. the reference View button's
-        # `padding:4px 8px` collapses to `4px 8px 0`, cramming the
-        # text against the bottom border) — so keep padding-bottom
-        # on direct child only.
-        ":root main.content.article > *:first-child{"
-        "margin-top:0 !important;padding-top:0 !important}"
-        # Trailing margin-bottom reset — direct-child chain only.
-        # Descendant `*:last-child{margin-bottom:0}` zeros the
-        # publisher's intentional `.mb-4` (mb=24) and trailing
-        # paragraph mb=16 used to space between sections (e.g. the
-        # Terms & Conditions paragraph above "Author Information"),
-        # collapsing inter-section spacing. The 6-level direct-child
-        # chain reaches the actual last-leaf of the wrapper and zeros
-        # only that one's trailing margin.
-        ":root main.content.article > *:last-child,"
-        ":root main.content.article > *:last-child > *:last-child,"
-        ":root main.content.article > *:last-child > *:last-child > *:last-child,"
-        ":root main.content.article > *:last-child > *:last-child > *:last-child > *:last-child,"
-        ":root main.content.article > *:last-child > *:last-child > *:last-child > *:last-child > *:last-child,"
-        ":root main.content.article > *:last-child > *:last-child > *:last-child > *:last-child > *:last-child > *:last-child"
-        "{margin-bottom:0 !important;padding-bottom:0 !important}"
-        # Native ACS CSS sets `.article-grid .article_abstract h2
-        # {margin:0}`, leaving no separation between the "Abstract"
-        # heading block and the content (graphical abstract figure +
-        # paragraph) that immediately follows. Restore ~16 px of
-        # breathing room.
-        ":root main.content.article .article_abstract-content{"
-        "margin-top:16px !important}"
-        # The Funding Statement / articleNote blue box natively ships
-        # `padding:1rem` (16 px all around) but the previous descendant
-        # `*:first-child{padding-top:0}` zeroed padding-top on the h4
-        # inside, leaving the "Funding Statement" heading text flush
-        # against the box's upper edge. Restore the heading's natural
-        # padding-top so the text sits inside the padded box.
-        ":root main.content.article .extra-info-sec.articleNote,"
-        ":root main.content.article .extra-info-sec.fnGroup{"
-        "padding-top:16px !important}"
-        # Figures: ACS wraps each figure in
-        #   <figure id=f_<N> class="article__inlineFigure ...">
+        "html{margin:0!important;padding:0!important;"
+        "background:#fff!important;}"
+        "body{max-width:752px!important;width:auto!important;"
+        "min-width:0!important;"
+        "margin:0 auto!important;padding:0 16px!important;"
+        "box-sizing:border-box!important;"
+        "background:#fff!important;"
+        "overflow-wrap:break-word!important;word-wrap:break-word!important;}"
+        # Step 10 — remove the 77 px margin-top the publisher reserves
+        # on `main.content` for the fixed `<header>` we deleted in Step 3.
+        # Without this override the article column starts ~77 px below
+        # the page top and `scan_gaps` reports a leading empty band.
+        "main.content{margin-top:0!important;}"
+        # Step 11 — `.article-grid` ships `padding-inline:16px` on top of
+        # the body's own 16 px gutter (32 px total each side). Drop the
+        # grid's padding and force a single full-width grid column so the
+        # article column shrinks with the viewport at narrow widths
+        # instead of overflowing right.
+        ".article-grid{padding-inline:0!important;padding-left:0!important;"
+        "padding-right:0!important;column-gap:0!important;"
+        "grid-template-columns:1fr!important;"
+        "grid-template-areas:\"left\"!important;"
+        "max-width:100%!important;width:100%!important;}"
+        ".article__left-side{width:auto!important;max-width:100%!important;"
+        "min-width:0!important;}"
+        # Step 8 — figures: cap image/figure/button to the column width
+        # so wide native images shrink to fit; image renders above
+        # caption with 12 px gap. ACS markup is
+        #   <figure class=article__inlineFigure>
         #     <button class=figure-viewer__trigger>
-        #       <img class="inline-fig internalNav"
-        #            src='data:image/svg+xml,<placeholder>'
-        #            style="background-image:var(--sf-img-N) ...">
+        #       <img class="inline-fig internalNav">
         #     </button>
-        #     <div class=figure-bottom-links>
-        #       <div class=download-hi-res-img>
-        #         <a href=https://pubs.acs.org/cms/<doi>/asset/images/large/<file>.jpeg>
-        #            High Resolution Image</a>
-        #       </div>
-        #       <div class=download-ppt><a>Download MS PowerPoint Slide</a></div>
-        #     </div>
-        #   </figure>
-        # The image is rendered via SingleFile's `--sf-img-<N>` CSS var
-        # (background-image on the <img> with a transparent SVG src).
-        # Native fixed style="width:405px;height:275px" caps the figure
-        # to the publisher's column width (narrower than the 720-px
-        # reading column). Force the figure-viewer button + img to
-        # full column width; the background-image fills the box at
-        # `background-size:contain`, preserving aspect ratio.
-        # get_refs.py uses `_ACS_FIGURES_FIX_JS` to swap the inline
-        # SVG src to the high-res JPEG URL pulled from the
-        # `.download-hi-res-img > a` link, so SingleFile inlines the
-        # full-resolution image. Also hide the JS-only download link
-        # row (PPT / Hi-Res) — non-functional inside the saved HTML.
-        ":root main.content.article figure.article__inlineFigure{"
-        "margin:1rem 0 !important;padding:0 !important;"
-        "width:100% !important;max-width:100% !important;"
-        "display:block !important}"
-        ":root main.content.article figure.article__inlineFigure "
-        "button.figure-viewer__trigger{"
-        "all:unset !important;display:block !important;"
-        "width:100% !important;max-width:100% !important;"
-        "margin:0 !important;padding:0 !important;cursor:default !important}"
-        ":root main.content.article figure.article__inlineFigure "
-        "img.inline-fig{"
-        "display:block !important;width:100% !important;"
-        "height:auto !important;max-width:100% !important;"
-        "margin:0 0 5px 0 !important}"
-        # Drop the JS-only download links row.
-        ":root main.content.article figure.article__inlineFigure "
-        ".figure-bottom-links{display:none !important}"
+        #     <figcaption><div class=hlFld-FigureCaption><p>caption</p></div>
+        ".article__inlineFigure"
+        "{display:block!important;width:100%!important;"
+        "max-width:100%!important;"
+        "margin-left:0!important;margin-right:0!important;"
+        "box-sizing:border-box!important;}"
+        ".article__inlineFigure .figure-viewer__trigger"
+        "{display:block!important;width:100%!important;"
+        "max-width:100%!important;padding:0!important;"
+        "border:none!important;background:transparent!important;}"
+        ".article__inlineFigure img.inline-fig"
+        "{display:block!important;width:100%!important;"
+        "max-width:100%!important;height:auto!important;"
+        "margin:0 0 12px 0!important;"
+        "box-sizing:border-box!important;}"
+        ".article__inlineFigure figcaption"
+        "{display:block!important;width:100%!important;"
+        "margin:0!important;}"
+        # Step 8 (continued) — table-wrap inner tables ship native pixel
+        # widths from the publisher PDF that overflow the narrow column.
+        # Scroll horizontally inside the wrap rather than overflow the page.
+        ".NLM_table-wrap"
+        "{max-width:100%!important;overflow-x:auto!important;"
+        "box-sizing:border-box!important;}"
+        ".NLM_table-wrap table"
+        "{max-width:100%!important;}"
+        # Step 9 — expand the affiliations popup so author affiliations
+        # render inline instead of staying hidden behind the
+        # "View Author Information" button.
+        "#affiliations-popup,#affiliations-popup.all-aff-infos"
+        "{display:block!important;visibility:visible!important;"
+        "position:static!important;opacity:1!important;"
+        "width:auto!important;max-width:100%!important;"
+        "margin:8px 0!important;padding:0!important;"
+        "background:transparent!important;border:none!important;"
+        "box-shadow:none!important;}"
+        "#affiliations-popup .aff-info"
+        "{display:block!important;margin:2px 0!important;}"
         "</style>"
     )
     if "</head>" in html:
@@ -602,22 +479,13 @@ def _parse_inline_ref(entry):
     if ym:
         year = ym.group(1)
 
-    # Authors: everything before "(YYYY)"
+    # Authors: everything before "(YYYY)". Keep the trailing "." intact —
+    # it is the terminal initial's period (e.g. "Steitz, T. A.") and
+    # _looks_like_initials needs it to recognize the initials run.
     authors = []
     if ym:
-        author_text = text[:ym.start()].strip().rstrip(',').rstrip('.').strip()
-        # Split "Surname, I., and Surname, I." into author strings
-        # Split on ", and " first, then each chunk is "Surname, I. N."
-        parts = re.split(r'\s*,\s+and\s+|\s+and\s+', author_text)
-        for p in parts:
-            p = p.strip().rstrip(',').strip()
-            if not p:
-                continue
-            # "Joyce, C. M." -> "Joyce CM"
-            if ',' in p:
-                authors.append(format_author_name(p))
-            else:
-                authors.append(p)
+        author_text = text[:ym.start()].strip().rstrip(',').strip()
+        authors = _split_inline_authors(author_text)
 
     # Pages: "VVV, fpage-lpage." at end
     pages = ""
@@ -627,6 +495,27 @@ def _parse_inline_ref(entry):
     )
     if pm:
         pages = f"{pm.group(1)}-{pm.group(2)}"
+
+    # When no <i> tags carried the journal/volume (older ACS bare-text
+    # format), the run after "(YYYY)" looks like
+    # "Journal Name VV, fpage-lpage." Split off the trailing volume
+    # number and promote it to `volume`.
+    if not journal and ym:
+        tail = text[ym.end():].strip()
+        jm = re.match(
+            r'(.+?)\s+(\d+)\s*,\s*\d+\s*[-–—−]\s*\d+\s*\.?\s*$',
+            tail,
+        )
+        if jm:
+            journal = jm.group(1).strip().rstrip('.').strip()
+            if not volume:
+                volume = jm.group(2)
+    elif journal and not volume:
+        # Journal italic absorbed the volume (e.g. "Biochemistry 35").
+        vm = re.search(r'\s+(\d+)\s*$', journal)
+        if vm:
+            volume = vm.group(1)
+            journal = journal[:vm.start()].rstrip().rstrip(',').strip()
 
     return {
         "title": "",
@@ -638,6 +527,74 @@ def _parse_inline_ref(entry):
         "doi": "",
         "authors": authors,
     }
+
+
+def _looks_like_initials(tok):
+    """True if tok matches one or more `X.` initials runs.
+
+    Covers `R.`, `R. M.`, `J.-B.`. Not `Smith` (no terminal dot) and not
+    `Smith J.` (multi-word with leading capital word).
+    """
+    if not tok:
+        return False
+    pieces = tok.split()
+    for p in pieces:
+        if not p.endswith('.'):
+            return False
+        head = p.rstrip('.')
+        head_clean = re.sub(r'[\-‐‑‒–.]', '', head)
+        if not head_clean:
+            return False
+        if not (head_clean.isalpha() and head_clean.isupper()
+                and 1 <= len(head_clean) <= 4):
+            return False
+    return True
+
+
+def _split_inline_authors(author_text):
+    """Split "Last, F. M., Last, F., and Last, F. M." into formatted names.
+
+    The ACS inline-ref author region is a comma-and-space-separated list
+    where each author appears as `Surname, Initial1.[ Initial2.[ ...]]`.
+    Commas separate adjacent fields *within* one author (surname / initials)
+    and adjacent authors. Pair adjacent comma-split tokens (surname +
+    initials) using the heuristic: the first token is a surname; the next
+    token, if it matches the initials shape (one or more `X.` letters
+    separated by spaces), is its initials run. Otherwise the surname
+    stands alone.
+
+    Also handles the comma-omitted final-author form
+    `Last, F. and Last, F.` — when an initials chunk contains ` and `,
+    the `and Lastname` portion is split off as its own surname token.
+    """
+    if not author_text:
+        return []
+    raw_parts = [p.strip() for p in author_text.split(',') if p.strip()]
+    # Split out trailing `and Surname` chunks fused into an initials part
+    # (e.g. "L. S. and Karam" -> "L. S." + "and Karam").
+    parts = []
+    for p in raw_parts:
+        m = re.match(r'^(.+?)\s+and\s+(.+)$', p)
+        if m and _looks_like_initials(m.group(1)):
+            parts.append(m.group(1).strip())
+            parts.append('and ' + m.group(2).strip())
+        else:
+            parts.append(p)
+    authors = []
+    i = 0
+    while i < len(parts):
+        tok = parts[i]
+        if tok.lower().startswith('and '):
+            tok = tok[4:].strip()
+        if i + 1 < len(parts) and _looks_like_initials(parts[i + 1]):
+            combined = f"{tok}, {parts[i + 1]}"
+            authors.append(format_author_name(combined))
+            i += 2
+        else:
+            if tok:
+                authors.append(format_author_name(tok))
+            i += 1
+    return authors
 
 
 def _parse_structured_ref(entry):
@@ -846,22 +803,61 @@ def _find_refs_boundary(article):
     return min(candidates) if candidates else len(article)
 
 
+def _strip_body_chrome(html_fragment):
+    """Drop in-body chrome that pollutes main_text on ACS pages.
+
+    Removes: tooltip popovers (role=tooltip), CC license blocks, article tag
+    rails (Subjects), copyright statements, footnote groups (fnGroup author
+    notes — funding/correspondence), and empty headings (`<h[1-4]> </h[1-4]>`)
+    that would otherwise concatenate with the next paragraph through the
+    standard text pipeline.
+    """
+    # role=tooltip popovers (License Summary, Subjects help, etc.)
+    while True:
+        m = re.search(r'<div[^>]*\brole=["\']?tooltip["\']?[^>]*>', html_fragment)
+        if not m:
+            break
+        new = _remove_nested_element(html_fragment, re.escape(m.group()))
+        if new == html_fragment:
+            break
+        html_fragment = new
+    # CC license blocks
+    html_fragment = remove_elements_by_selector(
+        html_fragment,
+        "article__cc-license",
+        "article__tags",
+        "article_header-article-copyright",
+        "extra-info-sec",
+        "article-section__back",
+    )
+    # Empty headings (`<h2 id=_iN> </h2>`) — they otherwise produce an empty
+    # `## ` marker that joins with the following paragraph.
+    html_fragment = re.sub(
+        r'<h([1-6])[^>]*>\s*</h\1>', '', html_fragment
+    )
+    return html_fragment
+
+
 def _parse_main_text(html):
     """Extract body text.
 
     Boundary rules (from CLAUDE.md):
       - Body sections: keep everything from abstract to before first references.
       - Supplementary: after first references, keep only sections matching
-        supplement/extended data/source data/expanded view/powerpoint/appendix.
+        supplement/supporting information/extended data/source data/expanded
+        view/appendix.
       - Remove all references sections.
-    Pipeline: locate article container -> slice body zones -> extract_captions
-    -> strip_common -> tags_to_text -> drop_noise.
-    ACS-specific: take the abstract <div class=article_abstract> plus the full
-    slab from the first body section (or start of article_content) up to the
-    References section as one block (this captures NLM_sec body sections plus
-    Acknowledgment / Abbreviations / Author Information back matter wrapped
-    in different classes). After References, append any NLM_sec supplementary
-    sections.
+    Pipeline: locate article container -> slice body zones -> _strip_body_chrome
+    -> extract_captions -> strip_common -> tags_to_text -> drop_noise.
+    ACS-specific layout:
+      - Abstract paragraph lives in <div class=article_abstract-content>
+        (the wider article_abstract div also wraps the license, Subjects rail,
+        and footnote group, which we drop).
+      - Body NLM_sec_level_1 divs follow, then a <div id=ac_i*> /
+        <div class=articleBody_back> with Author Information / Acknowledgment.
+      - References live in <ol id=references> inside a "References" h2
+        section; everything after it is Cited By / Recommended / Supporting
+        Information / page chrome.
     """
     article_m = re.search(r'<article[^>]*>', html)
     if not article_m:
@@ -870,25 +866,27 @@ def _parse_main_text(html):
 
     parts = []
 
-    # Abstract container + body start position (after the abstract's </div>)
-    body_start = 0
-    abs_m = re.search(r'<div\s+class="?article_abstract"?[^>]*>', article)
+    # Abstract paragraph: the inner article_abstract-content container holds
+    # only the abstract text (the outer article_abstract div also wraps
+    # license / Subjects / fnGroup chrome that we don't want in main_text).
+    abs_m = re.search(
+        r'<div\s+class="?article_abstract-content[^>]*>', article
+    )
     if abs_m:
         abs_html = _extract_section(article, abs_m)
-        body_start = abs_m.start() + len(abs_html)
+        abs_html = _strip_body_chrome(abs_html)
         abs_html = extract_captions(abs_html)
         abs_html = strip_common(abs_html)
         abs_text = tags_to_text(abs_html)
         if abs_text.strip():
-            parts.append(abs_text)
+            parts.append("## Abstract\n\n" + abs_text.lstrip("# ").lstrip())
 
-    # Body slab: from just after the abstract to the References boundary.
-    # This captures Funding Statement blocks and any other pre-body content
-    # (e.g. <div class=extra-info-sec articleNote>) that sits between the
-    # abstract and the first NLM_sec body section.
+    # Body slab: from the first NLM_sec_level_1 to the References boundary.
     refs_pos = _find_refs_boundary(article)
-    if body_start < refs_pos:
-        body_html = article[body_start:refs_pos]
+    body_start_m = _ALL_SECTION_RE.search(article)
+    if body_start_m and body_start_m.start() < refs_pos:
+        body_html = article[body_start_m.start():refs_pos]
+        body_html = _strip_body_chrome(body_html)
         body_html = extract_captions(body_html)
         body_html = strip_common(body_html)
         text = tags_to_text(body_html)
@@ -901,6 +899,7 @@ def _parse_main_text(html):
         section_html = _extract_section(post, sec_m)
         heading = _get_section_heading(section_html)
         if heading and _SUPP_RE.search(heading):
+            section_html = _strip_body_chrome(section_html)
             section_html = extract_captions(section_html)
             section_html = strip_common(section_html)
             text = tags_to_text(section_html)

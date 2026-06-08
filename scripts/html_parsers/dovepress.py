@@ -12,9 +12,7 @@ from ._helpers import (
     format_name,
     get_meta,
     neutralize_media_queries,
-    parse_meta_authors,
     remove_elements_by_id,
-    remove_elements_by_selector,
     strip_common,
     strip_tags,
     tags_to_text,
@@ -44,145 +42,97 @@ _SUPP_RE = re.compile(
 # ---------------------------------------------------------------------------
 
 def remove_banners(html):
-    """Normalize Dovepress HTML to a single centered text column.
+    """Apply Phase 2 layout rules for dovepress.com.
 
-    Dovepress chrome to strip:
-      - <div id=mobile-bg>, <div class=top_bg>, <div class=mast_bg>:
-        site mobile menu, top nav, journal masthead.
-      - <aside>: left-rail metadata sidebar.
-      - <p class=back>: breadcrumb above the article body.
-      - <div id=btn-readspeaker>: audio "Listen" button.
-      - <div class=mobile-social>, <div class=tabs print-hide>: share +
-        cite tabs at top of article.
-      - <div class=rs_skip> "Download Article" button.
-      - <p class=article-cc-license>: Creative Commons banner after
-        references.
-      - <footer> (×2 — site nav + copyright bar).
+    Step 1: cap body width at 752 px, center, neutralize @media queries
+            so the publisher's narrow CSS branch always applies (the
+            wide-viewport CSS un-hides the left .sidebar column).
+    Step 2: remove the Transcend cookie consent manager
+            (`#transcend-consent-manager`, `position:fixed`).
+    Step 3: remove sticky chrome flagged by scan_sticky.py — the
+            consent manager (Step 2) and the live-chat floater
+            `.psmtc_BuTp` (`position:fixed`, bottom-right).
+    Step 4: no extra vertical columns beyond `<aside class=sidebar>`,
+            and the publisher's narrow CSS already hides it
+            (`display:none`). The .grid wrapper holds sidebar + main;
+            after Step 1 the cap collapses it to the article column.
+    Step 5: no ad slots ship in the captured dovepress HTML
+            (no `gpt-ad`, `ad-slot`, or `sponsored` markers).
+    Step 6: page background is white; the article column has no
+            box-shadow. Force html/body white for symmetry.
+    Step 7: figure thumbnails are inlined as data URIs by SingleFile;
+            the parser already swaps them to caption-only via
+            _strip_inline_chrome at parse time. For visual rendering
+            here, the small thumbnails are kept as-is — the publisher
+            ships ~600 px JPEGs which are adequate for the 720-px
+            column.
+    Step 8: figures live in `<table class=thumbnail-table>` with the
+            thumbnail image in one `<td>` and `<p class=tabtext>`
+            caption in another `<td>`. Force the table to block the
+            image above the caption, both at column width.
+    Step 9: nothing is collapsed in dovepress source — all author
+            affiliations, captions, tables, and references render
+            inline natively.
     """
     html = neutralize_media_queries(html)
 
-    # Top-of-page chrome blocks ----------------------------------------
-    html = remove_elements_by_id(html, "mobile-bg", "modal_wrapper")
-    for _ in range(3):
-        before = html
-        html = _remove_nested_element(
-            html, r'<div\b[^>]*\bclass=["\']?[^"\'>]*\btop_bg\b',
-        )
-        if html == before:
-            break
-    for _ in range(3):
-        before = html
-        html = _remove_nested_element(
-            html, r'<div\b[^>]*\bclass=["\']?[^"\'>]*\bmast_bg\b',
-        )
-        if html == before:
-            break
-    # Left-rail metadata sidebar (volume archive, related articles).
-    html = _remove_nested_element(html, r"<aside\b[^>]*>")
-    # Breadcrumb / back link above the article body.
-    for _ in range(3):
-        before = html
-        html = _remove_nested_element(
-            html, r'<p\b[^>]*\bclass=["\']?back["\']?[^>]*>',
-        )
-        if html == before:
-            break
-    # Listen / ReadSpeaker audio button.
-    html = remove_elements_by_id(html, "btn-readspeaker")
-    # Mobile-only share-button row at the top of the article header
-    # (small redundant clone of the .tabs row's share button). The
-    # `<div class="tabs print-hide">` tab strip (Fulltext / Metrics /
-    # Get Permission / Cite this article) is kept — it belongs in the
-    # reading column.
-    for _ in range(3):
-        before = html
-        html = _remove_nested_element(
-            html,
-            r'<div\b[^>]*\bclass=["\']?[^"\'>]*\bmobile-social\b',
-        )
-        if html == before:
-            break
-    # NOTE: do not strip <div class=rs_skip> (Download Article [PDF])
-    # or <p class=article-cc-license> (Creative Commons license + © 2026
-    # Dove Medical Press attribution block). They are part of the
-    # reading column the user expects to see.
-    # Site footers (mobile-friendly nav + copyright). There are two
-    # <footer> elements at the bottom of the page.
-    for _ in range(3):
-        before = html
-        html = _remove_nested_element(html, r"<footer\b[^>]*>")
-        if html == before:
-            break
+    # Step 2 / Step 3 — DOM-strip fixed-position chrome the publisher
+    # injects via id/class attributes that survive the CSS overrides.
+    html = remove_elements_by_id(html, "transcend-consent-manager")
+    html = _remove_nested_element(
+        html, r'<div\b[^>]*\bclass=psmtc_BuTp\b[^>]*>',
+    )
 
-    # -------------------------------------------------------------------
-    # Steps 2 + 4 — layout freeze and reading-column cap.
-    # -------------------------------------------------------------------
     override = (
         "<style>"
-        # Layout freeze (Step 2).
-        "html{width:100% !important;max-width:100% !important;"
-        "margin:0 !important;background:#fff !important}"
-        "body{width:100% !important;min-width:0 !important;"
-        "max-width:752px !important;margin:0 auto !important;"
-        "background:#fff !important;color:#000 !important}"
-        # Reset every wrapper between <body> and the cap target so
-        # they neither narrow the column (.grid is 90% width by
-        # default) nor inset the content (.tabs-padding pads 20.625
-        # px on every side). Use :root prefix to beat single-class
-        # publisher rules without needing inline-style hooks.
-        ":root #page,:root .grid_bg,:root .grid,"
-        ":root #content,:root #html-readaloud-text,"
-        ":root .tabs-bg,:root .tab-content,"
-        ":root .articles{"
-        "width:auto !important;max-width:100% !important;"
-        "margin:0 !important;padding:0 !important;"
-        "background:#fff !important}"
-        # Cap the reading column on .tabs-padding — the highest
-        # common ancestor of the article-type tag, title, byline,
-        # body, and references.
-        ":root .tabs-padding{"
-        "float:none !important;display:block !important;"
-        "width:auto !important;max-width:752px !important;"
-        "margin:0 auto !important;"
-        # pt trimmed to 46 to absorb the 10-px line-box descent above
-        # the "Original Research" tag's small-caps glyph; pb trimmed
-        # to 43 to absorb the trailing <p>'s 9-px margin-bottom on the
-        # last reference plus the .tab-content's 9-px tail gap.
-        "padding:46px 16px 43px 16px !important;"
-        "box-sizing:border-box !important;background:#fff !important}"
-        ":root .tabs-padding>*:first-child{"
-        "margin-top:0 !important;padding-top:0 !important}"
-        ":root .tabs-padding>*:last-child{"
-        "margin-bottom:0 !important;padding-bottom:0 !important}"
-        # Figures: dovepress wraps each figure in
-        #   <table class=thumbnail-table>
-        #     <tr><td><a class=float_border href=<HIRES_JPG>>
-        #            <img class=imgthubnail src=<thumbnail data URL>></a></td>
-        #         <td><p class=tabtext>Figure N caption text</p></td></tr>
-        # Native layout puts thumbnail (150 px wide, capped via the
-        # publisher's `.float_border{width:150px}` rule) on the left and
-        # caption text on the right. Block-stack so the image sits above
-        # the caption at full column width. The high-res JPEG URL is on
-        # the parent <a href> — get_refs.py needs a browser-script
-        # rewrite to swap <img src> ← parent <a href> for full-res
-        # capture; this CSS only handles the layout, so until the
-        # capture rule lands, the image is the inlined thumbnail
-        # scaled up.
-        ":root .tabs-padding table.thumbnail-table,"
-        ":root .tabs-padding table.thumbnail-table tbody,"
-        ":root .tabs-padding table.thumbnail-table tr,"
-        ":root .tabs-padding table.thumbnail-table td{"
-        "display:block !important;width:100% !important;"
-        "text-align:left !important;"
-        "box-sizing:border-box !important}"
-        ":root .tabs-padding table.thumbnail-table a.float_border{"
-        "display:block !important;width:auto !important;"
-        "max-width:100% !important;margin:0 !important}"
-        ":root .tabs-padding table.thumbnail-table img.imgthubnail,"
-        ":root .tabs-padding table.thumbnail-table img.imgsmall{"
-        "display:block !important;width:100% !important;"
-        "height:auto !important;max-width:100% !important;"
-        "margin:0 0 5px 0 !important}"
+        # Step 1 / Step 6 — lock layout to 752 px wide, white background.
+        "html{margin:0!important;padding:0!important;"
+        "background:#fff!important;}"
+        "body{max-width:752px!important;width:auto!important;"
+        "min-width:0!important;"
+        "margin:0 auto!important;padding:0 16px!important;"
+        "box-sizing:border-box!important;"
+        "background:#fff!important;"
+        "overflow-wrap:break-word!important;word-wrap:break-word!important;}"
+        # Dovepress page-wide chrome wrappers ship a fixed 90% / 1320 px
+        # `.grid` and 100%-float bg bars; collapse to body cap.
+        "#page,.grid_bg,.grid,.top_bg,.top,.mast_bg,.mast,"
+        ".nav_bg,.footer-nav-bg,.footer-nav,.footer_bg"
+        "{width:auto!important;max-width:100%!important;"
+        "float:none!important;clear:both!important;"
+        "margin-left:auto!important;margin-right:auto!important;"
+        "box-sizing:border-box!important;}"
+        # Article column wrappers — collapse the sidebar/article split.
+        ".tab-content,.articles,#article-fulltext,.html-oct"
+        "{width:100%!important;max-width:100%!important;"
+        "float:none!important;clear:both!important;"
+        "margin-left:0!important;margin-right:0!important;}"
+        # Hide the publisher's left sidebar (already display:none in narrow
+        # CSS but state it explicitly for safety).
+        "aside.sidebar,aside[role=complementary].sidebar"
+        "{display:none!important;}"
+        # Step 8 — figures: thumbnail table → image above caption,
+        # both at column width with breathing room.
+        "table.thumbnail-table"
+        "{display:block!important;width:100%!important;"
+        "max-width:100%!important;border-collapse:collapse!important;"
+        "margin:0 0 16px 0!important;}"
+        "table.thumbnail-table tbody,table.thumbnail-table tr"
+        "{display:block!important;width:100%!important;}"
+        "table.thumbnail-table td"
+        "{display:block!important;width:100%!important;"
+        "padding:0!important;margin:0 0 8px 0!important;"
+        "text-align:left!important;}"
+        "table.thumbnail-table td a.float_border"
+        "{display:block!important;width:100%!important;"
+        "border:none!important;float:none!important;}"
+        "table.thumbnail-table td img"
+        "{display:block!important;width:100%!important;"
+        "max-width:100%!important;height:auto!important;"
+        "margin:0!important;}"
+        "table.thumbnail-table p.tabtext"
+        "{margin:0!important;padding:0!important;"
+        "width:100%!important;}"
         "</style>"
     )
     if "</head>" in html:
@@ -190,12 +140,6 @@ def remove_banners(html):
     else:
         html = re.sub(r"(<body\b)", override + r"\1", html, count=1)
     return html
-
-
-# ---------------------------------------------------------------------------
-# Metadata
-# ---------------------------------------------------------------------------
-
 def _parse_metadata(html):
     """Extract bundled metadata: title, journal, year, volume, issue, pages, doi.
 
@@ -205,10 +149,12 @@ def _parse_metadata(html):
     "Breast Cancer (Dove Med Press)" form.
     """
     title = get_meta(html, "citation_title")
-    title = unescape(title).strip().rstrip(".") if title else ""
+    # Dovepress occasionally embeds inline tags (e.g. <em>H. pylori</em>) in
+    # the citation_title meta — strip them before unescaping entities.
+    title = unescape(strip_tags(title)).strip().rstrip(".") if title else ""
 
     journal = get_meta(html, "citation_journal_title")
-    journal = unescape(journal).replace(".", "").strip() if journal else ""
+    journal = unescape(strip_tags(journal)).replace(".", "").strip() if journal else ""
 
     year = ""
     date = get_meta(html, "citation_publication_date")
@@ -269,6 +215,16 @@ def _parse_authors(html):
     body_block, aff_block = _author_byline_blocks(html)
     aff_map = _parse_affiliation_map(aff_block) if aff_block else {}
 
+    # Single-author / no-sup fallback: when the affiliation block carries
+    # no <sup>N</sup> markers (typical of single-author papers), treat the
+    # plain text as one shared affiliation that all listed authors inherit.
+    shared_aff = ""
+    if aff_block and not aff_map:
+        text = unescape(re.sub(r"\s+", " ", strip_tags(aff_block))).strip()
+        text = text.rstrip(";,. ")
+        if text:
+            shared_aff = text
+
     body_authors = _walk_byline(body_block) if body_block else []
     keys_by_index = [keys for _name, keys in body_authors]
 
@@ -276,6 +232,8 @@ def _parse_authors(html):
     for i, name in enumerate(names):
         keys = keys_by_index[i] if i < len(keys_by_index) else []
         affiliations = [aff_map[k] for k in keys if k in aff_map]
+        if not affiliations and shared_aff:
+            affiliations = [shared_aff]
         authors.append({"author": name, "affiliation": affiliations})
     return authors
 

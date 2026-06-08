@@ -105,7 +105,7 @@ For the `references` key:
 ```
 
 - Extract from the references section in `/tmp/<stem>.md`. Include supplementary references too.
-- Leave `pmid` as the empty string `""` for every entry. PMIDs are filled later by `python scripts/get_pmids.py` only if the user opts in to adding these references to the database (it is not part of the default workflow).
+- Leave `pmid` as the empty string `""` for every entry. PMIDs are filled later by `python scripts/get_pmid.py` only if the user opts in to adding these references to the database (it is not part of the default workflow).
 - Empty bib fields are `""`. Empty `authors` is `[]`.
 
 ### Step 4: cleanup

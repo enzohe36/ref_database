@@ -15,7 +15,6 @@ from ._helpers import (
     neutralize_media_queries,
     parse_meta_authors,
     remove_elements_by_id,
-    remove_elements_by_selector,
     strip_common,
     strip_tags,
     tags_to_text,
@@ -29,13 +28,7 @@ _NOISE = (
     "[Web of Science]",
     "[Google Scholar]",
     "[Citing articles]",
-)
-
-_REF_RE = re.compile(r'\breferences\b|literature\s+cited', re.IGNORECASE)
-
-_SUPP_RE = re.compile(
-    r'supplement|extended data|source data|expanded view|powerpoint|appendix',
-    re.IGNORECASE,
+    "CLOSE ×",
 )
 
 
@@ -44,191 +37,83 @@ _SUPP_RE = re.compile(
 # ---------------------------------------------------------------------------
 
 def remove_banners(html):
-    """Normalize Annual Reviews HTML to a single centered text column.
+    """Apply Phase 2 layout rules for annualreviews.org.
 
-    Chrome stripped (Step 3):
-      - Fixed-position cookie consent bar (`#cookie-bar`).
-      - Site `<header>` and `<footer>`.
-      - Breadcrumb nav inside `#main-content-container`.
-      - "Most Read This Month" panel (`.mostreadcontainer`) that renders
-        at the tail of `#main-content-container`.
-      - Trendmd / recommendations / related-articles blocks that follow.
-
-    Reading column wrapper: `<main id=main-content-container>`. Cap to
-    752 px with 56 px top/bottom + 16 px side padding.
+    Step 1: cap body width at 752 px, center, neutralize @media queries
+            so the publisher's narrow CSS branch always applies.
+    Step 2: remove the cookie-bar (no separate backdrop on this site).
+    Step 3: remove sticky elements — the article-navigation-bar (nav
+            tabs Info/Figures/References/Cited-By that pin to the top)
+            and the right-rail sidebar_right that holds tools, social
+            share, altmetrics, and "Journal News" advertising.
+    Step 4: covered by Step 3 (sidebar_right is also the tall sidebar).
+    Step 5: covered by Step 3 (the journal-news ad lives inside
+            sidebar_right; nothing else carries an ad-naming
+            convention in main column or article-body).
+    Steps 6, 7: no-op (no colored bg or shadow around main column;
+            figures inline images are usable resolution).
+    Step 8: figure CSS — image fills column, image above caption,
+            12 px gap. Annual Reviews markup ships caption BEFORE
+            image inside `<div class="figure ...">`, so reorder via
+            CSS flex column-reverse with `.caption` and `.image` as
+            children.
+    Step 9: force-show affiliations / citation popup that the publisher
+            collapses by default (`.showhide .minus` is display:none in
+            the publisher CSS — override to display:block).
+    Steps 10-12: scan_gaps clean across all three test fixtures.
     """
-    # Lock layout to publisher's narrow (≤1024 px) form at any viewport.
     html = neutralize_media_queries(html)
-    # -------------------------------------------------------------------
-    # Step 3 — strip chrome.
-    # -------------------------------------------------------------------
+
+    # Step 2 — cookie consent banner (no separate backdrop on this site).
     html = remove_elements_by_id(html, "cookie-bar")
-    for _ in range(5):
-        before = html
-        html = _remove_nested_element(html, r'<header\b[^>]*>')
-        if html == before:
-            break
-    for _ in range(5):
-        before = html
-        html = _remove_nested_element(html, r'<footer\b[^>]*>')
-        if html == before:
-            break
-    # Breadcrumb nav at the top of main-content-container.
-    html = _remove_nested_element(html, r'<nav\b[^>]*aria-label=breadcrumbs\b[^>]*>')
-    # Most Read + Most Cited + trailing recommendation panels.
-    for cls in ("mostreadcontainer", "mostcitedcontainer",
-                "recommendation-items", "sidebar-pub2web-element"):
-        for _ in range(5):
-            before = html
-            html = _remove_nested_element(
-                html, rf'<div\b[^>]*class="[^"]*\b{cls}\b[^"]*"[^>]*>',
-            )
-            if html == before:
-                break
-    # Trendmd widget(s) inside the article column.
-    html = _remove_nested_element(
-        html, r'<div\b[^>]*class="[^"]*\btrendmd-widget\b[^"]*"[^>]*>',
-    )
-    # Right-rail sidebar with "Reference Details" / cited-by panel.
-    # On wide viewports it renders to the right of #main-content-container,
-    # at narrow viewports it stacks below — both add document height past
-    # the wrapper's bottom padding.
+
+    # Step 3 / 4 / 5 — sticky chrome and tall right-rail sidebar
+    # (which also contains the in-page Journal News ad).
     html = remove_elements_by_id(html, "sidebar_right")
     html = _remove_nested_element(
-        html, r'<aside\b[^>]*\bclass="[^"]*\bfooter-sidebar\b[^"]*"[^>]*>',
-    )
-    # Sticky article-tools navigation bar (Download / Cite / Share /
-    # Tools dropdown) that pins to the top of the article column at
-    # viewport widths >= 845 px.
-    html = _remove_nested_element(
-        html, r'<nav\b[^>]*\bclass="[^"]*\barticle-navigation-bar\b[^"]*"[^>]*>',
-    )
-    # Trailing empty `.bottom-side-nav` placeholder inside the wrapper
-    # (h=0 but margin-bottom=30px). With visible content ending above
-    # it, the margin shows up as 30 px of empty space between the
-    # references and the wrapper's padding-bottom.
-    for _ in range(3):
-        before = html
-        html = _remove_nested_element(
-            html, r'<div\b[^>]*\bclass=bottom-side-nav\b[^>]*>',
-        )
-        if html == before:
-            break
-    # Trailing hidden chrome inside the wrapper that becomes the
-    # ACTUAL last child of `#main-content-container`, hiding the
-    # references list from the structural last-child chain selector
-    # below. Strip them so the chain reaches the visible content.
-    html = _remove_nested_element(
-        html, r'<dialog\b[^>]*\bid=["\']?messageBox\b',
-    )
-    html = re.sub(
-        r'<input\b[^>]*\bid=["\']?fancyBoxImgLoadErrMsg[^>]*>', '', html,
+        html,
+        r'<nav[^>]*\bclass="[^"]*\barticle-navigation-bar\b[^"]*"[^>]*>',
     )
 
-    # -------------------------------------------------------------------
-    # Steps 2 + 4 — layout freeze and reading-column cap.
-    # -------------------------------------------------------------------
     override = (
         "<style>"
-        "html{width:100% !important;max-width:100% !important;"
-        "margin:0 !important;background:#fff !important}"
-        "body{width:100% !important;min-width:0 !important;"
-        "max-width:752px !important;margin:0 auto !important;"
-        "background:#fff !important;color:#000 !important}"
-        # The site layout wraps #main-content-container in a Bootstrap
-        # row with sibling sidebars (col-md-3). Collapse the outer
-        # container/row so main fills body width. Inner article wrappers
-        # (#html_fulltext, #itemFullTextId, #html-body) get the same
-        # flatten treatment so their natural sidebar-gutter padding
-        # doesn't leak into the reading width.
-        ".container,.container-fluid,"
-        ".row,.row>[class*='col-'],"
-        "#html_fulltext,#itemFullTextId,#html-body,"
-        "#article-level-0-front-and-body,"
-        "#article-level-0-back,"
-        "#article-level-0-figs-and-tables,"
-        "#article-level-0-end-metadata{"
-        "display:block !important;width:100% !important;"
-        "max-width:100% !important;min-width:0 !important;"
-        "margin:0 !important;padding:0 !important;float:none !important;"
-        "flex:1 1 auto !important;background:#fff !important}"
-        # Capped reading-column wrapper.
-        ":root #main-content-container{"
-        "float:none !important;display:block !important;"
-        "width:auto !important;max-width:752px !important;"
-        "margin:0 auto !important;padding:56px 16px !important;"
-        "box-sizing:border-box !important;background:#fff !important}"
-        # Clamp every descendant to fit inside the column. `min-width: 0`
-        # was here historically to let flex children shrink, but on a
-        # wildcard descendant selector it forces text-content blocks to
-        # reflow narrower than the publisher's narrow CSS intended,
-        # adding ~32 px to every reference list item. Drop it; if a
-        # specific flex/grid child needs it later, scope it there.
-        ":root #main-content-container *{"
-        "max-width:100% !important;"
-        "box-sizing:border-box !important}"
-        # Tables: force fixed layout + break-all so wide cells don't push
-        # past the wrapper.
-        ":root #main-content-container table{"
-        "width:100% !important;max-width:100% !important;"
-        "table-layout:fixed !important}"
-        ":root #main-content-container td,:root #main-content-container th{"
-        "word-break:break-all !important;overflow-wrap:anywhere !important;"
-        "white-space:normal !important}"
-        # First-/last-child margin reset — scoped to direct children of
-        # the wrapper only (via `>`). Blanket `*:first-child` was
-        # collapsing reference list items' natural padding/margin and
-        # killing section-heading top margin.
-        ":root #main-content-container>*:first-child{"
-        "margin-top:0 !important;padding-top:0 !important}"
-        # Direct-child only — descendant `*:last-child{margin-bottom:0}`
-        # also kills the publisher's natural margin-bottom on inline
-        # last-children like `h4.item-meta-data__journal-issue` (mb=11px,
-        # spaces "Volume 42, 2008" from the H1 article title below).
-        ":root #main-content-container>*:last-child{"
-        "margin-bottom:0 !important;padding-bottom:0 !important}"
-        # The wrapper's actual last child is a zero-height `.clearfix`
-        # sibling-after the references; the publisher's natural
-        # margin-bottom on the last `.articleSection` (mb:10),
-        # `ol.articlereference-vancouver` (mb:11), and `li.refbody`
-        # (pb:10) escape past it and inflate B by ~31 px. Zero those
-        # specific trailing margins/padding via stable publisher
-        # class names — surgical, not chain-based.
-        ":root #main-content-container .articleSection:last-of-type,"
-        ":root #main-content-container ol.articlereference-vancouver{"
-        "margin-bottom:0 !important}"
-        ":root #main-content-container ol.articlereference-vancouver "
-        "> li.refbody:last-child{padding-bottom:0 !important}"
-        # The .article-cover wrapper ships with margin-top:-25px (negative
-        # pull for cover-art overlap); zero it so first text sits at
-        # padding-top.
-        ":root #main-content-container .article-cover{"
-        "margin-top:0 !important}"
-        # Force-expand the "View Affiliations and Author Notes"
-        # accordion. The publisher's stylesheet sets `.js-plus{display:
-        # inline}`, `.js-minus{display:none}`, and `#showHideAffiliation
-        # Content{display:none}` — JS toggles them on click. Without JS
-        # the affiliation block is invisible. Scoped to
-        # `#showHideAffiliation` so the sibling "View Citation" widget
-        # keeps its default collapsed state.
-        ":root #main-content-container #showHideAffiliation .js-plus{"
-        "display:none !important}"
-        ":root #main-content-container #showHideAffiliation .js-minus,"
-        ":root #main-content-container #showHideAffiliation .js-minus.minus{"
-        "display:inline !important}"
-        ":root #main-content-container #showHideAffiliationContent{"
-        "display:block !important}"
-        # Figure images: scale the full-res GIF (~1500-2300 px native,
-        # inlined by `_annualreviews_inline_figures` post_capture) to
-        # fill the figure container width (= caption width), preserving
-        # aspect ratio, and center it.
-        ":root #main-content-container .figure .image{"
-        "text-align:center !important}"
-        ":root #main-content-container .figure .image img,"
-        ":root #main-content-container .figure .image a.media-link{"
-        "display:inline-block !important;"
-        "width:100% !important;height:auto !important;"
-        "max-width:100% !important}"
+        "html{margin:0!important;padding:0!important;"
+        "background:#fff!important;}"
+        "body{max-width:752px!important;width:auto!important;"
+        "min-width:0!important;"
+        "margin:0 auto!important;padding:0 16px!important;"
+        "box-sizing:border-box!important;"
+        "background:#fff!important;"
+        "overflow-wrap:break-word!important;word-wrap:break-word!important;}"
+        # Step 8 — figures: image above caption, both fill column.
+        # Annual Reviews markup is
+        #   <div class="figure html-fulltext-responsive-figure">
+        #     <div class=caption>...</div>
+        #     <div class=image><a><img></a></div>
+        #   </div>
+        # Use flex column-reverse so the .image child renders above the
+        # .caption child without DOM mutation.
+        ".figure.html-fulltext-responsive-figure"
+        "{display:flex!important;flex-direction:column-reverse!important;"
+        "width:100%!important;max-width:100%!important;"
+        "margin:0 0 16px 0!important;}"
+        ".figure.html-fulltext-responsive-figure .image"
+        "{display:block!important;width:100%!important;"
+        "max-width:100%!important;margin:0 0 12px 0!important;}"
+        ".figure.html-fulltext-responsive-figure .image img"
+        "{display:block!important;width:100%!important;"
+        "max-width:100%!important;height:auto!important;}"
+        ".figure.html-fulltext-responsive-figure .caption"
+        "{display:block!important;width:100%!important;}"
+        # Step 9 — expand collapsed author affiliations / citation popup.
+        # Publisher CSS: `.showhide .minus { display: none }`.
+        ".showhide .minus,.showhide .js-minus,.showhide .js-description"
+        "{display:block!important;visibility:visible!important;"
+        "opacity:1!important;}"
+        # Hide the +/− toggle chrome since the content is always shown.
+        ".showhide .js-plus,.showhide .fa-plus-circle,"
+        ".showhide .fa-minus-circle"
+        "{display:none!important;}"
         "</style>"
     )
     if "</head>" in html:
@@ -236,12 +121,6 @@ def remove_banners(html):
     else:
         html = re.sub(r"(<body\b)", override + r"\1", html, count=1)
     return html
-
-
-# ---------------------------------------------------------------------------
-# Metadata
-# ---------------------------------------------------------------------------
-
 def _parse_metadata(html):
     """Extract bundled metadata: title, journal, year, volume, issue, pages, doi.
 

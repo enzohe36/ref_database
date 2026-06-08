@@ -1,4 +1,4 @@
-"""Nature (nature.com) HTML parser."""
+"""Springer (springer.com) HTML parser."""
 
 import re
 from html import unescape
@@ -44,31 +44,29 @@ _PRE_BODY = {"inline recommendations"}
 # ---------------------------------------------------------------------------
 
 def remove_banners(html):
-    """Apply Phase 2 layout rules for Nature.
+    """Apply Phase 2 layout rules for Springer (link.springer.com).
 
     Step 1: cap body width at 752px, center, neutralize @media queries so
             the publisher's narrow CSS branch always applies.
     Step 2: remove the cookie consent dialog (`<dialog class=cc-banner>`).
             The dialog ships its backdrop as the `::backdrop` pseudo-element
             on the same node, so a single removal handles both.
-    Step 3: remove the position:fixed Nature Briefing site-messages banner
-            (`<div class="c-site-messages ...">`) that engages on scroll.
-    Step 5: remove ad wrappers — `<aside class="c-ad ...">` leaderboard,
-            `<div class="u-lazy-ad-wrapper ...">` lazy-loaded MPU wrapper,
-            and the `<div class="u-show-following-ad">` reservation marker.
-    Step 8: figure CSS — size figures, figure wrappers, and the figure
-            image to full column width with an 8 px margin below the image
-            for visible separation from the caption/description. DOM order
-            is figcaption -> figure-content (figure-item picture +
-            figure-description), so block layout already places the image
-            above the description.
-    Step 9: nothing to expand. Nature ships the figure image inline
-            (publisher CSS sets `.c-article-section__figure-item img` to
-            `display:block;margin:0 auto`); the only `display:none` rule
-            on a figure-related selector is `.c-article-section__figure-link`,
-            the "View larger" modal trigger, which Step 9 calls out as a
-            known overlay false positive and we leave alone. Author list,
-            tables, and references are not collapsed in Nature.
+    Step 3: remove the position:sticky `c-status-message--sticky` info
+            banner (work-in-progress / archive notice) that engages on
+            scroll.
+    Step 5: remove ad wrappers — `<aside class="c-ad ...">` leaderboard /
+            inline ads. (Springer pages don't ship the lazy-MPU
+            `u-lazy-ad-wrapper` or the empty `u-show-following-ad` marker.)
+    Step 8: figure CSS — size the figure image to full column width,
+            force display:block on the picture/figure-content wrappers
+            (defaults are inline) so figcaption -> image -> description
+            stack vertically in DOM order, and add an 8 px margin below
+            the image. The native CSS already paints the image
+            (`.c-article-section__figure-item img{display:block}`); this
+            CSS is purely sizing/alignment, not a hidden-state reveal.
+    Step 9: no-op. Author list, tables, references, and figure images
+            all render inline in Springer's link.springer.com layout —
+            no collapsed-state UI to expand.
     """
     html = neutralize_media_queries(html)
 
@@ -78,21 +76,18 @@ def remove_banners(html):
         html, r'<dialog\b[^>]*\bclass=["\']?cc-banner\b[^>]*>'
     )
 
-    # Step 3 — sticky Nature Briefing banner (position:fixed, anchored at
-    # the bottom of the viewport once the user scrolls past 15% of the page).
+    # Step 3 — sticky `c-status-message--sticky` info banner (e.g. WIP /
+    # archive notices). position:sticky engages once the user scrolls
+    # past the article header.
     html = _remove_nested_element(
-        html, r'<div\b[^>]*\bclass="[^"]*\bc-site-messages\b[^"]*"[^>]*>'
+        html,
+        r'<div\b[^>]*\bclass="[^"]*\bc-status-message--sticky\b[^"]*"[^>]*>'
     )
 
-    # Step 5 — ad blocks. Three wrappers: <aside class="c-ad ..."> for
-    # leaderboard / inline ads, <div class="u-lazy-ad-wrapper ..."> for
-    # lazy-loaded MPUs, and the <div class="u-show-following-ad"> empty
-    # reservation marker (0x0 wrapper before each c-ad). Loop on each so
-    # multiple instances per page are all removed.
+    # Step 5 — ad blocks. `<aside class="c-ad ...">` covers leaderboard /
+    # inline ads. Loop so multiple instances per page are all removed.
     for pat in (
         r'<aside\b[^>]*\bclass="[^"]*\bc-ad\b[^"]*"[^>]*>',
-        r'<div\b[^>]*\bclass="[^"]*\bu-lazy-ad-wrapper\b[^"]*"[^>]*>',
-        r'<div\b[^>]*\bclass="[^"]*\bu-show-following-ad\b[^"]*"[^>]*>',
     ):
         while True:
             prev = html
@@ -107,12 +102,9 @@ def remove_banners(html):
         "margin:0 auto!important;padding:0 16px!important;"
         "box-sizing:border-box!important;"
         "overflow-wrap:break-word!important;word-wrap:break-word!important;}"
-        # Step 8: size the figure image to full column width. Publisher
-        # already renders the image inline (`.c-article-section__figure-item
-        # img{display:block;margin:0 auto}`); the rules below assert
-        # display:block + width:100% so the image fills the capped body
-        # column instead of relying on the publisher's responsive sizing,
-        # and add an 8 px bottom margin before the description.
+        # Step 8: size the figure image to column width and force
+        # display:block on picture/figure-content wrappers so DOM order
+        # (figcaption -> figure-content) renders vertically.
         "figure{display:block!important;width:100%!important;"
         "max-width:100%!important;margin:1em 0!important;}"
         ".c-article-section__figure-content,"
@@ -131,6 +123,10 @@ def remove_banners(html):
         html = re.sub(r"(<body\b)", override + r"\1", html, count=1)
     return html
 
+
+# ---------------------------------------------------------------------------
+# Metadata
+# ---------------------------------------------------------------------------
 
 def _parse_metadata(html):
     """Extract bundled metadata: title, journal, year, volume, issue, pages, doi.
@@ -319,22 +315,10 @@ def _parse_body_reference(item_html):
     abbreviations like "J. Exp. Med." and titles containing colons or
     species names no longer confuse the parser).
 
-    Covers three observed Nature/Springer layouts:
+    Covers three observed Springer/Nature layouts:
       A. Authors. Title. <i>Journal</i> <b>Vol</b>[, Pages] (YEAR).
       B. Authors. Title. <i>Journal</i> YEAR; <b>Vol</b>: Pages.
       C. Authors . YEAR <i>Journal</i> <b>Vol</b>: Pages  (no title)
-
-    Fields:
-    - volume: content of the first <b>...</b>.
-    - journal: <i>...</i> preceding <b>, plus an optional following
-      "(<i>...</i>.)" continuation (e.g., "DNA Repair (Amst)").
-    - year: parenthesized (YYYY) anywhere → bare YYYY between </i>
-      and <b> (Layout B) → bare YYYY before <i> (Layout C).
-    - pages/issue: plain text between </b> and trailing (YYYY).
-      Parenthesized span within is issue; remainder is pages.
-    - head: text before journal <i> with trailing Layout-C year
-      removed. Split into authors and title via "et al." or the last
-      "LastName, I[. I.]" / "LastName IN" match.
 
     Falls back to a title-only record only when no <b> or no <i>
     precedes <b> (≤0.02% of observed body refs).
@@ -350,20 +334,13 @@ def _parse_body_reference(item_html):
     volume = re.sub(r"<[^>]+>", "", b_m.group(1)).strip()
 
     pre_b = item_html[:b_m.start()]
-    # Find all <i>...</i> blocks individually (non-greedy $-anchored search
-    # can span TWO <i> tags when the regex engine expands .+? to reach the
-    # end — seen on refs like "Ludérus ... <i>et al</i>. ... <i>J. Cell
-    # Biol.</i>" where the `<i>et al</i>` author italic precedes the
-    # journal italic). Journal is the last <i> block before <b>; an
-    # optional "(<i>X</i>)" continuation right after (e.g. "DNA Repair
-    # (Amst)") folds into the journal name.
+    # Find all <i>...</i> blocks individually. Journal is the last <i>
+    # block before <b>; an optional "(<i>X</i>)" continuation right
+    # after (e.g. "DNA Repair (Amst)") folds into the journal name.
     i_matches = list(re.finditer(r"<i[^>]*>(.+?)</i>", pre_b, re.DOTALL))
     if not i_matches:
         return _body_fallback(item_html, doi)
     last_i = i_matches[-1]
-    # Check for a (<i>...</i>) continuation after the primary journal block —
-    # only applies when the last <i> is inside parens, with another <i>
-    # immediately before. e.g. "<i>DNA Repair</i> (<i>Amst</i>)".
     journal = unescape(re.sub(r"<[^>]+>", "", last_i.group(1))).strip().rstrip(".").strip()
     head_end = last_i.start()
     if len(i_matches) >= 2:
@@ -399,7 +376,7 @@ def _parse_body_reference(item_html):
     if im:
         issue = im.group(1).strip().rstrip(".")
         after_text = (after_text[:im.start()] + after_text[im.end():]).strip(" ,:;.")
-    pages = after_text.replace("\u2013", "-").strip()
+    pages = after_text.replace("–", "-").strip()
 
     head = unescape(re.sub(r"<[^>]+>", "", head_html))
     head = re.sub(r"\s+", " ", head).strip()
@@ -424,15 +401,10 @@ def _parse_body_reference(item_html):
 def _body_fallback(item_html, doi):
     """Parse refs that lack <i>/<b> structural tags.
 
-    Tries three plaintext formats in order:
-      1. "Authors. Title. Journal Vol[, Pages] (YEAR)." — year-at-end,
-         common for modern refs that lost styling in the HTML.
-      2. "AuthorList (YEAR) Title. Journal, Vol, Pages" — EMBO/Oxford
-         comma-style.
-      3. "AuthorList (YEAR) Title. Journal Vol[(Issue)][:Pages]" —
-         older Springer colon-style.
-    Returns a title-only record if none match (true books, theses,
-    software citations).
+    Tries plaintext formats: year-at-end, BMC semicolon, BMC
+    colon-after-authors, book chapters, monographs, then a generic
+    "Authors (YEAR) Title. Journal Vol[(Issue)][:Pages]" form. Returns
+    a title-only record if none match (true books, theses, software).
     """
     text = re.sub(r"<a[^>]*>.*?</a>", " ", item_html, flags=re.DOTALL)
     text = re.sub(r"<[^>]+>", "", text)
@@ -452,17 +424,12 @@ def _body_fallback(item_html, doi):
     if year_end is not None:
         return year_end
 
-    # Modern Springer/Nature plaintext refs use two compact pagination
-    # separators that lose <i>/<b> styling in the saved HTML:
+    # Two compact pagination separators that lose <i>/<b> styling:
     #
     # A. Semicolon:
     #    "Authors. Title. Journal. YEAR;VOL[(Issue)]:PAGES."
     # B. Colon-after-authors, comma-separated pagination (BMC/BioMed):
     #    "Authors: Title. Journal. YEAR, VOL[(Issue)]: PAGES."
-    #
-    # Anchor on the pagination tail so prose-containing titles don't slip
-    # past. Run these before the book-chapter patterns because they're
-    # unambiguous.
     for sep1, sep2, auth_delim in (
         (";", ":", "."),      # Semicolon / Guterres / Oncogene
         (",", ":", ":"),      # BMC / Wang / Waldner
@@ -474,7 +441,7 @@ def _body_fallback(item_html, doi):
             + r"(?P<year>\d{4})\s*" + re.escape(sep1) + r"\s*"
             + r"(?P<vol>\d+)(?:\s*\((?P<issue>[^)]+)\))?\s*"
             + re.escape(sep2) + r"\s*"
-            + r"(?P<pages>[\w.\-\u2013\u2014]+)\.?\s*$"
+            + r"(?P<pages>[\w.\-–—]+)\.?\s*$"
         )
         m = re.match(pat, text)
         if m:
@@ -493,39 +460,28 @@ def _body_fallback(item_html, doi):
                 "volume": m.group("vol"),
                 "issue": m.group("issue") or "",
                 "pages": re.sub(
-                    r"[\u2010-\u2014]", "-", m.group("pages")
+                    r"[‐-—]", "-", m.group("pages")
                 ).rstrip("."),
                 "doi": doi,
                 "authors": authors,
             }
 
-    # Nature body refs for book chapters in the Heim/Mitelman form:
-    # "Authors. in Book Title pages (Publisher, City, Year)."
-    # Anchor on "<authors ending in a period>. in <CapitalizedBookTitle>"
-    # so the "in" inside prose (e.g., "Python in Science Conference") does
-    # not hijack the match.
+    # Book-chapter form: "Authors. in Book Title pages (Publisher, City, Year)."
     chap_m = re.match(
         r"^(?P<authors>.+?\.)\s+in\s+(?P<book>[A-Z][^.]*?)\s+"
-        r"(?P<pages>\d+[\-\u2013\u2014]\d+|[A-Za-z]?\d+(?:[\-\u2013\u2014][A-Za-z]?\d+)?)?"
+        r"(?P<pages>\d+[\-–—]\d+|[A-Za-z]?\d+(?:[\-–—][A-Za-z]?\d+)?)?"
         r"\s*\(([^)]*?)(?P<year>\d{4})\s*\)\.?\s*$",
         text,
     )
     if not chap_m:
-        # Standalone book monograph:
-        # "Authors. Book Title (Publisher, City, Year)."
-        # Require the closing paren to carry a publisher-like token so
-        # regular journal refs don't get misread as books. Old Nature
-        # (1998) wraps the year in nested parens — "(Yale University
-        # Press, New Haven, CT, (1992))" — so the paren-content pattern
-        # admits a single nested "(...)" group instead of [^)]*.
+        # Standalone book monograph
         mono_m = re.match(
-            r"^(?P<authors>(?:[A-Z][\w\-']+,\s+(?:[A-Z]\.\s*)+)+)"
-            r"(?P<book>[A-Z][^()]+?)\s+"
-            r"\((?P<paren>(?:[^()]|\([^()]*\))*?(?:Press|Publishers?|Publishing|"
-            r"Freeman|Wiley|Springer|Elsevier|Chapman\s*&\s*Hall|CRC|Academic|"
+            r"^(?P<authors>.+?\.)\s+(?P<book>[A-Z][^()]+?)\s+"
+            r"\((?P<paren>[^)]*?(?:Press|Publishers?|Publishing|Freeman|"
+            r"Wiley|Springer|Elsevier|Chapman\s*&\s*Hall|CRC|Academic|"
             r"University|Laboratory|INSERM|Humana|Dekker|Garland|Saunders|"
-            r"Mosby|Kluwer|Blackwell|ASM)(?:[^()]|\([^()]*\))*?)"
-            r"\(?(?P<year>\d{4})\)?\s*\)\.?\s*$",
+            r"Mosby|Kluwer|Blackwell|ASM)[^)]*?)"
+            r"(?P<year>\d{4})\s*\)\.?\s*$",
             text,
         )
         if mono_m:
@@ -556,7 +512,7 @@ def _body_fallback(item_html, doi):
             "year": chap_m.group("year"),
             "volume": "",
             "issue": "",
-            "pages": re.sub(r"[\u2010-\u2014]", "-", chap_m.group("pages") or ""),
+            "pages": re.sub(r"[‐-—]", "-", chap_m.group("pages") or ""),
             "doi": doi,
             "authors": chap_authors,
         }
@@ -568,8 +524,6 @@ def _body_fallback(item_html, doi):
             "volume": "", "issue": "", "pages": "", "doi": doi, "authors": [],
         }
     authors_str, year, rest = m.group(1), m.group(2), m.group(3)
-    # Try the structured helper first (handles "LastName, I." and "LastName I")
-    # before falling back to naive comma split.
     authors = _parse_body_author_list(authors_str.rstrip(","))
     if not authors:
         authors = [a.strip() for a in authors_str.rstrip(",").split(",") if a.strip()]
@@ -578,7 +532,7 @@ def _body_fallback(item_html, doi):
     #   "Journal Vol[(Issue)][:Pages]"   (colon-separated, older style)
     #   "Journal, Vol[(Issue)], Pages"   (comma-separated, EMBO/Oxford style)
     tail = re.search(
-        r"[.?!]\s+(.+?),\s*(\d+)(?:\(([\d\w\-\u2013]+)\))?,\s+([\w\-\u2013]+)\s*\.?\s*$",
+        r"[.?!]\s+(.+?),\s*(\d+)(?:\(([\d\w\-–]+)\))?,\s+([\w\-–]+)\s*\.?\s*$",
         rest,
     )
     if tail:
@@ -586,10 +540,10 @@ def _body_fallback(item_html, doi):
         journal = tail.group(1).strip().rstrip(".")
         volume = tail.group(2)
         issue = tail.group(3) or ""
-        pages = tail.group(4).replace("\u2013", "-").strip()
+        pages = tail.group(4).replace("–", "-").strip()
     else:
         tail = re.search(
-            r"[.?!]\s+([^.?!]+?)\s+(\d+)(?:\(([\d\w\-\u2013]+)\))?(?::\s*(.+?))?$",
+            r"[.?!]\s+([^.?!]+?)\s+(\d+)(?:\(([\d\w\-–]+)\))?(?::\s*(.+?))?$",
             rest,
         )
         if tail:
@@ -597,12 +551,8 @@ def _body_fallback(item_html, doi):
             journal = tail.group(1).strip().rstrip(".")
             volume = tail.group(2) or ""
             issue = tail.group(3) or ""
-            pages = (tail.group(4) or "").replace("\u2013", "-").strip()
+            pages = (tail.group(4) or "").replace("–", "-").strip()
         else:
-            # Book-monograph fallback: "Book Title. City: Publisher" —
-            # the period before "City:" separates the book name (journal
-            # role) from the publisher metadata. Covers "ggplot2:
-            # elegant graphics for data analysis. Berlin: Springer".
             book_m = re.match(
                 r"^(?P<book>.+?)\.\s+[^.]+?:\s+[A-Z].*$",
                 rest.rstrip("."),
@@ -631,11 +581,9 @@ def _body_fallback(item_html, doi):
 def _parse_year_at_end_plaintext(text, doi):
     """Parse 'Authors. Title. Journal Vol[, Pages] (YEAR).' without tags.
 
-    Mirrors the tag-anchored logic but identifies the journal as the
-    trailing sequence of capital-letter words preceded by ". "
-    (covers multi-word abbreviations like "Nucleic Acids Res." and
-    "FEBS J."). Returns None when the text doesn't end in "(YEAR)"
-    or can't locate a journal-like suffix — caller falls through.
+    Identifies the journal as the trailing sequence of capital-letter
+    words preceded by ". ". Returns None when the text doesn't end in
+    "(YEAR)" or can't locate a journal-like suffix.
     """
     core = text.rstrip(".")
     ym = re.search(r"\(\s*(\d{4})[a-z]?\s*\)\s*$", core)
@@ -645,10 +593,10 @@ def _parse_year_at_end_plaintext(text, doi):
     core = core[: ym.start()].rstrip(" ,.")
 
     volume = pages = ""
-    m = re.search(r"\s+(\d+),\s+([\w\-\u2013]+)\s*$", core)
+    m = re.search(r"\s+(\d+),\s+([\w\-–]+)\s*$", core)
     if m:
         volume = m.group(1)
-        pages = m.group(2).replace("\u2013", "-")
+        pages = m.group(2).replace("–", "-")
         core = core[: m.start()].rstrip(" ,.")
     else:
         m = re.search(r"\s+(\d+)\s*$", core)
@@ -656,10 +604,9 @@ def _parse_year_at_end_plaintext(text, doi):
             volume = m.group(1)
             core = core[: m.start()].rstrip(" ,.")
         else:
-            # e.g. "Nucleic Acids Res. 1–18" or "F1000Res" alone
-            m = re.search(r"\s+([\w\-\u2013]+)\s*$", core)
-            if m and re.search(r"[\d\u2013\-]", m.group(1)):
-                pages = m.group(1).replace("\u2013", "-")
+            m = re.search(r"\s+([\w\-–]+)\s*$", core)
+            if m and re.search(r"[\d–\-]", m.group(1)):
+                pages = m.group(1).replace("–", "-")
                 core = core[: m.start()].rstrip(" ,.")
 
     jm = re.search(
@@ -691,10 +638,9 @@ def _split_body_authors_title(head):
     """Split head text into (authors list, title string).
 
     Recognizes "et al." as an anchor; otherwise walks the last dotted
-    "LastName, I[. I.]" match or the last compact "LastName IN" match
-    (Layout C). When no author pattern matches (e.g., consortium names
-    like "The Cancer Genome Atlas Network"), emits authors=[] and
-    title=head so the raw string is still searchable.
+    "LastName, I[. I.]" match or the last compact "LastName IN" match.
+    Emits authors=[] and title=head when no author pattern matches
+    (consortium names, etc.).
     """
     et_al = re.search(r"\b[Ee]t al\.?", head)
     if et_al:
@@ -709,15 +655,6 @@ def _split_body_authors_title(head):
         for m in _COMPACT_AUTHOR_RE.finditer(head):
             last_end = m.end()
     if last_end:
-        # Old Nature (1998) style strips the period from "Jr.", leaving a
-        # bare "J" between the last dotted initial and the title:
-        # "Darnell, J. E. J STATs and gene regulation." Detect this by
-        # checking for a single uppercase letter (J/S — Jr/Sr) followed by
-        # a space and a capitalized title-start, and move past it so the
-        # leading "J " doesn't leak into the title.
-        suffix_m = re.match(r"\s*([JS])\s+(?=[A-Z])", head[last_end:])
-        if suffix_m:
-            last_end += suffix_m.end()
         authors_str = head[:last_end]
         title = head[last_end:].lstrip(" .").rstrip(".")
         return _parse_body_author_list(authors_str), title.strip()
@@ -725,11 +662,17 @@ def _split_body_authors_title(head):
 
 
 def _parse_body_author_list(authors_str):
-    """Extract "LastName IN" strings from the author section text."""
-    # Normalize " and " / ", and " / " & " separators into ", " so the
-    # greedy surname pattern below doesn't absorb the following author
-    # ("Prat S and Willmitzer L" → "Prat S, Willmitzer L"). Seen in old
-    # EMBO J reference lists.
+    """Extract "LastName IN" strings from the author section text.
+
+    The compact-form regex extends its surname capture leftward across
+    optional lowercase particle tokens (de, van, der, di, d'Adda, ...)
+    so 'de Lange T' parses as ('de Lange', 'T') instead of dropping
+    the 'de' particle. Particles attach to the right-adjacent
+    capitalized token; the regex itself does not enumerate the particle
+    set — surname-vs-particle disambiguation is handled centrally by
+    format_name when given the combined surname string.
+    """
+    # Normalize "and" / "&" separators to commas.
     authors_str = re.sub(r"\s*,?\s+(?:and|&)\s+", ", ", authors_str)
     authors = []
     for m in re.finditer(
@@ -739,8 +682,13 @@ def _parse_body_author_list(authors_str):
         authors.append(format_name(m.group(2).strip(), m.group(1)))
     if authors:
         return authors
+    # Compact form: optional leading lowercase particle tokens (de, van,
+    # der, di, d'Adda, etc.) absorbed into the surname capture.
     for m in re.finditer(
-        r"([A-Z][\w\-']+(?:\s[\w\-']+)*)\s+([A-Z]{1,5})(?=\s*(?:,|&|et al|\.|$))",
+        r"((?:(?:[a-z][\w\-']*|[a-z]['’][\w\-']+)\s+)*"
+        r"[A-Z][\w\-']+"
+        r"(?:\s+(?:[a-z][\w\-']*|[a-z]['’][\w\-']+|[A-Z][\w\-']+))*)"
+        r"\s+([A-Z]{1,5})(?=\s*(?:,|&|et al|\.|$))",
         authors_str,
     ):
         authors.append(format_name(m.group(2), m.group(1)))
@@ -751,15 +699,10 @@ def _parse_references(html):
     """Extract the reference list.
 
     Returns list of {"": {title, journal, year, volume, issue, pages, doi, authors}}.
-    Each reference dict uses the same field formats as the main paper, with
-    one exception: authors is a list of "LastName IN" strings (plain strings,
-    not dicts with affiliation). Empty fields are "". Empty authors is [].
 
     Prefers body parsing (anchored on <i>Journal</i>/<b>Volume</b> tags)
     and falls back to citation_reference meta tags only when body entries
-    are fewer. Body parsing tolerates freeform meta content (no
-    citation_title=...; k/v pairs), supplement parens, Layout B/C
-    ordering, and non-digit volumes that the meta path can't resolve.
+    are fewer.
     """
     meta_refs = [
         {"": _parse_citation_reference(unescape(m.group(1)))}
@@ -786,11 +729,7 @@ def _parse_references(html):
 # ---------------------------------------------------------------------------
 
 def _parse_keywords(html):
-    """Extract article-specific keywords from Subjects list in body HTML.
-
-    Uses c-article-subject-list (visible "Subjects" section) rather than
-    JSON-LD keywords, which mix article keywords with journal categories.
-    """
+    """Extract article-specific keywords from the Subjects list in body HTML."""
     keywords = []
     for m in re.finditer(
         r'<li[^>]*class=["\']?c-article-subject-list__subject["\']?[^>]*>'
@@ -813,10 +752,8 @@ def _parse_abstract(html):
     )
     if not m:
         return ""
-    # Remove heading tags (e.g. <h2>Abstract</h2>) to avoid header leaking
     content = re.sub(r'<h[1-6][^>]*>.*?</h[1-6]>', '', m.group(1), flags=re.DOTALL)
     text = strip_tags(content).strip()
-    # Safety net: strip leading "Abstract" if h-tag removal missed it
     if text.startswith("Abstract"):
         text = text[len("Abstract"):].strip()
     return text
@@ -850,7 +787,6 @@ def _find_start(article, sections):
     start = 0
     for i, (pos, tag_end, title) in enumerate(sections):
         if title.lower() in _PRE_BODY:
-            # End of this section = start of next section
             next_pos = sections[i + 1][0] if i + 1 < len(sections) else len(article)
             if next_pos > start:
                 start = next_pos
@@ -887,7 +823,6 @@ def _build_body(article, sections):
     Zone 2 (after first references): keep only supplementary sections.
     Remove all references sections.
     """
-    # Find first references section position
     first_ref_idx = None
     for i, (pos, tag_end, title) in enumerate(sections):
         if title.lower() in _REF_SECTIONS:
@@ -895,27 +830,21 @@ def _build_body(article, sections):
             break
 
     if first_ref_idx is None:
-        # No references found — include all non-pre-body sections
         return None
 
-    # Collect section ranges to include
     parts = []
     for i, (pos, tag_end, title) in enumerate(sections):
         tl = title.lower()
-        # Skip pre-body sections
         if tl in _PRE_BODY:
             continue
-        # Skip references sections
         if tl in _REF_SECTIONS:
             continue
 
         end = sections[i + 1][0] if i + 1 < len(sections) else len(article)
 
         if i < first_ref_idx:
-            # Zone 1: keep everything
             parts.append((pos, end))
         else:
-            # Zone 2: keep only supplementary sections
             if _SUPP_RE.search(title):
                 parts.append((pos, end))
 
@@ -925,14 +854,13 @@ def _build_body(article, sections):
 def _parse_main_text(html):
     """Extract body text.
 
-    Boundary rules (from CLAUDE.md):
+    Boundary rules:
       - Body sections: keep everything from abstract to before first references.
       - Supplementary: after first references, keep only sections matching
         supplement/extended data/source data/expanded view/powerpoint/appendix.
       - Remove all references sections.
     Pipeline: locate article container -> slice body zones -> extract_captions
     -> strip_common -> tags_to_text -> drop_noise.
-    Nature-specific: start is below Abstract and keywords/Inline Recommendations.
     """
     article = _extract_article(html)
     sections = _section_boundaries(article)
@@ -943,19 +871,16 @@ def _parse_main_text(html):
     parts = _build_body(article, sections)
 
     if parts is None:
-        # No references found — use start/end fallback
         start = _find_start(article, sections)
         end = len(article)
         if start >= end:
             return ""
         parts = [(start, end)]
     elif not parts:
-        # Fallback for articles without body sections (e.g. News & Views)
         m = re.search(r'<div[^>]*class=["\']?main-content[^>]*>', article)
         if not m:
             return ""
         start = m.end()
-        # End at first references or end of article
         end = len(article)
         for pos, tag_end, title in sections:
             if title.lower() in _REF_SECTIONS and pos > start:
@@ -982,7 +907,6 @@ def _parse_main_text(html):
     for start, end in parts:
         body_html += article[start:end]
 
-    # Remove any remaining references sections in the HTML
     while True:
         body_html, removed = _remove_section(
             body_html,
@@ -1002,7 +926,7 @@ def _parse_main_text(html):
 # ---------------------------------------------------------------------------
 
 def parse_article(html):
-    """Parse Nature HTML into a papers/*.json-format dict."""
+    """Parse Springer HTML into a papers/*.json-format dict."""
     meta = _parse_metadata(html)
     return {
         "title": meta["title"],

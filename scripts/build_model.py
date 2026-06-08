@@ -2,17 +2,17 @@
 """Build the embedding model (chroma collection) for semantic search.
 
 Usage:
-    python build_model.py                            # rebuild _global collection
+    python build_model.py                            # rebuild global collection
     python build_model.py <project_name> [<name>...]  # rebuild named project collections
 
-No args: rebuild the `_global` chroma collection over every
+No args: rebuild the `global` chroma collection over every
 papers/parsed/<stem>.json that has a non-empty main_text.
 
 With <project_name> args: rebuild each named project's collection from
 PMIDs in projects/<name>/pmids.txt.
 
 Single chroma_db/ directory at repo root holds named collections; one per
-project plus _global.
+project plus global.
 """
 
 import json
@@ -34,7 +34,7 @@ from _project import (
 MODEL_NAME = "BAAI/bge-base-en-v1.5"
 CHUNK_SIZE = 400
 CHUNK_OVERLAP = 80
-GLOBAL_COLLECTION = "_global"
+GLOBAL_COLLECTION = "global"
 
 
 def detect_device():

@@ -1,12 +1,4 @@
-"""bioRxiv (biorxiv.org) HTML parser.
-
-bioRxiv runs on the HighWire Press platform — same DOM idioms as CSHLP
-(`div.section.ref-list` + `ol.cit-list > li` for references,
-`<div class="fulltext-view">` for body, `citation_*` meta tags for
-metadata). This parser extracts full-text content when the capture is
-from the `/content/<doi>v1.full` URL; abstract-only landing pages yield
-metadata + abstract only.
-"""
+"""bioRxiv (biorxiv.org) HTML parser."""
 
 import re
 from html import unescape
@@ -15,13 +7,13 @@ from ._helpers import (
     _remove_nested_element,
     drop_noise,
     extract_captions,
+    format_author_name,
     format_doi,
     format_name,
     get_meta,
     neutralize_media_queries,
     parse_meta_authors,
     remove_elements_by_id,
-    remove_elements_by_selector,
     strip_common,
     strip_tags,
     tags_to_text,
@@ -54,222 +46,134 @@ _SUPP_RE = re.compile(
 # ---------------------------------------------------------------------------
 
 def remove_banners(html):
-    """Normalize bioRxiv HTML to a single centered text column.
+    """Apply Phase 2 layout rules for biorxiv.org (HighWire).
 
-    bioRxiv runs on HighWire; the visible article sits inside
-    ``.main-content-wrapper`` with siblings for prev/next article nav
-    (``.content-left-wrapper`` + ``.content-right-wrapper``) and global
-    chrome (<header>, <footer>, #sliding-popup cookie banner).
-
-    Chrome stripped (Step 3):
-      - <header id=section-header> site masthead, <footer>, breadcrumbs.
-      - Cookie consent ``#sliding-popup`` banner.
-      - Prev/next article nav sidebars (``.content-left-wrapper``,
-        ``.content-right-wrapper``).
-      - In-page tab bar (Abstract / Full Text / PDF) via
-        ``pane-highwire-panel-tabs`` and
-        ``pane-highwire-panel-tabs-container``.
-      - Everything from ``pane-highwire-back-to-top`` to the end of
-        ``.main-content-wrapper`` (disqus stub, share tools, related
-        collections, subject-collections carousel, forward form, citation
-        export — none of it is reading content).
-
-    Reading column (Step 4): cap ``.main-content-wrapper`` at 752 px with
-    56 px top/bottom and 16 px side padding.
+    Step 1: cap body width at 752 px; neutralize @media so the narrow
+            (single-column) layout applies at any viewport.
+    Step 2: EU cookie compliance bottom popup (`#sliding-popup`).
+    Step 3: HighWire docked-nav and full-viewport overlay (sticky on
+            scroll). Hidden via CSS so the parser still sees the source.
+    Step 4: vertical sidebars — `#col-2`, `#col-3` (HighWire columns
+            that flank the article container in two-column layouts).
+            After Step 1's media-query collapse most of this folds
+            already; explicit hide is belt-and-braces.
+    Step 5: ad block — biorxiv ships top banner ad (`#ads3`) and a
+            `.no-ad.tower_col_2` placeholder li.
+    Step 6: page background — body cascade leaves a grey backdrop
+            visible at wide viewports once the cap kicks in. Force
+            html + body backgrounds to white.
+    Step 8: figures — `.fig.pos-float` wraps an inline image; force
+            block + caption-below layout.
+    Step 9: no-op. `.affiliation-list.hideaffil` and
+            `.cb-section.default-closed.collapsed` are HighWire
+            conventions absent from the DOM in our test fixtures
+            (CSS rule for `.hideaffil` exists but no element uses
+            the class; `.cb-section` does not appear at all). Even
+            if present, `.cb-section.default-closed.collapsed` lives
+            inside `#col-2`/`#col-3` which Step 4 already hides.
     """
-    # Lock layout to publisher's narrow (≤1024 px) form at any viewport.
     html = neutralize_media_queries(html)
-    # -------------------------------------------------------------------
-    # Step 3 — strip chrome.
-    # -------------------------------------------------------------------
-    html = _remove_nested_element(html, r"<header\b[^>]*>")
-    html = _remove_nested_element(html, r"<footer\b[^>]*>")
+
+    # Step 2 — cookie compliance popup
     html = remove_elements_by_id(html, "sliding-popup")
-    # Prev/next-article sidebars (HighWire ``node-pager`` layout).
+
+    # Step 5 — ad blocks
+    html = remove_elements_by_id(html, "ads3")
     html = _remove_nested_element(
         html,
-        r'<div[^>]*\bclass="[^"]*\bcontent-left-wrapper\b[^"]*"[^>]*>',
+        r'<li[^>]*\bclass="no-ad tower_col_2"[^>]*>',
     )
-    html = _remove_nested_element(
-        html,
-        r'<div[^>]*\bclass="[^"]*\bcontent-right-wrapper\b[^"]*"[^>]*>',
-    )
-    # Note: keep `.pane-highwire-panel-tabs` (Abstract / Full Text /
-    # Info/History / Metrics / Preview PDF row). It's a static
-    # row of tab labels at narrow vw — useful navigation, not chrome.
-    # Disqus comment placeholder + "Back to top" link (both sit at the
-    # bottom of the active tab's content column).
-    html = remove_elements_by_selector(
-        html,
-        "pane-disqus-comment",
-        "pane-highwire-back-to-top",
-        "pane-highwire-node-pager",
-    )
-    # Entire right-sidebar column inside the tab container: article
-    # tools, variant link, print / supplementary / share / cite / email /
-    # collections / subject carousel / forward form / citation export.
-    # None of it is reading content.
-    html = _remove_nested_element(
-        html,
-        r'<div[^>]*\bclass="[^"]*\bpanel-region-sidebar-right\b[^"]*"[^>]*>',
-    )
-    # Trailing omega-12 row (article clipboard copy, service links,
-    # citation-export tool, and the "Subject Collections" carousel) that
-    # lives below the two-col split.
-    html = _remove_nested_element(
-        html,
-        r'<div[^>]*\bclass="[^"]*\bpanels-flexible\b[^"]*"[^>]*>',
-    )
-    html = remove_elements_by_selector(
-        html,
-        "pane-highwire-article-clipboard-copy",
-        "pane-highwire-article-collections",
-        "pane-biorxiv-subject-collections",
-        "pane-highwire-subject-collections",
-        "pane-forward-form",
-        "pane-highwire-citation-export",
-    )
-    # Remove the whole omega-12 panel display that holds the post-article
-    # chrome (preface / content / postscript rows below the tab split).
-    html = re.sub(
-        r'<div\s+class="panel-display omega-12-onecol"[\s\S]*?</div>\s*</div>\s*</div>',
-        "",
-        html,
-        count=1,
-    )
-    # Sticky comments/side-panel (HighWire `<aside class=csh_panelc>` +
-    # `<div class=csh_panelc-header>`) — positioned fixed at T=2400
-    # (offscreen below at top viewport) but surfaces mid-scroll. Kill
-    # both so nothing pops when scrolling through the article.
-    for _ in range(3):
-        before = html
+    while True:
+        prev = html
         html = _remove_nested_element(
-            html, r'<aside\b[^>]*\bclass=["\']?[^"\'>]*\bcsh_panelc\b[^>]*>',
+            html,
+            r'<\w+[^>]*\bclass=("[^"]*\bbanner-ads\b[^"]*"|'
+            r"'[^']*\bbanner-ads\b[^']*'|banner-ads\b)[^>]*>",
         )
-        if html == before:
-            break
-    for _ in range(3):
-        before = html
-        html = _remove_nested_element(
-            html, r'<div\b[^>]*\bclass=["\']?[^"\'>]*\bcsh_panelc-header\b[^>]*>',
-        )
-        if html == before:
+        if html == prev:
             break
 
-    # -------------------------------------------------------------------
-    # Steps 2 + 4 — layout freeze and reading-column cap.
-    # -------------------------------------------------------------------
     override = (
         "<style>"
-        # Layout freeze (Step 2). The HighWire "grid-*" layout uses
-        # 960-px containers that off-center the article at wide viewports;
-        # force everything to fluid-with-cap so the wrapper cap is the
-        # only thing that sets the visible column width.
-        "html{width:100% !important;max-width:100% !important;"
-        "margin:0 !important;background:#fff !important;"
-        "overflow-y:overlay}"
-        "html::-webkit-scrollbar{width:0}"
-        "body{width:100% !important;min-width:0 !important;"
-        "max-width:100% !important;margin:0 auto !important;"
-        "background:#fff !important;color:#000 !important}"
-        # Collapse HighWire's outer grid scaffolding so the main-content
-        # wrapper sizes to its own cap instead of inheriting grid-28 /
-        # suffix-1 / prefix-1 widths.
-        "#page,#zone-content,#region-content,.region-content-inner,"
-        ".panel-panel,.panel-region-content,.panels-jcore-2col,"
-        ".grid-28,.grid-17,.grid-11,.suffix-1,.prefix-1,.alpha,.omega{"
-        "float:none !important;width:auto !important;"
-        "max-width:100% !important;min-width:0 !important;"
-        "margin:0 auto !important;padding:0 !important;"
-        "display:block !important}"
-        # Capped reading column (Step 4).
-        ".main-content-wrapper{"
-        "float:none !important;display:block !important;"
-        "width:auto !important;max-width:752px !important;"
-        "margin:0 auto !important;padding:56px 16px !important;"
-        "box-sizing:border-box !important;background:#fff !important}"
-        ".main-content-wrapper *{"
-        "max-width:100% !important;min-width:0 !important}"
-        # Zero the horizontal offsets on panel/pane wrappers so the text
-        # column lines up flush with the 16-px wrapper padding.
-        ".main-content-wrapper .panel-pane,"
-        ".main-content-wrapper .pane-content,"
-        ".main-content-wrapper .highwire-article-citation,"
-        ".main-content-wrapper .highwire-cite,"
-        ".main-content-wrapper .fulltext-view,"
-        ".main-content-wrapper .highwire-markup,"
-        ".main-content-wrapper .article,"
-        ".main-content-wrapper .section,"
-        ".main-content-wrapper .panel-panel,"
-        ".main-content-wrapper .panel-display{"
-        "float:none !important;width:auto !important;"
-        "margin-left:0 !important;margin-right:0 !important;"
-        "padding-left:0 !important;padding-right:0 !important}"
-        # Headings inside `.highwire-markup` ship with
-        # `margin-left:-15px` to bleed outside the article gutter; zero
-        # it so h2 aligns with body text at the wrapper padding edge.
-        # Figures / tables / videos ship with `margin:25px -15px` for the
-        # same bleed-out effect — zero the horizontal margins there too.
-        # Keep their padding-left/right so the caption text inside `.fig`
-        # stays indented from the figure box edge as it does in raw.
-        ".main-content-wrapper h1,.main-content-wrapper h2,"
-        ".main-content-wrapper h3,.main-content-wrapper h4,"
-        ".main-content-wrapper .fig,.main-content-wrapper .table,"
-        ".main-content-wrapper .video-content{"
-        "margin-left:0 !important;margin-right:0 !important}"
-        # Figure images: a get_refs.py browser-script swaps
-        # `img.highwire-fragment` src from the medium GIF (~440 px) to
-        # the large JPG/PNG on the parent <a href> (~800-1500 px native).
-        # The publisher renders the medium image at its native pixel
-        # dimensions centered inside the `.fig-inline-img-wrapper`,
-        # leaving a visibly narrower image than its caption. Force the
-        # large image to fill the wrapper (block, full width) so the
-        # figure aligns with caption width. The publisher's parent <a>
-        # carries `padding: 8px` which would shave 16 px off the image
-        # width; zero those so img matches caption width exactly.
-        ":root .main-content-wrapper a.highwire-fragment{"
-        "padding-left:0 !important;padding-right:0 !important}"
-        ":root .main-content-wrapper img.highwire-fragment{"
-        "display:block !important;width:100% !important;"
-        "height:auto !important;margin:0 !important}"
-        # Empty panel-separator spacers (trailing siblings of the tab
-        # container) add ~13 px to the doc bottom.
-        ".main-content-wrapper .panel-separator{"
-        "display:none !important;margin:0 !important;"
-        "padding:0 !important;height:0 !important;border:none !important}"
-        # First-child margin reset — DIRECT children only (`>`) per the
-        # SKILL.md pitfall. Descendant `*:first-child{margin-top:0}`
-        # zeros every section heading's top margin (H2s/H3s are the
-        # first child of their .section/.subsection containers),
-        # collapsing biorxiv's 15-25 px section rhythm. Descendant
-        # `*:last-child{margin-bottom:0}` is still safe.
-        ".main-content-wrapper>*:first-child{"
-        "margin-top:0 !important;padding-top:0 !important}"
-        ".main-content-wrapper>*:last-child,"
-        ".main-content-wrapper>*:last-child>*:last-child,"
-        ".main-content-wrapper>*:last-child>*:last-child>*:last-child,"
-        ".main-content-wrapper>*:last-child>*:last-child>*:last-child>*:last-child,"
-        ".main-content-wrapper>*:last-child>*:last-child>*:last-child>*:last-child>*:last-child,"
-        ".main-content-wrapper>*:last-child>*:last-child>*:last-child>*:last-child>*:last-child>*:last-child"
-        "{margin-bottom:0 !important;padding-bottom:0 !important}"
-        # Tab container has its own `margin-bottom:10px` that isn't
-        # caught by `*:last-child` because the two panel-separator
-        # spacers are stacked after it.
-        ".main-content-wrapper .pane-highwire-panel-tabs-container{"
-        "margin-bottom:0 !important}"
-        # Drupal ships hidden modal dialogs (Email article / Citation
-        # Tools / Share) and per-author qTip popup templates in the DOM.
-        # Their built-in `display:none` is toggled on by JS, so when a
-        # reader opens the saved HTML without JS enabled, the dialogs
-        # render as visible blocks below the article.
-        # Per-author popup templates have class stems like `author-tooltip-0`
-        # — anchored with the `author-tooltip-` prefix so the sibling
-        # `has-author-tooltip` wrapper class on the cite card is unaffected.
-        ".ui-dialog,.cluetip,.cluetip-default,"
-        "[class^=author-tooltip-],[class*=' author-tooltip-'],"
-        "[id^=highwire-author-tooltip-],"
-        "#sliding-popup,#eu-cookie-withdraw-banner{"
-        "display:none !important}"
+        # Step 1 / Step 6 — lock layout to 752 px wide, white background.
+        "html{margin:0!important;padding:0!important;"
+        "background:#fff!important;}"
+        "body{max-width:752px!important;width:auto!important;"
+        "min-width:0!important;"
+        "margin:0 auto!important;padding:0 16px!important;"
+        "box-sizing:border-box!important;"
+        "background:#fff!important;"
+        "overflow-wrap:break-word!important;word-wrap:break-word!important;}"
+        # Override publisher's fixed pixel widths so the floats collapse
+        # into the body cap. biorxiv uses Drupal Omega zones + grid-28
+        # layout with hard-coded widths (960 / 886 px).
+        "#pageid-content,#content-block,"
+        "#zone-branding,#zone-content,#zone-menu,#zone-user,"
+        "#zone-postscript,#zone-footer,"
+        "#region-content,.region-inner,.region-content-inner,"
+        ".panel-display,.panel-row-wrapper,"
+        ".grid-1,.grid-2,.grid-3,.grid-4,.grid-5,.grid-6,.grid-7,"
+        ".grid-8,.grid-9,.grid-10,.grid-11,.grid-12,.grid-13,.grid-14,"
+        ".grid-15,.grid-16,.grid-17,.grid-18,.grid-19,.grid-20,.grid-21,"
+        ".grid-22,.grid-23,.grid-24,.grid-25,.grid-26,.grid-27,.grid-28,"
+        ".grid-29,.grid-30,"
+        ".container-12,.container-16,.container-24,.container-30"
+        "{width:auto!important;max-width:100%!important;"
+        "float:none!important;padding:0!important;margin:0!important;"
+        "background:transparent!important;}"
+        "body{background:#fff!important;}"
+        "#header,#footer{width:auto!important;max-width:100%!important;"
+        "background:#fff!important;position:relative!important;}"
+        # HighWire's header/footer use fixed-pixel-width inner bars
+        # that escape the body cap.
+        ".bar,.bar-inner,.footer-group,"
+        ".footer-col-left,.footer-col-right"
+        "{width:auto!important;max-width:100%!important;"
+        "margin-left:0!important;padding-left:0!important;"
+        "float:none!important;}"
+        ".header-qs,#hdr-login,.inst-branding,#authstring"
+        "{position:static!important;left:auto!important;top:auto!important;"
+        "width:auto!important;max-width:100%!important;}"
+        ".inst-branding,#hdr-login"
+        "{height:auto!important;min-height:0!important;"
+        "padding-top:0!important;padding-bottom:0!important;}"
+        ".inst-branding:empty,#hdr-login:empty"
+        "{display:none!important;}"
+        # Step 4 — hide left/right sidebars.
+        "#col-2,#col-3{display:none!important;}"
+        # Step 3 — hide HighWire's docked-nav, full-viewport overlay,
+        # and the right-edge collapsible panel (aside.csh_panelc).
+        "#bg-hovering-img,div#docked-nav,div#docked-nav3,"
+        "aside.csh_panelc"
+        "{display:none!important;}"
+        # Step 8 — figures: image fills column, image above caption.
+        # bioRxiv markup is `.fig.pos-float > .highwire-figure >
+        # .fig-inline-img-wrapper > .fig-inline-img > a > img.highwire-
+        # fragment.fragment-image`. The publisher's default styling
+        # caps the image at 400 px (lazyload thumbnail dimensions),
+        # leaving large white reservation below.
+        ".fig.pos-float,.highwire-figure,"
+        ".fig-inline-img-wrapper,.fig-inline-img,.fig-inline"
+        "{display:block!important;width:100%!important;"
+        "max-width:100%!important;float:none!important;"
+        "margin-left:0!important;margin-right:0!important;"
+        "padding-left:0!important;padding-right:0!important;"
+        "box-sizing:border-box!important;height:auto!important;"
+        "min-height:0!important;}"
+        ".fig-inline-img a,.fig-inline-img a img,"
+        ".fig-inline-img img,"
+        "img.highwire-fragment.fragment-image,"
+        "img.lazyload,img.lazyloading"
+        "{display:block!important;width:100%!important;"
+        "max-width:100%!important;height:auto!important;"
+        "margin:0 0 12px 0!important;"
+        "opacity:1!important;"
+        "box-sizing:border-box!important;}"
+        ".fig-caption"
+        "{display:block!important;width:100%!important;"
+        "margin:0!important;}"
+        ".fig-inline .callout,.highwire-figure .callout"
+        "{display:none!important;}"
         "</style>"
     )
     if "</head>" in html:
@@ -277,12 +181,6 @@ def remove_banners(html):
     else:
         html = re.sub(r"(<body\b)", override + r"\1", html, count=1)
     return html
-
-
-# ---------------------------------------------------------------------------
-# Metadata
-# ---------------------------------------------------------------------------
-
 def _parse_metadata(html):
     """Extract bundled metadata: title, journal, year, volume, issue, pages, doi.
 
@@ -327,9 +225,8 @@ def _parse_authors(html):
     bioRxiv exposes per-author `citation_author` + consecutive
     `citation_author_institution` tags; `parse_meta_authors` aligns
     them. Names are in "Given Last" form (first-last) — `format_name`
-    via `format_author_name` below the helper flips to "LastName IN".
+    via `format_author_name` flips to "LastName IN".
     """
-    from ._helpers import format_author_name
     return [
         {
             "author": format_author_name(a["name"]),

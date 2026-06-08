@@ -6,7 +6,7 @@ Usage:
 
 Project resolution is cwd-based:
   - cwd inside projects/<name>/ → query that project's collection.
-  - cwd elsewhere → query the _global collection.
+  - cwd elsewhere → query the global collection.
 
 Output: JSON array of {pmid, stem, score, snippet} for the top matches.
 """
@@ -20,7 +20,7 @@ from sentence_transformers import SentenceTransformer
 from _project import chroma_dir, current_project_from_cwd
 
 MODEL_NAME = "BAAI/bge-base-en-v1.5"
-GLOBAL_COLLECTION = "_global"
+GLOBAL_COLLECTION = "global"
 TOP_K = 30
 RESULT_LIMIT = 10
 

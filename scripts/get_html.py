@@ -13,7 +13,7 @@ For each URL arg: fetch directly, save to papers/raw/<url_name>.html where
 underscores. URL-keyed outputs that already exist are skipped.
 
 A list arg is a file containing PMIDs and/or URLs separated by spaces or
-newlines.
+newlines. Lines starting with '#' are ignored (comments).
 """
 
 import json
@@ -31,6 +31,7 @@ import websocket
 from html import unescape
 
 from _cli import parse_argv
+from _net import polite_urlopen
 from _project import parsed_path, raw_dir, raw_html_path
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -298,6 +299,45 @@ def _plos_inline_figures(saved_path, port):
         if img_m and url_m:
             pairs.append((img_m.group(0), unescape(url_m.group(1))))
 
+    # Also walk the lightbox carousel: each carousel slot is
+    #   <div class="carousel-item lightbox-figure" data-doi=10.1371/<journal>.<id>.gN>
+    #     <img src=data:, loading=lazy alt="Figure N">
+    #   </div>
+    # No adjacent `<a href=…size=large>` link — derive the URL from
+    # data-doi by routing it through PLOS's article/figure/image endpoint:
+    #   https://journals.plos.org/<journal>/article/figure/image?id=<doi>&size=large
+    # The `<journal>` segment is the third dotted token in the DOI
+    # (`10.1371/journal.<journal>.<id>.gN` → `<journal>`).
+    carousel_re = re.compile(
+        r'<div\s+class=("?[^"\'>]*?\bcarousel-item\b[^"\'>]*?\blightbox-figure\b[^"\'>]*?"?)'
+        r'[^>]*\bdata-doi=("([^"]+)"|\'([^\']+)\'|([^\s>]+))',
+        re.IGNORECASE,
+    )
+    for m in carousel_re.finditer(html):
+        doi = (m.group(3) or m.group(4) or m.group(5)).strip()
+        # Expect `10.1371/journal.<journal>.<id>.gN` or `…tN` (table); only
+        # extract the journal token. Fail open — skip if the DOI doesn't
+        # match the expected shape.
+        m_doi = re.match(r'10\.1371/journal\.([a-z]+)\.', doi, re.IGNORECASE)
+        if not m_doi:
+            continue
+        journal = m_doi.group(1).lower()
+        # Param ordering matters on this endpoint: `?id=…&size=large`
+        # returns 404; `?download&size=large&id=…` returns 200. Match
+        # the format PLOS itself uses on the inline `.figure` block's
+        # download anchor (extracted by the loop above).
+        url = (
+            f"https://journals.plos.org/{journal}/article/figure/image"
+            f"?download&size=large&id={doi}"
+        )
+        # Find the first <img> inside this carousel-item div (closing
+        # </div> is at most ~500 bytes downstream — bound the scan).
+        slot = html[m.start():m.start() + 1500]
+        img_m = re.search(r'<img\b[^>]*>', slot)
+        if not img_m:
+            continue
+        pairs.append((img_m.group(0), url))
+
     if not pairs:
         return
 
@@ -315,7 +355,7 @@ def _plos_inline_figures(saved_path, port):
             req = urllib.request.Request(
                 url, headers={"User-Agent": _BROWSER_UA},
             )
-            with urllib.request.urlopen(req, timeout=60) as resp:
+            with polite_urlopen(req, timeout=60) as resp:
                 ct = resp.headers.get(
                     "Content-Type", "image/png",
                 ).split(";")[0].strip()
@@ -427,7 +467,7 @@ def _imrpress_inline_figures(saved_path, port):
             req = urllib.request.Request(
                 fig_url, headers={"User-Agent": _BROWSER_UA},
             )
-            with urllib.request.urlopen(req, timeout=30) as resp:
+            with polite_urlopen(req, timeout=30) as resp:
                 ct = resp.headers.get("Content-Type", "image/jpeg").split(";")[0].strip()
                 blob = resp.read()
         except Exception as e:
@@ -504,7 +544,7 @@ def _annualreviews_inline_figures(saved_path, port):
                     "Referer": "https://www.annualreviews.org/",
                 },
             )
-            with urllib.request.urlopen(req, timeout=30) as resp:
+            with polite_urlopen(req, timeout=30) as resp:
                 ct = resp.headers.get("Content-Type", "image/gif").split(";")[0].strip()
                 blob = resp.read()
         except Exception as e:
@@ -538,6 +578,1743 @@ def _annualreviews_inline_figures(saved_path, port):
             f.write(html)
 
 
+def _cshlp_inline_figures(saved_path, port):
+    """Post-capture hook: refetch cshlp inline thumbnails as .large.jpg.
+
+    cshlp ships each figure as
+      `<div class=fig><a class=fig-inline-link href=...F<N>.expansion.html>
+        <img src=...F<N>.small.gif>`
+    The pre-capture `_CSHLP_FIGURES_FIX_JS` rewrites the img src to the
+    `.large.jpg` URL before SingleFile inlines, but old captures and
+    captures where SingleFile saved before the JS swap completed end up
+    with the small thumbnail (~200 px wide, illegible at 720-px column
+    width). This hook walks the saved HTML, locates each
+    fig-inline-link's `.expansion.html` href, swaps to `.large.jpg`,
+    fetches via urllib, and replaces the inner img's src with the
+    base64-encoded large image.
+
+    `port` is unused; kept for post_capture signature symmetry.
+    """
+    del port
+    try:
+        html = open(saved_path, encoding="utf-8").read()
+    except Exception:
+        return
+
+    # Locate each <a class=fig-inline-link>...<img>. href and class can
+    # appear in either order; match each <a>, check it has both
+    # attributes, then capture the inner img.
+    matches = []
+    for m in re.finditer(
+        r'<a\b([^>]*)>\s*(<img\b[^>]*>)', html, re.IGNORECASE,
+    ):
+        attrs = m.group(1)
+        if "fig-inline-link" not in attrs:
+            continue
+        hm = re.search(
+            r'\bhref=("([^"]*)"|\'([^\']*)\'|([^\s>]+))', attrs,
+        )
+        if not hm:
+            continue
+        href = hm.group(2) or hm.group(3) or hm.group(4)
+        if not href.endswith(".expansion.html"):
+            continue
+        # Synthesize a match-like object
+        matches.append((m.start(2), m.end(2), m.group(2), href))
+    if not matches:
+        return
+
+    print(f"  cshlp post-capture: {len(matches)} figure(s) to refetch",
+          flush=True)
+
+    import base64
+    url_to_data = {}
+    for img_start, img_end, img_tag, href in matches:
+        large_url = re.sub(r'\.expansion\.html$', '.large.jpg', href)
+        if large_url in url_to_data:
+            continue
+        try:
+            req = urllib.request.Request(
+                large_url, headers={
+                    "User-Agent": _BROWSER_UA,
+                    "Referer": href,
+                },
+            )
+            with polite_urlopen(req, timeout=30) as resp:
+                ct = resp.headers.get(
+                    "Content-Type", "image/jpeg"
+                ).split(";")[0].strip()
+                blob = resp.read()
+        except Exception as e:
+            print(f"    fetch-error: {large_url[-50:]} ({e})", flush=True)
+            continue
+        url_to_data[large_url] = ("data:" + ct + ";base64,"
+                                  + base64.b64encode(blob).decode("ascii"))
+
+    modified = False
+    for img_start, img_end, img_tag, href in matches:
+        large_url = re.sub(r'\.expansion\.html$', '.large.jpg', href)
+        data_url = url_to_data.get(large_url)
+        if not data_url:
+            continue
+        new_img = re.sub(
+            r'\bsrc=("[^"]*"|\'[^\']*\'|[^\s>]+)',
+            'src="' + data_url + '"',
+            img_tag, count=1,
+        )
+        if new_img == img_tag:
+            continue
+        html = html.replace(img_tag, new_img, 1)
+        modified = True
+        print(f"    inlined {large_url.rsplit('/', 1)[-1]} "
+              f"({len(data_url)} b)", flush=True)
+
+    if modified:
+        with open(saved_path, "w", encoding="utf-8") as f:
+            f.write(html)
+
+
+def _biorxiv_inline_figures(saved_path, port):
+    """Post-capture hook: refetch bioRxiv equation embeds via urllib.
+
+    bioRxiv equation/formula embeds (`<img class="highwire-embed
+    lazyloaded" src=data:, data-src=…/embed/graphic-N.gif>`) fail to
+    inline during the SingleFile pass — the CDN serves them only with a
+    valid Referer header, and SingleFile's deferred image fetch runs
+    without one. SingleFile additionally appends `.backup.<timestamp>`
+    suffixes onto the data-src after each retry. Strategy: walk every
+    broken `<img …highwire-embed…>`, strip any `.backup.<digits>`
+    suffix(es) from the data-src, refetch via urllib server-side with a
+    `Referer: https://www.biorxiv.org/` header, and inline the bytes as
+    a base64 data URL. `port` is unused; server-side fetch.
+    """
+    del port
+    try:
+        html = open(saved_path, encoding="utf-8").read()
+    except Exception:
+        return
+
+    pairs = []  # (img_tag, clean_url)
+    for start_m in re.finditer(
+        r'<img\b[^<>]*\bhighwire-embed\b', html,
+    ):
+        s = start_m.start()
+        i = s
+        in_sq = in_dq = False
+        while i < len(html):
+            c = html[i]
+            if c == "'" and not in_dq:
+                in_sq = not in_sq
+            elif c == '"' and not in_sq:
+                in_dq = not in_dq
+            elif c == '>' and not in_sq and not in_dq:
+                break
+            i += 1
+        if i >= len(html):
+            continue
+        img_tag = html[s:i + 1]
+        if not re.search(
+            r'\bsrc=(?:"data:,?"|\'data:,?\'|data:,?)[\s>]', img_tag,
+        ):
+            continue
+        dsrc_m = re.search(
+            r'\bdata-src=(?:"([^"]+)"|\'([^\']+)\'|([^\s>]+))',
+            img_tag,
+        )
+        if not dsrc_m:
+            continue
+        url = unescape(
+            dsrc_m.group(1) or dsrc_m.group(2) or dsrc_m.group(3),
+        )
+        # Strip any .backup.<timestamp> suffix(es) SingleFile appended
+        # on failed retries; timestamp may be an integer or a float
+        # (e.g. `.backup.1751516754` or `.backup.1751516754.2611`). The
+        # canonical URL is the bare CDN path with no suffix.
+        clean = re.sub(r'(?:\.backup\.\d+(?:\.\d+)?)+$', '', url)
+        pairs.append((img_tag, clean))
+
+    if not pairs:
+        return
+
+    print(f"  biorxiv post-capture: {len(pairs)} embed(s) to refetch",
+          flush=True)
+
+    import base64
+    url_to_data = {}
+    for _, clean_url in pairs:
+        if clean_url in url_to_data:
+            continue
+        try:
+            req = urllib.request.Request(
+                clean_url, headers={
+                    "User-Agent": _BROWSER_UA,
+                    "Referer": "https://www.biorxiv.org/",
+                },
+            )
+            with polite_urlopen(req, timeout=30) as resp:
+                ct = resp.headers.get(
+                    "Content-Type", "image/gif",
+                ).split(";")[0].strip()
+                blob = resp.read()
+        except Exception as e:
+            print(f"    fetch-error: {clean_url[-60:]} ({e})", flush=True)
+            continue
+        url_to_data[clean_url] = (
+            "data:" + ct + ";base64,"
+            + base64.b64encode(blob).decode("ascii")
+        )
+
+    modified = False
+    for img_tag, clean_url in pairs:
+        data_url = url_to_data.get(clean_url)
+        if not data_url:
+            continue
+        new_img = re.sub(
+            r'\bsrc=(?:"data:,?"|\'data:,?\'|data:,?)',
+            'src="' + data_url + '"',
+            img_tag, count=1,
+        )
+        if new_img == img_tag:
+            continue
+        html = html.replace(img_tag, new_img, 1)
+        modified = True
+        ident = clean_url.rsplit('/', 1)[-1]
+        print(f"    inlined {ident} ({len(data_url)} chars)", flush=True)
+
+    if modified:
+        with open(saved_path, "w", encoding="utf-8") as f:
+            f.write(html)
+
+
+def _jci_inline_figures(saved_path, port):
+    """Post-capture hook: inline JCI figure thumbnails via CloudFront.
+
+    JCI articles ship every figure as
+      `<a href=https://[www.|insight.]jci.org/articles/view/<ID>/figure/<N>>
+        <img class=figure_thumbnail src=data:, alt=… title=…>`
+    The pre-capture `_JCI_FIGURES_FIX_JS` browser-script normally
+    rewrites `<img src>` to a derivable CloudFront URL before SingleFile
+    captures, but on slow loads (5+ figures, busy CDN) some images miss
+    the swap and end up with the empty placeholder. The medium-resolution
+    JPEG lives at a deterministic CloudFront URL derived from the
+    article ID + figure number on the parent `<a href>`:
+      bucket = (int(article_id) // 1000) * 1000
+      url = https://dm5migu4zj3pb.cloudfront.net/manuscripts/<bucket>/
+            <article_id>/medium/JCI<article_id>.f<N>.jpg
+    Substring `jci.org` matches both `www.jci.org` and `insight.jci.org`.
+    `port` is unused; server-side fetch.
+    """
+    del port
+    try:
+        html = open(saved_path, encoding="utf-8").read()
+    except Exception:
+        return
+
+    pair_re = re.compile(
+        r'<a\s+href=(?:"([^"]+)"|\'([^\']+)\'|([^\s>]+))[^>]*>\s*'
+        r'(<img\b[^<>]*?\bclass=("[^"]*\bfigure_thumbnail\b[^"]*"'
+        r"|'[^']*\bfigure_thumbnail\b[^']*'"
+        r'|[^\s>]*\bfigure_thumbnail\b[^\s>]*)[^>]*>)',
+        re.IGNORECASE,
+    )
+    pairs = []  # (cdn_url, img_tag)
+    for m in pair_re.finditer(html):
+        href = m.group(1) or m.group(2) or m.group(3)
+        img_tag = m.group(4)
+        if "data:image/jpeg;base64" in img_tag or "data:image/png;base64" in img_tag:
+            continue
+        if not re.search(
+            r'\bsrc=(?:"data:,?"|\'data:,?\'|data:,?)[\s>]', img_tag,
+        ):
+            continue
+        href_clean = unescape(href).rstrip("/")
+        href_m = re.search(
+            r'/articles/view/(\d+)/figure/(\d+)$',
+            href_clean,
+            re.IGNORECASE,
+        )
+        if not href_m:
+            continue
+        article_id = href_m.group(1)
+        fig_num = href_m.group(2)
+        bucket = (int(article_id) // 1000) * 1000
+        cdn_url = (
+            f"https://dm5migu4zj3pb.cloudfront.net/manuscripts/{bucket}/"
+            f"{article_id}/medium/JCI{article_id}.f{fig_num}.jpg"
+        )
+        pairs.append((cdn_url, img_tag))
+
+    if not pairs:
+        return
+
+    print(f"  jci post-capture: {len(pairs)} figure(s) to enrich",
+          flush=True)
+
+    import base64
+    url_to_data = {}
+    for cdn_url, _ in pairs:
+        if cdn_url in url_to_data:
+            continue
+        try:
+            req = urllib.request.Request(
+                cdn_url, headers={
+                    "User-Agent": _BROWSER_UA,
+                    "Referer": "https://www.jci.org/",
+                },
+            )
+            with polite_urlopen(req, timeout=30) as resp:
+                ct = resp.headers.get(
+                    "Content-Type", "image/jpeg",
+                ).split(";")[0].strip()
+                blob = resp.read()
+        except Exception as e:
+            print(f"    fetch-error: {cdn_url[-60:]} ({e})", flush=True)
+            continue
+        url_to_data[cdn_url] = (
+            "data:" + ct + ";base64,"
+            + base64.b64encode(blob).decode("ascii")
+        )
+
+    modified = False
+    for cdn_url, img_tag in pairs:
+        data_url = url_to_data.get(cdn_url)
+        if not data_url:
+            continue
+        new_img = re.sub(
+            r'\bsrc=(?:"data:,?"|\'data:,?\'|data:,?)',
+            'src="' + data_url + '"',
+            img_tag, count=1,
+        )
+        if new_img == img_tag:
+            continue
+        html = html.replace(img_tag, new_img, 1)
+        modified = True
+        ident = cdn_url.rsplit('/', 1)[-1]
+        print(f"    inlined {ident} ({len(data_url)} chars)", flush=True)
+
+    if modified:
+        with open(saved_path, "w", encoding="utf-8") as f:
+            f.write(html)
+
+
+def _nature_inline_figures(saved_path, port):
+    """Post-capture hook: refetch any Nature figure with empty `data:,` src.
+
+    The pre-capture `_NATURE_FIGURES_FIX_JS` swaps each
+    `<picture><img>` src to the matching JSON-LD lw1200 URL before
+    SingleFile inlines. When an individual fetch fails (transient
+    network / CDN throttling / SingleFile timeout) the resulting saved
+    src is `data:,` (empty). This hook deterministically re-fetches via
+    Python urllib and inlines the bytes as a base64 data URL, matching
+    the figure to its URL by DOM order against the JSON-LD `image`
+    array.
+
+    `port` is unused; kept for post_capture signature symmetry.
+    """
+    del port
+    try:
+        html = open(saved_path, encoding="utf-8").read()
+    except Exception:
+        return
+
+    # Extract JSON-LD URL list. The image array lives on the
+    # ScholarlyArticle node which is usually nested inside `mainEntity`
+    # of the page-level @type=WebPage block, but can also sit at the
+    # top level — handle both shapes.
+    def _find_image_list(node):
+        if isinstance(node, dict):
+            v = node.get("image")
+            if isinstance(v, list) and v and all(
+                isinstance(x, str) for x in v
+            ):
+                return v
+            for k in ("mainEntity", "@graph"):
+                sub = node.get(k)
+                found = _find_image_list(sub)
+                if found:
+                    return found
+        elif isinstance(node, list):
+            for item in node:
+                found = _find_image_list(item)
+                if found:
+                    return found
+        return None
+
+    urls = []
+    for sm in re.finditer(
+        r'<script[^>]*type=["\']?application/ld\+json["\']?[^>]*>'
+        r'(.*?)</script>',
+        html, re.DOTALL | re.IGNORECASE,
+    ):
+        try:
+            data = json.loads(sm.group(1))
+        except Exception:
+            continue
+        urls = _find_image_list(data) or []
+        if urls:
+            break
+    if not urls:
+        return
+
+    # GROUP 1: Article-body figures.
+    # Each <picture class=c-article-section__figure-picture> wraps one
+    # inline figure's <img> in DOM order matching the JSON-LD list.
+    pic_iter = list(re.finditer(
+        r'<picture[^>]*\bc-article-section__figure-picture\b[^>]*>\s*'
+        r'(<img\b[^>]*>)',
+        html,
+    ))
+
+    def _img_src(img_tag):
+        # Use (?:^|\s) lookbehind-ish prefix instead of \b because \b
+        # matches inside `data-src=` (the boundary between `-` and `s`).
+        # That false-positive made the Nature hook read data-src URLs
+        # as the bare src and miss every broken figure with both attrs.
+        m = re.search(
+            r'(?:^|\s)src=("([^"]*)"|\'([^\']*)\'|([^\s>]+))',
+            img_tag,
+        )
+        if not m:
+            return None
+        return m.group(2) or m.group(3) or m.group(4)
+
+    def _img_data_src(img_tag):
+        # Use (?:^|\s) prefix so we ONLY match the data-src attribute,
+        # never a substring of any other attr. Returns absolute URL,
+        # promoting protocol-relative `//host/...` to `https://host/...`.
+        m = re.search(
+            r'(?:^|\s)data-src=("([^"]*)"|\'([^\']*)\'|([^\s>]+))',
+            img_tag,
+        )
+        if not m:
+            return None
+        url = unescape(m.group(2) or m.group(3) or m.group(4))
+        if url.startswith("//"):
+            return "https:" + url
+        return url
+
+    broken = []
+    for idx, pm in enumerate(pic_iter):
+        img_tag = pm.group(1)
+        if _img_src(img_tag) != "data:,":
+            continue
+        # Prefer the image's own `data-src` URL when present (handles
+        # extended-data / `esm/` figures that JSON-LD omits and any
+        # figure index past the JSON-LD list length). Fall back to
+        # JSON-LD by index for figures that lack data-src.
+        url = _img_data_src(img_tag) or (
+            urls[idx] if idx < len(urls) else None
+        )
+        if not url:
+            continue
+        broken.append((idx, pm.start(1), pm.end(1), img_tag, url))
+
+    # GROUP 2: Reading-companion sidebar figures.
+    # Nature's post-2020 layout duplicates each article figure as a
+    # thumbnail inside `<div class="c-reading-companion__panel
+    # c-reading-companion__figures">`. SingleFile inlines the article-
+    # body `<picture>`s but the sidebar copies often time out and stay
+    # at `src=data:,`. The sidebar figures map 1:1 to the JSON-LD list
+    # (same article figures, same DOM order) — walk them with a fresh
+    # index from 0. Each sidebar `<img>` also carries its own data-src
+    # which is preferred when present (covers extended-data figures
+    # that ride along in the same panel).
+    rc_match = re.search(
+        r'<div[^>]*\bc-reading-companion__figures\b[^>]*>',
+        html,
+    )
+    if rc_match:
+        rc_start = rc_match.start()
+        rc_section = html[rc_start:rc_start + 200000]
+        for idx, pm in enumerate(re.finditer(
+            r'<picture[^>]*>\s*(<img\b[^>]*>)',
+            rc_section,
+        )):
+            img_tag = pm.group(1)
+            if _img_src(img_tag) != "data:,":
+                continue
+            url = _img_data_src(img_tag) or (
+                urls[idx] if idx < len(urls) else None
+            )
+            if not url:
+                continue
+            full_start = rc_start + pm.start(1)
+            full_end = rc_start + pm.end(1)
+            broken.append((idx, full_start, full_end, img_tag, url))
+
+    # GROUP 3: Catch-all for any remaining `<img>` whose src=data:, is
+    # NOT inside the article-body or sidebar containers — supplementary
+    # figures, extended-data panels, biology callouts, etc. These all
+    # carry their own `data-src` URL on the same tag; ignore the ones
+    # we already collected (by start position).
+    seen_starts = {b[1] for b in broken}
+    for m in re.finditer(
+        r'<img\b[^<>]*?\bdata-src=', html,
+    ):
+        s = m.start()
+        if s in seen_starts:
+            continue
+        # Walk to the real end of the tag (quote-aware).
+        i = s
+        in_sq = in_dq = False
+        while i < len(html):
+            c = html[i]
+            if c == "'" and not in_dq:
+                in_sq = not in_sq
+            elif c == '"' and not in_sq:
+                in_dq = not in_dq
+            elif c == '>' and not in_sq and not in_dq:
+                break
+            i += 1
+        if i >= len(html):
+            continue
+        img_tag = html[s:i + 1]
+        if _img_src(img_tag) != "data:,":
+            continue
+        url = _img_data_src(img_tag)
+        if not url or "media.springernature.com" not in url:
+            continue
+        broken.append((-1, s, i + 1, img_tag, url))
+
+    if not broken:
+        return
+
+    print(f"  nature post-capture: {len(broken)} broken figure(s) "
+          f"to refetch", flush=True)
+
+    import base64
+    # Process from end so byte positions don't shift.
+    for idx, start, end, img_tag, fig_url in sorted(
+        broken, key=lambda b: -b[1]
+    ):
+        try:
+            req = urllib.request.Request(
+                fig_url, headers={
+                    "User-Agent": _BROWSER_UA,
+                    "Referer": "https://www.nature.com/",
+                },
+            )
+            with polite_urlopen(req, timeout=30) as resp:
+                ct = resp.headers.get(
+                    "Content-Type", "image/png"
+                ).split(";")[0].strip()
+                blob = resp.read()
+        except Exception as e:
+            print(f"    fetch-error fig{idx + 1}: {e}", flush=True)
+            continue
+        data_url = ("data:" + ct + ";base64,"
+                    + base64.b64encode(blob).decode("ascii"))
+        new_img = re.sub(
+            r'\bsrc=(?:"data:,"|\'data:,\'|data:,)',
+            'src="' + data_url + '"',
+            img_tag, count=1,
+        )
+        html = html[:start] + new_img + html[end:]
+        print(f"    inlined fig{idx + 1}: "
+              f"{fig_url.rsplit('/', 1)[-1]} ({len(blob)} b)", flush=True)
+
+    with open(saved_path, "w", encoding="utf-8") as f:
+        f.write(html)
+
+
+def _aging_us_inline_figures(saved_path, port):
+    """Post-capture hook: inline aging-us.com figure images via urllib.
+
+    aging-us.com is a Next.js SPA that ships every figure as
+      `<a data-figure-id=f<N> href=https://www.aging-us.com/article/<id>/figure/f<N>/large/>
+        <img class="max-w-full mx-auto border border-slate-200" src=data:,>`
+    Bytes are lazy-loaded in the browser after hydration; SingleFile typically
+    captures before hydration completes (or before the swapped src finishes
+    fetching), leaving the empty `data:,` placeholder.
+
+    The high-resolution PNG lives at a predictable CDN URL derived from the
+    `<a data-figure-id>`'s href:
+      `https://www.aging-us.com/article/<id>/figure/<fid>/large/`
+        -> `https://cdn.aging-us.com/article/<id>/figure/<fid>/large.png`
+
+    Strategy: walk every `<a data-figure-id=...>...<img class=max-w-full ...>`
+    pair, derive the CDN URL, fetch via urllib server-side (cdn.aging-us.com
+    serves the PNG with a permissive CORS/edge cache), and inline as a data
+    URL. Skip images that already carry real bytes (`base64` substring in src).
+
+    `port` is unused; kept for post_capture signature symmetry.
+    """
+    del port  # server-side fetch; no browser tab needed
+    try:
+        html = open(saved_path, encoding="utf-8").read()
+    except Exception:
+        return
+
+    # `<a data-figure-id=fX href=...> ... <img class=...max-w-full...>`. The
+    # img is the immediate first child but allow whitespace/newlines between
+    # the two tags. data-figure-id and href appear in that order in observed
+    # captures, but be defensive about attribute quoting (often unquoted in
+    # SingleFile output).
+    pair_re = re.compile(
+        r'<a\b[^>]*\bdata-figure-id=(?:"([^"]+)"|\'([^\']+)\'|([^\s>]+))'
+        r'[^>]*\bhref=(?:"([^"]+)"|\'([^\']+)\'|([^\s>]+))'
+        r'[^>]*>\s*'
+        r'(<img\b[^>]*\bclass=[^>]*max-w-full[^>]*>)',
+        re.IGNORECASE,
+    )
+    pairs = []  # (fid, href, img_tag)
+    for m in pair_re.finditer(html):
+        fid = m.group(1) or m.group(2) or m.group(3)
+        href = m.group(4) or m.group(5) or m.group(6)
+        img_tag = m.group(7)
+        # Skip images that already have real inline bytes (e.g. an earlier
+        # post-capture run, or the rare case where the SPA hydrated before
+        # SingleFile saved).
+        if "base64" in img_tag:
+            continue
+        # Derive the CDN URL from the article-level href. The href ends
+        # `/article/<id>/figure/<fid>/large/` (with trailing slash).
+        href_clean = unescape(href).rstrip("/")
+        cdn_m = re.search(
+            r'/article/(\d+)/figure/([^/]+)/large$', href_clean,
+        )
+        if not cdn_m:
+            continue
+        article_id = cdn_m.group(1)
+        # The CDN is case-strict: newer articles serve `f<N>` (lowercase)
+        # and older articles (e.g. id 100141) serve `F<N>` (uppercase). The
+        # on-page href already encodes the correct casing per article, so
+        # preserve it verbatim instead of normalising.
+        cdn_fid = cdn_m.group(2)
+        cdn_url = (
+            f"https://cdn.aging-us.com/article/{article_id}"
+            f"/figure/{cdn_fid}/large.png"
+        )
+        pairs.append((fid, cdn_url, img_tag))
+    if not pairs:
+        return
+
+    print(f"  aging-us post-capture: {len(pairs)} figure(s) to enrich",
+          flush=True)
+
+    import base64
+    url_to_data = {}
+    for _, cdn_url, _ in pairs:
+        if cdn_url in url_to_data:
+            continue
+        try:
+            req = urllib.request.Request(
+                cdn_url, headers={
+                    "User-Agent": _BROWSER_UA,
+                    "Referer": "https://www.aging-us.com/",
+                },
+            )
+            with polite_urlopen(req, timeout=30) as resp:
+                ct = resp.headers.get(
+                    "Content-Type", "image/png",
+                ).split(";")[0].strip()
+                blob = resp.read()
+        except Exception as e:
+            print(f"    fetch-error: {cdn_url[-60:]} ({e})", flush=True)
+            continue
+        url_to_data[cdn_url] = (
+            "data:" + ct + ";base64,"
+            + base64.b64encode(blob).decode("ascii")
+        )
+
+    modified = False
+    for fid, cdn_url, img_tag in pairs:
+        data_url = url_to_data.get(cdn_url)
+        if not data_url:
+            print(f"    skip {fid}  (no data)", flush=True)
+            continue
+        # Replace `src=data:,` (unquoted, single- or double-quoted).
+        new_img = re.sub(
+            r'\bsrc=(?:"data:,?"|\'data:,?\'|data:,?)',
+            'src="' + data_url + '"',
+            img_tag, count=1,
+        )
+        if new_img == img_tag:
+            continue
+        html = html.replace(img_tag, new_img, 1)
+        modified = True
+        print(f"    inlined {fid}  ({len(data_url)} chars)", flush=True)
+
+    if modified:
+        with open(saved_path, "w", encoding="utf-8") as f:
+            f.write(html)
+
+
+def _bmj_inline_figures(saved_path, port):
+    """Post-capture hook: refetch bmj inline thumbnails as .large.jpg.
+
+    BMJ journals (heart.bmj.com, emj.bmj.com, rapm.bmj.com, etc.) run on
+    the HighWire platform and ship each figure as
+      `<div id=F<N> class=fig><div class=highwire-figure>
+        <div class=fig-inline-img-wrapper><div class=fig-inline-img>
+          <a href=...F<N>.large.jpg?width=...&height=...&carousel=1
+             class="... colorbox-load ...">
+            <span><img src=data:image/gif;base64,...
+                       data-src=...F<N>.medium.gif width=440 height=196></span>`
+    The medium.gif (~263-440 px native) gets inlined by SingleFile after
+    `_LAZYLOAD_FIX_JS` swaps src ← data-src, but it upscales to the 716-px
+    column width and renders as a low-resolution thumbnail. The
+    full-resolution `F<N>.large.jpg` URL is directly available on the
+    parent `<a class=colorbox-load>` and on the sibling
+    `<a class=highwire-figure-link-newtab>` — no sub-page indirection.
+
+    Strategy (CDP same-origin batch fetch): walk every `<img>` whose
+    `data-src` matches the `.../F<N>.medium.<ext>` HighWire pattern,
+    derive the `.large.jpg` URL by simple substitution, then open one
+    same-origin tab at the landing URL and `fetch()` each high-res image
+    in parallel. urllib won't work because Cloudflare bot protection
+    (`cf-mitigated: challenge`) on bmj.com 403s any request without a
+    valid `__cf_bm` cookie; the live tab carries that cookie.
+    """
+    try:
+        html = open(saved_path, encoding="utf-8").read()
+    except Exception:
+        return
+
+    # Match each `<img>` whose data-src is a HighWire `.medium.<ext>` URL
+    # (gif/jpg/png). data-src may be quoted or unquoted; capture both the
+    # full <img> tag (for replacement) and the medium URL (for substitution).
+    img_re = re.compile(
+        r'<img\b[^>]*\bdata-src=(?:"([^"]+\.medium\.(?:gif|jpg|jpeg|png))"'
+        r"|'([^']+\.medium\.(?:gif|jpg|jpeg|png))'"
+        r'|([^\s>]+\.medium\.(?:gif|jpg|jpeg|png)))[^>]*>',
+        re.IGNORECASE,
+    )
+    pairs = []  # (img_tag, large_url)
+    for m in img_re.finditer(html):
+        img_tag = m.group(0)
+        medium_url = unescape(m.group(1) or m.group(2) or m.group(3))
+        large_url = re.sub(
+            r'\.medium\.(?:gif|jpg|jpeg|png)$', '.large.jpg', medium_url,
+            flags=re.IGNORECASE,
+        )
+        if large_url == medium_url:
+            continue
+        pairs.append((img_tag, large_url))
+    if not pairs:
+        return
+
+    # Landing URL lives in SingleFile's header comment at the top of the file.
+    url_m = re.search(
+        r"Page saved with SingleFile\s+url:\s*(\S+)", html[:2000],
+    )
+    if not url_m:
+        # Fall back to deriving the landing origin from the first .large.jpg
+        # URL — gives same-origin cookies even without the header.
+        from urllib.parse import urlsplit
+        parts = urlsplit(pairs[0][1])
+        landing_url = f"{parts.scheme}://{parts.netloc}/"
+    else:
+        landing_url = url_m.group(1)
+
+    print(f"  bmj post-capture: {len(pairs)} figure(s) to refetch",
+          flush=True)
+
+    # Open one same-origin tab at the landing URL.
+    try:
+        target = _cdp_open_tab(landing_url, port)
+        tab_id = target["id"]
+        ws_url = target["webSocketDebuggerUrl"]
+    except Exception as e:
+        print(f"    error: could not open landing tab ({e})", flush=True)
+        return
+    try:
+        # Let the landing tab settle (Cloudflare challenge + cookies).
+        time.sleep(15)
+        # Deduplicate URLs (same .large.jpg requested only once).
+        unique_urls = sorted({u for _, u in pairs})
+        urls_js = json.dumps(unique_urls)
+        expr = r"""
+        (async function() {
+            const urls = __URLS__;
+            async function one(url) {
+                try {
+                    const blob = await fetch(url, {credentials: 'include'})
+                        .then(r => r.ok ? r.blob() : null);
+                    if (!blob) return {url, error: 'fetch-failed'};
+                    const dataUrl = await new Promise((res, rej) => {
+                        const r = new FileReader();
+                        r.onloadend = () => res(r.result);
+                        r.onerror = rej;
+                        r.readAsDataURL(blob);
+                    });
+                    return {url, dataUrl, size: dataUrl.length};
+                } catch (e) { return {url, error: String(e)}; }
+            }
+            return Promise.all(urls.map(one));
+        })()
+        """.replace("__URLS__", urls_js)
+        results = _cdp_eval_await(ws_url, expr, timeout=120)
+    finally:
+        try:
+            _cdp_close_tab(tab_id, port)
+        except Exception:
+            pass
+
+    if not results:
+        print("    error: batch fetch returned nothing", flush=True)
+        return
+
+    url_to_data = {}
+    for r in results:
+        if isinstance(r, dict) and r.get("dataUrl"):
+            url_to_data[r["url"]] = r["dataUrl"]
+        elif isinstance(r, dict):
+            print(f"    skip: {r.get('url', '?')[-60:]}  "
+                  f"({r.get('error', 'unknown')})", flush=True)
+
+    modified = False
+    for img_tag, large_url in pairs:
+        data_url = url_to_data.get(large_url)
+        if not data_url:
+            continue
+        # Replace <img>'s src attribute (currently the inlined medium gif
+        # bytes or `data:,` placeholder) with the high-res data URL.
+        new_img = re.sub(
+            r'\bsrc=("[^"]*"|\'[^\']*\'|[^\s>]+)',
+            'src="' + data_url + '"',
+            img_tag, count=1,
+        )
+        # Drop hard-coded width/height from the medium thumbnail so the
+        # high-res image renders at the column's natural width.
+        new_img = re.sub(r'\bwidth=(["\']?)\d+\1\s*', '', new_img)
+        new_img = re.sub(r'\bheight=(["\']?)\d+\1\s*', '', new_img)
+        if new_img == img_tag:
+            continue
+        html = html.replace(img_tag, new_img, 1)
+        modified = True
+        print(f"    inlined {large_url.rsplit('/', 1)[-1]} "
+              f"({len(data_url)} b)", flush=True)
+
+    if modified:
+        with open(saved_path, "w", encoding="utf-8") as f:
+            f.write(html)
+
+
+def _silverchair_inline_figures(saved_path, port, *, label, referer):
+    """Generic post-capture hook for Silverchair-platform publishers.
+
+    Every Silverchair journal (ashpublications.org, portlandpress.com, etc.)
+    ships figures as `<img class=content-image src='data:image/svg+xml,
+    <placeholder>' data-src=https://<host>.silverchair-cdn.com/.../m_<id>.jpeg
+    ?Expires=...&Signature=...&Key-Pair-Id=...>`. (`src` is sometimes the
+    even shorter `data:,` placeholder.) The signed JPEG URL on `data-src` is
+    valid ~7-700 days from page-load. In practice neither the universal
+    `_LAZYLOAD_FIX_JS` swap (src ← data-src) nor SingleFile's deferred-image
+    fetch causes the bytes to land in the saved HTML — captures uniformly
+    keep the placeholder.
+
+    Strategy: walk every `<img class=content-image>` whose `data-src` is a
+    `silverchair-cdn.com` URL, fetch the signed image via urllib server-
+    side, and inline as a data URL. The CloudFront signature is self-
+    contained — no cookies required. `port` is unused; kept for post_capture
+    signature symmetry. `label` prefixes log lines (e.g. "ashpublications");
+    `referer` is the page origin sent on each fetch.
+    """
+    del port  # server-side fetch; no browser tab needed
+    try:
+        html = open(saved_path, encoding="utf-8").read()
+    except Exception:
+        return
+
+    # Locate each `<img class=content-image ...>` tag and extract its full
+    # span. Cannot use a naive `<img[^>]*>` regex because the `src` attribute
+    # holds an SVG placeholder whose payload contains literal `>` chars
+    # (`<svg ...><rect ...></svg>`), so `[^>]*` truncates the tag at the
+    # first `>` inside the SVG. Walk the source instead, tracking whether
+    # we are inside a quoted attribute value.
+    pairs = []  # (img_tag, signed_url)
+    for start_m in re.finditer(
+        r'<img\b[^<>]*?\bclass=content-image\b', html,
+    ):
+        s = start_m.start()
+        i = s
+        in_squote = False
+        in_dquote = False
+        while i < len(html):
+            c = html[i]
+            if c == "'" and not in_dquote:
+                in_squote = not in_squote
+            elif c == '"' and not in_squote:
+                in_dquote = not in_dquote
+            elif c == '>' and not in_squote and not in_dquote:
+                break
+            i += 1
+        if i >= len(html):
+            continue
+        img_tag = html[s:i + 1]
+        # Skip images that already carry real bytes (e.g. an earlier
+        # post-capture run).
+        if "data:image/jpeg;base64" in img_tag or "data:image/png;base64" in img_tag:
+            continue
+        # Extract the data-src URL (double-quoted in observed fixtures, but
+        # also accept single-quoted / unquoted).
+        dsrc_m = re.search(
+            r'\bdata-src=(?:"([^"]+(?:silverchair-cdn|cdn\.rupress)\.(?:com|org)[^"]+)"'
+            r"|'([^']+(?:silverchair-cdn|cdn\.rupress)\.(?:com|org)[^']+)'"
+            r'|([^\s>]+(?:silverchair-cdn|cdn\.rupress)\.(?:com|org)[^\s>]+))',
+            img_tag,
+            re.IGNORECASE,
+        )
+        if not dsrc_m:
+            continue
+        signed_url = unescape(
+            dsrc_m.group(1) or dsrc_m.group(2) or dsrc_m.group(3)
+        )
+        pairs.append((img_tag, signed_url))
+    if not pairs:
+        return
+
+    print(f"  {label} post-capture: {len(pairs)} figure(s) to enrich",
+          flush=True)
+
+    import base64
+    url_to_data = {}
+    for _, signed_url in pairs:
+        if signed_url in url_to_data:
+            continue
+        try:
+            req = urllib.request.Request(
+                signed_url, headers={
+                    "User-Agent": _BROWSER_UA,
+                    "Referer": referer,
+                },
+            )
+            with polite_urlopen(req, timeout=30) as resp:
+                ct = resp.headers.get(
+                    "Content-Type", "image/jpeg",
+                ).split(";")[0].strip()
+                blob = resp.read()
+        except Exception as e:
+            print(f"    fetch-error: {signed_url.split('?', 1)[0][-60:]} "
+                  f"({e})", flush=True)
+            continue
+        url_to_data[signed_url] = (
+            "data:" + ct + ";base64,"
+            + base64.b64encode(blob).decode("ascii")
+        )
+
+    modified = False
+    for img_tag, signed_url in pairs:
+        data_url = url_to_data.get(signed_url)
+        if not data_url:
+            continue
+        # Replace the img tag's `src` (currently the SVG placeholder) with
+        # the high-res data URL. The src attribute in the observed markup
+        # is single-quoted because the SVG payload contains double quotes.
+        new_img = re.sub(
+            r'\bsrc=("[^"]*"|\'[^\']*\'|[^\s>]+)',
+            'src="' + data_url + '"',
+            img_tag, count=1,
+        )
+        if new_img == img_tag:
+            continue
+        html = html.replace(img_tag, new_img, 1)
+        modified = True
+        ident = signed_url.split('?', 1)[0].rsplit('/', 1)[-1]
+        print(f"    inlined {ident} ({len(data_url)} chars)", flush=True)
+
+    if modified:
+        with open(saved_path, "w", encoding="utf-8") as f:
+            f.write(html)
+
+
+def _oup_inline_figures(saved_path, port):
+    """Post-capture hook: inline academic.oup.com (NAR etc.) figures by
+    matching each broken `<img>` to a per-figure CDN URL by filename stem.
+
+    OUP (academic.oup.com) is on the Silverchair platform but its figures
+    arrive without a `data-src` attribute — instead the image carries
+    `<img class=content-image src=data:, data-path-from-xml=<stem>.jpg>`.
+    The signed full-resolution `oup.silverchair-cdn.com/.../<stem>.jpeg`
+    URLs (matching that filename stem) DO appear elsewhere in the same
+    HTML — typically in `<a href=…>` "View large figure" links and other
+    metadata blocks. Strategy: collect every silverchair-cdn URL in the
+    document, index by filename stem (without extension), then rewrite
+    each broken `<img>`'s src by stem-match against `data-path-from-xml`.
+
+    `port` is unused; kept for post_capture signature symmetry. Server-
+    side urllib fetch — the CloudFront signature on each URL is self-
+    contained, no Cloudflare cookie needed.
+    """
+    del port
+    try:
+        html = open(saved_path, encoding="utf-8").read()
+    except Exception:
+        return
+
+    # Index every signed silverchair-cdn URL in the page by filename stem
+    # (basename without extension). Same stem → same figure, regardless
+    # of which `<a>`/`<meta>` first surfaced the URL.
+    url_re = re.compile(
+        r'https://oup\.silverchair-cdn\.com/oup/backfile/[^\s"\'<>&]+',
+        re.IGNORECASE,
+    )
+    stem_to_url = {}
+    for m in url_re.finditer(html):
+        url = unescape(m.group(0))
+        fname = url.split('?', 1)[0].rsplit('/', 1)[-1]
+        stem = fname.rsplit('.', 1)[0]
+        # Drop the silverchair "m_" thumbnail prefix when comparing — full
+        # res `gkab965fig1.jpeg` and thumb `m_gkab965fig1.jpeg` share the
+        # same article-relative key. Prefer non-prefixed (full-res) URLs.
+        bare = stem[2:] if stem.startswith("m_") else stem
+        if bare in stem_to_url and stem.startswith("m_"):
+            continue  # keep already-stored full-res URL
+        stem_to_url[bare] = url
+
+    if not stem_to_url:
+        return
+
+    # Locate each `<img class=content-image …>` (quote-aware tag walk
+    # because alt text contains literal `>` chars). Pair with the URL
+    # whose filename stem matches the tag's `data-path-from-xml`.
+    pairs = []
+    for start_m in re.finditer(
+        r'<img\b[^<>]*?\bclass=content-image\b', html,
+    ):
+        s = start_m.start()
+        i = s
+        in_sq = in_dq = False
+        while i < len(html):
+            c = html[i]
+            if c == "'" and not in_dq:
+                in_sq = not in_sq
+            elif c == '"' and not in_sq:
+                in_dq = not in_dq
+            elif c == '>' and not in_sq and not in_dq:
+                break
+            i += 1
+        if i >= len(html):
+            continue
+        img_tag = html[s:i + 1]
+        # Skip already-healed / self-contained inline images.
+        if "data:image/jpeg;base64" in img_tag or "data:image/png;base64" in img_tag:
+            continue
+        path_m = re.search(
+            r'\bdata-path-from-xml=("([^"]+)"|\'([^\']+)\'|([^\s>]+))',
+            img_tag,
+        )
+        if not path_m:
+            continue
+        fname = path_m.group(2) or path_m.group(3) or path_m.group(4)
+        stem = fname.rsplit('.', 1)[0]
+        bare = stem[2:] if stem.startswith("m_") else stem
+        signed_url = stem_to_url.get(bare)
+        if not signed_url:
+            continue
+        pairs.append((img_tag, signed_url))
+
+    if not pairs:
+        return
+
+    print(f"  oup post-capture: {len(pairs)} figure(s) to enrich",
+          flush=True)
+
+    import base64
+    url_to_data = {}
+    for _, signed_url in pairs:
+        if signed_url in url_to_data:
+            continue
+        try:
+            req = urllib.request.Request(
+                signed_url, headers={
+                    "User-Agent": _BROWSER_UA,
+                    "Referer": "https://academic.oup.com/",
+                },
+            )
+            with polite_urlopen(req, timeout=30) as resp:
+                ct = resp.headers.get(
+                    "Content-Type", "image/jpeg",
+                ).split(";")[0].strip()
+                blob = resp.read()
+        except Exception as e:
+            print(f"    fetch-error: {signed_url.split('?', 1)[0][-60:]} "
+                  f"({e})", flush=True)
+            continue
+        url_to_data[signed_url] = (
+            "data:" + ct + ";base64,"
+            + base64.b64encode(blob).decode("ascii")
+        )
+
+    modified = False
+    for img_tag, signed_url in pairs:
+        data_url = url_to_data.get(signed_url)
+        if not data_url:
+            continue
+        new_img = re.sub(
+            r'\bsrc=("[^"]*"|\'[^\']*\'|[^\s>]+)',
+            'src="' + data_url + '"',
+            img_tag, count=1,
+        )
+        if new_img == img_tag:
+            continue
+        html = html.replace(img_tag, new_img, 1)
+        modified = True
+        ident = signed_url.split('?', 1)[0].rsplit('/', 1)[-1]
+        print(f"    inlined {ident} ({len(data_url)} chars)", flush=True)
+
+    if modified:
+        with open(saved_path, "w", encoding="utf-8") as f:
+            f.write(html)
+
+
+def _springer_inline_figures(saved_path, port):
+    """Post-capture hook: refetch Springer (link.springer.com) figures.
+
+    Springer Nature articles (EMBO J, Cell Death Differ, Nat Commun-on-
+    Springer-host, etc.) ship figures in two distinct shapes:
+
+    1. `<img data-src=URL src=data:,>` — lazysizes populated `data-src`
+       with the canonical lw685 CDN URL but SingleFile failed to inline
+       the fetched bytes. Rescue is purely local — read `data-src`,
+       fetch via urllib, substitute into `src`.
+    2. `<img aria-describedby="figure-N-desc" src=data:, …>` with NO
+       `data-src`. The lw1200 URLs live in the JSON-LD `image` array
+       in document order; convert lw1200 → lw685 (685-px column width
+       is ample for the article body) and match by figure index.
+
+    Both patterns can co-occur on a single article (older / newer figure
+    blocks). The hook handles both in a single pass: process `data-src`
+    figures first, then walk the remaining broken `aria-describedby`
+    figures and match against the JSON-LD list by sequential index.
+    `port` is unused; server-side fetch.
+    """
+    del port
+    try:
+        html = open(saved_path, encoding="utf-8").read()
+    except Exception:
+        return
+
+    import base64
+
+    # ---- Phase 1: data-src recovery ---------------------------------
+    pairs_dsrc = []  # (full_img_tag, url)
+    # Quote-aware <img> walker: alt text may contain literal `>` chars.
+    for start_m in re.finditer(
+        r'<img\b[^<>]*?\bdata-src=', html,
+    ):
+        s = start_m.start()
+        i = s
+        in_sq = in_dq = False
+        while i < len(html):
+            c = html[i]
+            if c == "'" and not in_dq:
+                in_sq = not in_sq
+            elif c == '"' and not in_sq:
+                in_dq = not in_dq
+            elif c == '>' and not in_sq and not in_dq:
+                break
+            i += 1
+        if i >= len(html):
+            continue
+        img_tag = html[s:i + 1]
+        # Only act on figures whose visible src is the empty placeholder.
+        if not re.search(r'\bsrc=(?:"data:,?"|\'data:,?\'|data:,?)[\s>]',
+                         img_tag):
+            continue
+        dsrc_m = re.search(
+            r'\bdata-src=(?:"([^"]+)"|\'([^\']+)\'|([^\s>]+))',
+            img_tag,
+        )
+        if not dsrc_m:
+            continue
+        url = unescape(dsrc_m.group(1) or dsrc_m.group(2) or dsrc_m.group(3))
+        if "media.springernature.com" not in url:
+            continue
+        pairs_dsrc.append((img_tag, url))
+
+    # ---- Phase 2: JSON-LD recovery for figures with no data-src -----
+    def _find_image_list(node):
+        if isinstance(node, dict):
+            v = node.get("image")
+            if isinstance(v, list) and v and all(
+                isinstance(x, str) for x in v
+            ):
+                return v
+            if isinstance(v, str):
+                return [v]
+            for k in ("mainEntity", "@graph"):
+                sub = node.get(k)
+                found = _find_image_list(sub)
+                if found:
+                    return found
+        elif isinstance(node, list):
+            for item in node:
+                found = _find_image_list(item)
+                if found:
+                    return found
+        return None
+
+    json_urls = []
+    for sm in re.finditer(
+        r'<script[^>]*type=["\']?application/ld\+json["\']?[^>]*>(.+?)</script>',
+        html, re.DOTALL | re.IGNORECASE,
+    ):
+        try:
+            data = json.loads(sm.group(1))
+        except Exception:
+            continue
+        urls = _find_image_list(data) or []
+        if urls:
+            json_urls = urls
+            break
+
+    pairs_jsonld = []
+    if json_urls:
+        # Walk every broken `<img aria-describedby=figure-N…>` in DOM
+        # order. Each missing `data-src` → use json_urls[idx].
+        idx = 0
+        for m in re.finditer(
+            r'<img\b[^<>]*\baria-describedby=["\'][^"\']*figure-\d+',
+            html,
+        ):
+            s = m.start()
+            i = s
+            in_sq = in_dq = False
+            while i < len(html):
+                c = html[i]
+                if c == "'" and not in_dq:
+                    in_sq = not in_sq
+                elif c == '"' and not in_sq:
+                    in_dq = not in_dq
+                elif c == '>' and not in_sq and not in_dq:
+                    break
+                i += 1
+            if i >= len(html):
+                continue
+            img_tag = html[s:i + 1]
+            if not re.search(
+                r'\bsrc=(?:"data:,?"|\'data:,?\'|data:,?)[\s>]',
+                img_tag,
+            ):
+                idx += 1
+                continue
+            if "data-src=" in img_tag:
+                idx += 1
+                continue
+            if idx < len(json_urls):
+                url = json_urls[idx].replace("lw1200", "lw685")
+                pairs_jsonld.append((img_tag, url))
+            idx += 1
+
+    pairs = pairs_dsrc + pairs_jsonld
+    if not pairs:
+        return
+
+    print(f"  springer post-capture: {len(pairs)} broken figure(s) "
+          f"to refetch", flush=True)
+
+    url_to_data = {}
+    for _, url in pairs:
+        if url in url_to_data:
+            continue
+        try:
+            req = urllib.request.Request(
+                url, headers={
+                    "User-Agent": _BROWSER_UA,
+                    "Referer": "https://link.springer.com/",
+                },
+            )
+            with polite_urlopen(req, timeout=30) as resp:
+                ct = resp.headers.get(
+                    "Content-Type", "image/png",
+                ).split(";")[0].strip()
+                blob = resp.read()
+        except Exception as e:
+            print(f"    fetch-error: {url.rsplit('/', 1)[-1][:60]} "
+                  f"({e})", flush=True)
+            continue
+        url_to_data[url] = (
+            "data:" + ct + ";base64,"
+            + base64.b64encode(blob).decode("ascii")
+        )
+
+    modified = False
+    for img_tag, url in pairs:
+        data_url = url_to_data.get(url)
+        if not data_url:
+            continue
+        new_img = re.sub(
+            r'\bsrc=(?:"data:,?"|\'data:,?\'|data:,?)',
+            'src="' + data_url + '"',
+            img_tag, count=1,
+        )
+        if new_img == img_tag:
+            continue
+        html = html.replace(img_tag, new_img, 1)
+        modified = True
+        print(f"    inlined {url.rsplit('/', 1)[-1].split('?', 1)[0]} "
+              f"({len(data_url)} chars)", flush=True)
+
+    if modified:
+        with open(saved_path, "w", encoding="utf-8") as f:
+            f.write(html)
+
+
+def _acs_inline_figures(saved_path, port):
+    """Post-capture hook: rescue pubs.acs.org `<img class=inline-fig>` placeholders.
+
+    ACS (pubs.acs.org) ships every inline figure as
+      `<figure class=article__inlineFigure>
+         <button class=figure-viewer__trigger>
+           <img class="inline-fig internalNav" src=data:,
+                data-lg-src=/cms/<doi>/asset/images/large/<file>.jpeg>
+         </button>
+         <div class=figure-bottom-links>
+           <div class=download-hi-res-img>
+             <a href=https://pubs.acs.org/cms/<doi>/asset/images/large/<file>.jpeg>
+                High Resolution Image</a>`
+    `_ACS_FIGURES_FIX_JS` swaps `<img.inline-fig src> ← <a.download-hi-res-img href>`
+    so SingleFile fetches the high-res JPEG. On newer fixtures (e.g.
+    Brown_2011, Lee_2020) SingleFile inlines the bytes successfully and the
+    saved `<img>` ends up with `src="data:image/jpeg;base64,..."`. On older
+    fixtures (e.g. Lin_2001) SingleFile's in-page image fetch occasionally
+    fails (Cloudflare race / cross-origin timing) and the swap leaves
+    `src=data:,` (empty data URL sentinel).
+
+    Strategy (CDP same-origin batch fetch, mirrors `_bmj_inline_figures`):
+    walk every `<img class=inline-fig>` whose src is the empty `data:,`
+    placeholder, derive the absolute high-res URL from `data-lg-src=`
+    (relative; resolved against `https://pubs.acs.org`) or fall back to
+    the sibling `.download-hi-res-img a[href]`, then open one same-origin
+    tab on pubs.acs.org and `fetch(url, {credentials: 'include'})` each
+    JPEG in parallel. urllib won't work because Cloudflare bot protection
+    (`cf-mitigated: challenge`) 403s any request without a valid `__cf_bm`
+    cookie; the live tab carries that cookie. Imgs that already hold real
+    base64 bytes are skipped, so this hook is a no-op on captures where
+    SingleFile already inlined every figure.
+    """
+    try:
+        html = open(saved_path, encoding="utf-8").read()
+    except Exception:
+        return
+
+    # Find every `<img>` tagged `inline-fig` whose `src` is the empty
+    # `data:,` placeholder. Capture the full <img> tag so we can rewrite
+    # its src in-place. `data-lg-src=` is unquoted in observed captures
+    # but be defensive about quoting for robustness.
+    img_re = re.compile(
+        r'<img\b[^>]*?\bclass=(?:"[^"]*\binline-fig\b[^"]*"'
+        r"|'[^']*\binline-fig\b[^']*'"
+        r'|[^\s>]*\binline-fig\b[^\s>]*)[^>]*>',
+        re.IGNORECASE,
+    )
+    pairs = []  # (img_tag, abs_url, fig_id)
+    for m in img_re.finditer(html):
+        img_tag = m.group(0)
+        # Skip imgs that already hold real bytes (Brown/Lee path).
+        if "data:image/jpeg;base64" in img_tag or "data:image/png;base64" in img_tag:
+            continue
+        # Only act on the empty `data:,` sentinel — leave anything else
+        # (real http URL, real placeholder SVG, etc.) untouched.
+        if not re.search(
+            r'\bsrc=(?:"data:,?"|\'data:,?\'|data:,?(?=[\s>]))',
+            img_tag,
+        ):
+            continue
+        # Pull the high-res URL from `data-lg-src=` first; it's the
+        # canonical source of the JPEG path. Fall back to the sibling
+        # `.download-hi-res-img a[href]` if absent.
+        dlg_m = re.search(
+            r'\bdata-lg-src=(?:"([^"]+)"|\'([^\']+)\'|([^\s>]+))',
+            img_tag,
+            re.IGNORECASE,
+        )
+        url = None
+        if dlg_m:
+            url = unescape(dlg_m.group(1) or dlg_m.group(2) or dlg_m.group(3))
+        if not url:
+            continue
+        # Resolve relative URLs against pubs.acs.org.
+        if url.startswith("//"):
+            url = "https:" + url
+        elif url.startswith("/"):
+            url = "https://pubs.acs.org" + url
+        # Derive a short identifier for log lines.
+        id_m = re.search(
+            r'\bid=(?:"([^"]+)"|\'([^\']+)\'|([^\s>]+))',
+            img_tag,
+        )
+        fig_id = (
+            (id_m.group(1) or id_m.group(2) or id_m.group(3))
+            if id_m else url.rsplit("/", 1)[-1]
+        )
+        pairs.append((img_tag, url, fig_id))
+    if not pairs:
+        return
+
+    # Landing URL for the same-origin tab. Pull from SingleFile's header
+    # comment when available; otherwise default to the article DOI URL via
+    # pubs.acs.org root.
+    url_m = re.search(
+        r"Page saved with SingleFile\s+url:\s*(\S+)", html[:2000],
+    )
+    landing_url = url_m.group(1) if url_m else "https://pubs.acs.org/"
+
+    print(f"  acs post-capture: {len(pairs)} figure(s) to refetch",
+          flush=True)
+
+    try:
+        target = _cdp_open_tab(landing_url, port)
+        tab_id = target["id"]
+        ws_url = target["webSocketDebuggerUrl"]
+    except Exception as e:
+        print(f"    error: could not open landing tab ({e})", flush=True)
+        return
+    try:
+        # Let the landing tab settle (Cloudflare challenge + cookies).
+        time.sleep(15)
+        unique_urls = sorted({u for _, u, _ in pairs})
+        urls_js = json.dumps(unique_urls)
+        expr = r"""
+        (async function() {
+            const urls = __URLS__;
+            async function one(url) {
+                try {
+                    const blob = await fetch(url, {credentials: 'include'})
+                        .then(r => r.ok ? r.blob() : null);
+                    if (!blob) return {url, error: 'fetch-failed'};
+                    const dataUrl = await new Promise((res, rej) => {
+                        const r = new FileReader();
+                        r.onloadend = () => res(r.result);
+                        r.onerror = rej;
+                        r.readAsDataURL(blob);
+                    });
+                    return {url, dataUrl, size: dataUrl.length};
+                } catch (e) { return {url, error: String(e)}; }
+            }
+            return Promise.all(urls.map(one));
+        })()
+        """.replace("__URLS__", urls_js)
+        results = _cdp_eval_await(ws_url, expr, timeout=120)
+    finally:
+        try:
+            _cdp_close_tab(tab_id, port)
+        except Exception:
+            pass
+
+    if not results:
+        print("    error: batch fetch returned nothing", flush=True)
+        return
+
+    url_to_data = {}
+    for r in results:
+        if isinstance(r, dict) and r.get("dataUrl"):
+            url_to_data[r["url"]] = r["dataUrl"]
+        elif isinstance(r, dict):
+            print(f"    skip: {r.get('url', '?').rsplit('/', 1)[-1]}  "
+                  f"({r.get('error', 'unknown')})", flush=True)
+
+    modified = False
+    for img_tag, url, fig_id in pairs:
+        data_url = url_to_data.get(url)
+        if not data_url:
+            continue
+        # Replace the empty `data:,` placeholder with the high-res data
+        # URL. Match unquoted / single-quoted / double-quoted variants.
+        new_img = re.sub(
+            r'\bsrc=(?:"data:,?"|\'data:,?\'|data:,?(?=[\s>]))',
+            'src="' + data_url + '"',
+            img_tag, count=1,
+        )
+        if new_img == img_tag:
+            continue
+        html = html.replace(img_tag, new_img, 1)
+        modified = True
+        print(f"    inlined {fig_id} ({len(data_url)} chars)", flush=True)
+
+    if modified:
+        with open(saved_path, "w", encoding="utf-8") as f:
+            f.write(html)
+
+
+def _molbiolcell_inline_figures(saved_path, port):
+    """Post-capture hook: replace molbiolcell.org figure thumbnails with high-res JPEGs.
+
+    Mol Biol Cell (www.molbiolcell.org, Atypon platform — same shape as
+    onlinelibrary.wiley.com) ships every figure as
+      `<img class=figure__image
+            src="data:image/jpeg;base64,<~10-30 KB 500-px thumbnail>"
+            data-lg-src=/cms/asset/<uuid>/<asset-id>.{jpg,png}>`
+    The base64 src is the publisher's 500-px thumbnail; rendered at the
+    658-px column width it visibly upscales / blurs. The full-resolution
+    image is exposed on the same `<img>` via `data-lg-src=` (relative path,
+    resolved against `https://www.molbiolcell.org`).
+
+    Strategy (server-side urllib, mirrors `_silverchair_inline_figures` /
+    `_aging_us_inline_figures`): walk every `<img class=figure__image>`
+    that carries a `data-lg-src` attribute, fetch the high-res asset via
+    urllib (Cloudflare-fronted but no `cf-mitigated: challenge` — public
+    requests succeed without cookies), and replace the thumbnail `src`
+    with the full-resolution data URL. Skips imgs whose `data-lg-src`
+    is missing. `port` is unused; kept for post_capture signature symmetry.
+    """
+    del port  # server-side fetch; no browser tab needed
+    try:
+        html = open(saved_path, encoding="utf-8").read()
+    except Exception:
+        return
+
+    # The base64 thumbnail src and the data-lg-src attribute both contain
+    # only URL-safe / base64 chars — no literal `>` — so a plain `[^>]*`
+    # match captures the full <img> tag. The `class=figure__image` attribute
+    # appears unquoted in observed SingleFile output, but tolerate quotes.
+    img_re = re.compile(
+        r'<img\b[^>]*?\bclass=(?:"[^"]*\bfigure__image\b[^"]*"'
+        r"|'[^']*\bfigure__image\b[^']*'"
+        r'|[^\s>]*\bfigure__image\b[^\s>]*)[^>]*>',
+        re.IGNORECASE,
+    )
+    pairs = []  # (img_tag, abs_url, fig_id)
+    for m in img_re.finditer(html):
+        img_tag = m.group(0)
+        # Pull `data-lg-src=` (unquoted in observed captures, but accept
+        # all three quoting styles defensively).
+        dlg_m = re.search(
+            r'\bdata-lg-src=(?:"([^"]+)"|\'([^\']+)\'|([^\s>]+))',
+            img_tag,
+            re.IGNORECASE,
+        )
+        if not dlg_m:
+            continue
+        url = unescape(dlg_m.group(1) or dlg_m.group(2) or dlg_m.group(3))
+        # Resolve relative URLs against www.molbiolcell.org.
+        if url.startswith("//"):
+            url = "https:" + url
+        elif url.startswith("/"):
+            url = "https://www.molbiolcell.org" + url
+        fig_id = url.rsplit("/", 1)[-1]
+        pairs.append((img_tag, url, fig_id))
+    if not pairs:
+        return
+
+    print(f"  molbiolcell post-capture: {len(pairs)} figure(s) to enrich",
+          flush=True)
+
+    import base64
+    url_to_data = {}
+    # Cloudflare in front of www.molbiolcell.org occasionally 403s
+    # individual asset fetches that would otherwise succeed (no global
+    # `cf-mitigated: challenge` — looks like burst rate-limiting). Retry
+    # with progressive backoff before giving up.
+    retries = (0, 4.0, 12.0)  # immediate, then 4 s, then 12 s
+    for _, url, fig_id in pairs:
+        if url in url_to_data:
+            continue
+        blob = None
+        ct = "image/jpeg"
+        last_err = None
+        for delay in retries:
+            if delay:
+                time.sleep(delay)
+            try:
+                req = urllib.request.Request(
+                    url, headers={
+                        "User-Agent": _BROWSER_UA,
+                        "Referer": "https://www.molbiolcell.org/",
+                        "Accept": "image/avif,image/webp,image/apng,"
+                                  "image/*,*/*;q=0.8",
+                    },
+                )
+                with polite_urlopen(req, timeout=30) as resp:
+                    ct = resp.headers.get(
+                        "Content-Type", "image/jpeg",
+                    ).split(";")[0].strip()
+                    blob = resp.read()
+                break
+            except Exception as e:
+                last_err = e
+                continue
+        if blob is None:
+            print(f"    fetch-error: {fig_id} ({last_err})", flush=True)
+            continue
+        url_to_data[url] = (
+            "data:" + ct + ";base64,"
+            + base64.b64encode(blob).decode("ascii")
+        )
+
+    modified = False
+    for img_tag, url, fig_id in pairs:
+        data_url = url_to_data.get(url)
+        if not data_url:
+            continue
+        # Replace whatever the current `src=` is (the 500-px base64
+        # thumbnail) with the high-res data URL. The src attribute may be
+        # double-quoted (newer captures) or unquoted (older captures with
+        # the base64 payload running to the next attribute boundary).
+        new_img = re.sub(
+            r'\bsrc=("[^"]*"|\'[^\']*\'|[^\s>]+)',
+            'src="' + data_url + '"',
+            img_tag, count=1,
+        )
+        if new_img == img_tag:
+            continue
+        html = html.replace(img_tag, new_img, 1)
+        modified = True
+        print(f"    inlined {fig_id} ({len(data_url)} chars)", flush=True)
+
+    if modified:
+        with open(saved_path, "w", encoding="utf-8") as f:
+            f.write(html)
+
+
+def _singlefile_inline_css_var_figures(
+    saved_path, port, label, fig_container_re=None,
+):
+    """Post-capture hook: promote SingleFile CSS-var background bytes to <img src>.
+
+    Several publishers (pnas.org via Atypon, cshlp.org via HighWire) emit
+    figures that SingleFile captures as
+      `<img src='data:image/svg+xml,<svg ...><rect fill-opacity=0/></svg>'
+            style="...background-image:var(--sf-img-<K>)..."></img>`
+    The `<img src>` is a transparent SVG placeholder; the real high-resolution
+    image bytes live in a `:root{--sf-img-<K>: url("data:image/...;base64,...")}`
+    CSS variable in the page's inline `<style>`. Browsers render correctly via
+    the CSS-var background-image, but downstream tooling reading `<img src>`
+    only sees the SVG placeholder.
+
+    Strategy (purely local — no network, no browser tab needed):
+      1. Build a {var_id: data_url} map from all `--sf-img-<K>: url("data:...")`
+         definitions in the saved HTML.
+      2. Walk every `<img>` whose `style` contains
+         `background-image:var(--sf-img-<K>)` AND whose `src` is an SVG
+         `data:image/svg+xml,...` placeholder. Use the same quote-tracking
+         tag-walk as `_silverchair_inline_figures` because the SVG payload
+         contains literal `>` chars that break naive `<img[^>]*>` regexes.
+      3. Rewrite each such `<img src>` to the data URL pulled from the matching
+         CSS variable, and neutralise the now-redundant background-image so
+         the placeholder doesn't double-render.
+
+    `label` prefixes log lines (e.g. "pnas", "cshlp"). `fig_container_re` is
+    an optional compiled regex matching the publisher's article-figure
+    container (e.g. `<figure id=fig<N> class=graphic>`); when provided, the
+    log distinguishes article-level figures from incidental UI icons that
+    also use the CSS-var trick. `port` is unused; kept for post_capture
+    signature symmetry.
+    """
+    del port  # local rewrite; no browser tab needed
+    try:
+        html = open(saved_path, encoding="utf-8").read()
+    except Exception:
+        return
+
+    # Build var_id -> data: URL map from all SingleFile CSS-var definitions.
+    var_map = {}
+    for vm in re.finditer(
+        r'--sf-img-(\d+)\s*:\s*url\("(data:[^"]+)"\)', html,
+    ):
+        var_map[vm.group(1)] = vm.group(2)
+    if not var_map:
+        return
+
+    # Walk each `<img>` start; can't use a naive `<img[^>]*>` because the SVG
+    # placeholder src payload contains literal `>` chars (`<svg ...><rect/>
+    # </svg>`). Track quote state to find the real tag terminator.
+    pairs = []  # (img_tag, var_id)
+    for start_m in re.finditer(r'<img\b', html):
+        s = start_m.start()
+        i = s
+        in_squote = False
+        in_dquote = False
+        while i < len(html):
+            c = html[i]
+            if c == "'" and not in_dquote:
+                in_squote = not in_squote
+            elif c == '"' and not in_squote:
+                in_dquote = not in_dquote
+            elif c == '>' and not in_squote and not in_dquote:
+                break
+            i += 1
+        if i >= len(html):
+            continue
+        img_tag = html[s:i + 1]
+        bg = re.search(
+            r'background-image:\s*var\(--sf-img-(\d+)\)', img_tag,
+        )
+        if not bg:
+            continue
+        # Only rewrite when the current src is an SVG placeholder (or
+        # the rare `data:,` empty placeholder); leave already-real images
+        # alone (idempotent across reruns).
+        if "svg+xml" not in img_tag and "data:," not in img_tag:
+            continue
+        pairs.append((img_tag, bg.group(1)))
+    if not pairs:
+        return
+
+    # Count figure-level inlining for clearer logging; the bulk count
+    # includes small UI icons that also use the CSS-var trick.
+    fig_var_ids = set()
+    if fig_container_re is not None:
+        for fm in fig_container_re.finditer(html):
+            chunk = html[fm.end():fm.end() + 5000]
+            bg_m = re.search(
+                r'background-image:\s*var\(--sf-img-(\d+)\)', chunk,
+            )
+            if bg_m:
+                fig_var_ids.add(bg_m.group(1))
+
+    if fig_container_re is not None:
+        print(
+            f"  {label} post-capture: {len(pairs)} <img>(s) "
+            f"({len(fig_var_ids)} figure-level) to inline",
+            flush=True,
+        )
+    else:
+        print(
+            f"  {label} post-capture: {len(pairs)} <img>(s) to inline",
+            flush=True,
+        )
+
+    modified = False
+    inlined_vars = set()
+    for img_tag, var_id in pairs:
+        data_url = var_map.get(var_id)
+        if not data_url:
+            continue
+        # Replace src=... (the SVG placeholder is single-quoted because its
+        # payload contains double quotes; allow other quotings defensively).
+        new_img = re.sub(
+            r'\bsrc=("[^"]*"|\'[^\']*\'|[^\s>]+)',
+            'src="' + data_url + '"',
+            img_tag, count=1,
+        )
+        # Strip the now-redundant background-image var so the placeholder
+        # SVG doesn't double-render and so re-runs are no-ops.
+        new_img = re.sub(
+            r'background-image:\s*var\(--sf-img-\d+\)\s*!important;?',
+            'background-image:none!important;',
+            new_img,
+        )
+        if new_img == img_tag:
+            continue
+        html = html.replace(img_tag, new_img, 1)
+        modified = True
+        if fig_container_re is None or var_id in fig_var_ids:
+            if var_id not in inlined_vars:
+                print(
+                    f"    inlined --sf-img-{var_id} ({len(data_url)} chars)",
+                    flush=True,
+                )
+                inlined_vars.add(var_id)
+
+    if modified:
+        with open(saved_path, "w", encoding="utf-8") as f:
+            f.write(html)
+
+
+# Compiled figure-container regexes for the SingleFile CSS-var inliner.
+# Keep these module-level so the post_capture lambdas don't recompile per
+# call.
+_PNAS_FIG_RE = re.compile(
+    r'<figure\s+id=[Ff](?:ig)?\d+\s+class=graphic[^>]*>',
+)
+_CSHLP_FIG_RE = re.compile(
+    r'<div[^>]*\bid=F\d+[^>]*\bclass="?fig\b[^>]*>',
+)
+
+
 def _get_post_capture(url):
     """Return the post_capture callable for a URL, or None if no rule matches."""
     if not url:
@@ -546,6 +2323,170 @@ def _get_post_capture(url):
         if key in url:
             return rule.get("post_capture")
     return None
+
+
+def _post_capture_needs_browser(url):
+    """Return True if the matching publisher's post_capture hook needs CDP.
+
+    Hooks that open same-origin CDP tabs (e.g. _acs_inline_figures,
+    _bmj_inline_figures, _iucr_inline_figures) need a live browser at
+    `port`; hooks that only call urllib do not. Heal callers consult this
+    to decide whether to start a browser before invoking the hook.
+    """
+    if not url:
+        return False
+    for key, rule in _PUBLISHER_RULES.items():
+        if key in url:
+            return bool(rule.get("post_capture_needs_browser"))
+    return False
+
+
+_BROKEN_IMG_RE = re.compile(
+    r'<img\b[^>]*?\bsrc=(?:"data:,?"|\'data:,?\'|data:,?)[\s>]',
+    re.IGNORECASE,
+)
+
+# Tags whose `data:,` `src` is structural UI chrome (badges, tracking
+# pixels, branding logos, JS-injected widgets), NOT a failed-to-fetch
+# article figure. Heal hooks can never recover these — they are
+# intentionally absent (the real asset is JS-injected post-capture, or
+# is a static UI affordance that has no source URL). Recognized across
+# the corpus:
+#   - Altmetric badge     `alt="Article has an altmetric score of …"`
+#   - 1x1/0x0 tracking pixel `height=1 width=1` (acs/ashpublications/bmj)
+#                           `width=0 height=0` (aacrjournals)
+#   - Journal/branding logo `class=… __journal__logo …` (frontiersin),
+#                           `class=fb-featured-image` (oup banner),
+#                           `class=brand-logo`, `class=…__logo…`
+#   - ACS figure-viewer placeholder slot `class=fv-img` — the real fig
+#     bytes live in the *sibling* `<img>` next to it
+#   - Wiley QR-code placeholder `class=qrcode__image` — only generated
+#     after user clicks "Get QR"
+#   - NIH/PMC header dropdown chevrons `class=usa-icon` /
+#     `class=ncbi-header__login-dropdown-icon`
+#   - HighWire (cshlp/etc.) "Current Issue" cover thumbnail
+#     `alt="Current Issue"` — sidebar widget, not article body
+#   - HighWire (cshlp/etc.) house-ad `class=adborder0` and ad images
+#     inside `<a href=…/cgi/adclick/…>` (Advansta SDS-PAGE Visioband etc.)
+# Keep this list narrow on purpose: anything that looks like a real
+# figure (`content-image`, `figure-N-desc`, `inline-fig`, `media-link`,
+# `figure__image`, `figure_thumbnail`, `xfigimg`, etc.) MUST keep
+# counting so the heal hook still fires for the publishers that need it.
+_UI_PLACEHOLDER_RES = (
+    re.compile(r'\baltmetric\b', re.IGNORECASE),
+    re.compile(
+        r'\b(?:height=["\']?1["\']?\s+width=["\']?1["\']?'
+        r'|width=["\']?1["\']?\s+height=["\']?1["\']?'
+        r'|height=["\']?0["\']?\s+width=["\']?0["\']?'
+        r'|width=["\']?0["\']?\s+height=["\']?0["\']?)',
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r'\bclass=(?:"[^"]*|\'[^\']*|)'
+        r'(?:[A-Za-z_-]+__journal__logo'
+        r'|fb-featured-image'
+        r'|brand[-_]?logo'
+        r'|[A-Za-z_-]+__logo'
+        r'|fv-img'
+        r'|qrcode__'
+        r'|usa-icon'
+        r'|usa-search__submit-icon'  # PMC search button icon (BEM variant)
+        r'|ncbi-header__login'
+        r'|adborder\d*)',
+        re.IGNORECASE,
+    ),
+    re.compile(r'\balt="?Current\s+Issue"?', re.IGNORECASE),
+    # Hidden UI placeholders (display:none) — never visible, never an
+    # article figure. Common on PMC pages and on capsule UI components
+    # that ship a placeholder for a JS-injected image.
+    re.compile(r'\bstyle=["\']?display\s*:\s*none', re.IGNORECASE),
+)
+
+
+_AD_CONTEXT_RE = re.compile(
+    r'/cgi/adclick/|/cgi/ads/|/ad-server/|googletag\.|googleads\.',
+    re.IGNORECASE,
+)
+
+
+def _is_ad_context_placeholder(html, tag_start):
+    """Return True if the broken `<img>` at tag_start sits inside an ad link.
+
+    HighWire publishers (cshlp, bmj) wrap house-ad images in
+    `<a href=".../cgi/adclick/...">`; the inner `<img>` is dynamically
+    populated and ships as `<img src=data:,>` in static captures. The
+    image content is intentionally absent and not recoverable by any
+    heal hook.
+    """
+    before = html[max(0, tag_start - 600):tag_start]
+    last_open_a = before.rfind("<a ")
+    if last_open_a == -1:
+        return False
+    last_close_a = before.rfind("</a>")
+    if last_close_a > last_open_a:
+        return False
+    a_tag = before[last_open_a:]
+    return bool(_AD_CONTEXT_RE.search(a_tag))
+
+
+def _is_ui_placeholder(tag):
+    """Return True if a `<img src=data:,>` tag is structural UI chrome."""
+    return any(p.search(tag) for p in _UI_PLACEHOLDER_RES)
+
+
+def _full_img_tag(html, start):
+    """Walk from `<` at `start` to the matching `>` honoring quoted attrs.
+
+    The src attribute on broken-figure tags often holds a quoted SVG
+    placeholder whose payload contains literal `>` chars; a naive
+    `<img[^>]*>` regex truncates the tag at the first `>` inside the
+    SVG. Walk the source instead, tracking single/double quote state.
+    Returns the full `<img …>` substring, or "" if no closing `>` found.
+    """
+    i = start
+    in_sq = False
+    in_dq = False
+    n = len(html)
+    while i < n:
+        c = html[i]
+        if c == "'" and not in_dq:
+            in_sq = not in_sq
+        elif c == '"' and not in_sq:
+            in_dq = not in_dq
+        elif c == '>' and not in_sq and not in_dq:
+            return html[start:i + 1]
+        i += 1
+    return ""
+
+
+def _has_broken_figures(html):
+    """Generic publisher-agnostic check for `<img src=data:,>` placeholders
+    that represent failed figure fetches (excluding UI chrome).
+
+    SingleFile leaves an empty `data:,` URL in the `src` attribute of
+    figure images whose inline-fetch failed during capture. convert_html.py
+    uses this count to decide whether to invoke the publisher's
+    `post_capture` hook to heal them. Structural UI placeholders
+    (Altmetric badges, 1x1 tracking pixels, branding logos, ACS carousel
+    placeholders, Wiley QR codes, ad images, etc.) are excluded because
+    no heal hook can recover them — they are stable artifacts of
+    publisher chrome, not failed asset fetches.
+
+    Returns the count of *healable* broken `<img>` tags found.
+    """
+    n = 0
+    for m in _BROKEN_IMG_RE.finditer(html):
+        # The broken-img regex matches only up to the byte after the
+        # `data:,` placeholder, not to the closing `>`; UI-class checks
+        # need the full tag (e.g. `class=fv-img` may appear after
+        # `src=data:,`). Walk to the real tag end before classifying.
+        full = _full_img_tag(html, m.start()) or m.group(0)
+        if _is_ui_placeholder(full):
+            continue
+        if _is_ad_context_placeholder(html, m.start()):
+            continue
+        n += 1
+    return n
 
 
 def _elsevier_pii_to_sciencedirect(url):
@@ -572,7 +2513,31 @@ _PUBLISHER_RULES = {
         # Same image-fetch needs as biorxiv: the figure-fix browser-script
         # rewrites <img src> to F<N>.large.jpg (~200 KB), and SingleFile
         # needs time to fetch + embed the larger images.
-        "wait_delay": 15000,
+        # CSHLP (HighWire) figures arrive from SingleFile as
+        # `<img src='data:image/svg+xml,<placeholder>'
+        #   style="...background-image:var(--sf-img-<N>)...">`, with the real
+        # GIF bytes (~28 KB each, ~150-200 px wide thumbnails) embedded in
+        # `--sf-img-<N>` CSS variables. Same SingleFile CSS-var trick as
+        # pnas; share the generic `_singlefile_inline_css_var_figures`
+        # helper to promote each CSS-var data URL to its `<img src>`.
+        # Pure local rewrite — no network calls. (El_Hage_2010-style
+        # captures that ship native JPEGs are unaffected: the helper
+        # only rewrites <img>s whose current src is the SVG placeholder.)
+        # Two distinct figure shapes coexist on cshlp HTML:
+        #   1. SingleFile CSS-var <img src='data:image/svg+xml,...'> with
+        #      the real GIF in `--sf-img-<N>` — handled by the CSS-var
+        #      inliner above.
+        #   2. Figure-level `<a class=fig-inline-link href=...expansion.html>
+        #      <img src=data:,>` — the inliner above doesn't touch these
+        #      because there's no CSS var; `_cshlp_inline_figures` refetches
+        #      the `.large.jpg` server-side. Wire both in series so a
+        #      single capture heals every figure regardless of shape.
+        "post_capture": lambda path, port: (
+            _singlefile_inline_css_var_figures(
+                path, port, label="cshlp", fig_container_re=_CSHLP_FIG_RE,
+            ),
+            _cshlp_inline_figures(path, port),
+        ),
     },
     "biorxiv.org": {
         "url": lambda u: u if u.endswith(".full") else u.rstrip("/") + ".full",
@@ -580,6 +2545,11 @@ _PUBLISHER_RULES = {
         # force-lazyload JS runs at 'load' and swaps them in; SingleFile
         # then needs time to fetch + embed the real images.
         "wait_delay": 15000,
+        # Equation/formula embeds (`<img class=highwire-embed lazyloaded
+        # src=data:, data-src=…/embed/graphic-N.gif>`) fail SingleFile's
+        # inline pass — the CDN refuses requests without a Referer.
+        # Post-capture refetches them server-side with a biorxiv referer.
+        "post_capture": lambda path, port: _biorxiv_inline_figures(path, port),
     },
     "plos.org": {
         # Figure images are JS-populated with `size=inline` (320 px) by
@@ -605,6 +2575,12 @@ _PUBLISHER_RULES = {
     # pay the 5 s default.
     "academic.oup.com": {
         "wait_delay": 30000,
+        # OUP figures arrive with `<img class=content-image src=data:,
+        # data-path-from-xml=…>` and no `data-src`. The matching signed
+        # `oup.silverchair-cdn.com/.../<stem>.jpeg` URL appears in
+        # `<meta property=og:image>` and other metadata blocks; the hook
+        # joins them by filename stem.
+        "post_capture": lambda path, port: _oup_inline_figures(path, port),
     },
     # iucr landing pages link to per-figure sub-pages instead of
     # inlining full-resolution figures. SingleFile only saves the
@@ -613,6 +2589,19 @@ _PUBLISHER_RULES = {
     # image as a data URL in the thumbnail's <img src>.
     "journals.iucr.org": {
         "post_capture": lambda path, port: _iucr_inline_figures(path, port),
+        # _iucr_inline_figures opens a same-origin CDP tab to fetch each
+        # figure sub-page; needs a live browser at `port`.
+        "post_capture_needs_browser": True,
+    },
+    # aging-us.com is a Next.js SPA that ships every figure as
+    # `<a data-figure-id=fN href=.../figure/fN/large/><img src=data:,>`.
+    # Bytes are lazy-loaded after hydration; SingleFile typically captures
+    # before hydration completes. The full-resolution PNG lives at a
+    # predictable CDN URL (`cdn.aging-us.com/article/<id>/figure/fN/large.png`)
+    # derived from the parent `<a>`'s href. `_aging_us_inline_figures`
+    # post-capture re-fetches each one server-side via urllib.
+    "aging-us.com": {
+        "post_capture": lambda path, port: _aging_us_inline_figures(path, port),
     },
     # imrpress (FBL / FBE / FBS) figure <img> tags ship with
     # src=data:, placeholders; Vue/JS populates them on render and
@@ -632,6 +2621,13 @@ _PUBLISHER_RULES = {
     # 5–10 figures before capture starts.
     "jci.org": {
         "wait_delay": 12000,
+        # Some captures still leave `<img class=figure_thumbnail src=data:,>`
+        # placeholders even with the browser-script JS swap. Post-capture
+        # derives the medium-resolution CloudFront URL from the parent
+        # `<a href=…/articles/view/<ID>/figure/<N>>` and refetches via
+        # urllib. Substring `jci.org` matches both `www.jci.org` and
+        # `insight.jci.org`.
+        "post_capture": lambda path, port: _jci_inline_figures(path, port),
     },
     # annualreviews ships base64 thumbnails (~500 px) inline; full-res
     # ~1500-2300 px GIF lives at the parent `<a class=media-link href=
@@ -651,6 +2647,100 @@ _PUBLISHER_RULES = {
     # figures per article).
     "aacrjournals.org": {
         "wait_delay": 20000,
+        # aacrjournals.org figures arrive with `<img class=content-image
+        # src=data:, data-src=https://aacr.silverchair-cdn.com/.../m_<id>
+        # .png?Expires=…&Signature=…>`. Universal lazyload swap is
+        # unreliable here; reuse the generic Silverchair urllib hook to
+        # refetch the signed CloudFront URL.
+        "post_capture": lambda path, port: _silverchair_inline_figures(
+            path, port,
+            label="aacrjournals",
+            referer="https://aacrjournals.org/",
+        ),
+    },
+    # journals.biologists.com (Silverchair, hosts JCS / Development /
+    # Disease Models & Mechanisms): figure <img class=content-image>
+    # ships with `src=data:,` placeholder + `data-src=https://cob.
+    # silverchair-cdn.com/cob/.../m_<id>.png?Expires=…&Signature=…`.
+    # Generic Silverchair hook handles this verbatim — same CloudFront
+    # signature pattern, same data-src field.
+    "journals.biologists.com": {
+        "wait_delay": 20000,
+        "post_capture": lambda path, port: _silverchair_inline_figures(
+            path, port,
+            label="biologists",
+            referer="https://journals.biologists.com/",
+        ),
+    },
+    # rupress.org (JEM / JGP, runs on the Silverchair platform but uses
+    # its own CloudFront-signed CDN at `cdn.rupress.org` rather than
+    # silverchair-cdn.com). Figure <img class="content-image lazyLoadInit">
+    # ships with `src=data:,` + `data-src=https://cdn.rupress.org/rup/
+    # .../m_<id>.png?Expires=…&Signature=…`. The generic Silverchair
+    # hook accepts both hosts (regex extended above).
+    "rupress.org": {
+        "post_capture": lambda path, port: _silverchair_inline_figures(
+            path, port,
+            label="rupress",
+            referer="https://rupress.org/",
+        ),
+    },
+    # link.springer.com (Springer Nature): figures arrive in two shapes
+    # depending on layout era — `<img data-src=URL src=data:,>` (where
+    # the lazysizes-populated CDN URL is on data-src) and
+    # `<img aria-describedby="figure-N-desc" src=data:,>` (where the
+    # canonical URL lives in the JSON-LD `image` array). The hook
+    # handles both: data-src first, then JSON-LD by figure index.
+    # Pure server-side urllib — `media.springernature.com` is a public
+    # CDN, no auth needed.
+    "link.springer.com": {
+        "post_capture": lambda path, port: _springer_inline_figures(path, port),
+    },
+    # ashpublications.org (Silverchair, same platform as aacrjournals):
+    # figure <img class=content-image> ships with src=data:image/svg+xml,
+    # <placeholder> and the medium JPEG URL on data-src (signed URL,
+    # `ash.silverchair-cdn.com/.../m_<id>.jpeg?Expires=...&Signature=...`).
+    # The universal `_LAZYLOAD_FIX_JS` swaps src ← data-src in the live DOM,
+    # but neither the swap nor SingleFile's deferred-image fetch causes the
+    # bytes to land in the saved HTML — captures uniformly keep the SVG
+    # placeholder. `_silverchair_inline_figures` post-capture re-fetches
+    # each signed URL via urllib server-side (CloudFront signature is self-
+    # contained, no cookies required) and inlines as a data URL.
+    "ashpublications.org": {
+        "post_capture": lambda path, port: _silverchair_inline_figures(
+            path, port,
+            label="ashpublications",
+            referer="https://ashpublications.org/",
+        ),
+    },
+    # portlandpress.com (Silverchair, same platform as ashpublications):
+    # figure <img class=content-image> ships with src=data:, or src='data:
+    # image/svg+xml,...' placeholder and the medium image URL on data-src
+    # (signed URL, `port.silverchair-cdn.com/.../m_<id>.png?Expires=...
+    # &Signature=...`). Same fix as ashpublications: re-fetch each signed
+    # URL via urllib server-side and inline as a data URL.
+    "portlandpress.com": {
+        "post_capture": lambda path, port: _silverchair_inline_figures(
+            path, port,
+            label="portlandpress",
+            referer="https://portlandpress.com/",
+        ),
+    },
+    # royalsocietypublishing.org (Silverchair, same platform as
+    # ashpublications / portlandpress): figure <img class=content-image>
+    # ships with src=data:, placeholder and the medium image URL on data-src
+    # (signed URL, `trs.silverchair-cdn.com/.../m_<id>.png?Expires=...
+    # &Signature=...&Key-Pair-Id=...`). Same fix as ashpublications: re-
+    # fetch each signed URL via urllib server-side and inline as a data
+    # URL. Covers all Royal Society journal subdomains (rsfs, rsta, rstb,
+    # rspa, rspb, rsif, rsbl, rsos, rsnr, ...) since they all live under
+    # the single royalsocietypublishing.org host.
+    "royalsocietypublishing.org": {
+        "post_capture": lambda path, port: _silverchair_inline_figures(
+            path, port,
+            label="royalsocietypublishing",
+            referer="https://royalsocietypublishing.org/",
+        ),
     },
     # Dovepress (dovepress.com) ships a thumbnail (~5-8 KB) inside
     # `<table class=thumbnail-table>` with the high-res JPEG URL on the
@@ -713,9 +2803,17 @@ _PUBLISHER_RULES = {
     # `_ACS_FIGURES_FIX_JS` swaps <img.inline-fig src> ← that <a href>
     # at load so SingleFile fetches and inlines the full-resolution
     # image as the foreground (`background-image:none` ensures the
-    # inlined src becomes the visible foreground).
+    # inlined src becomes the visible foreground). On older fixtures
+    # (e.g. Lin_2001) SingleFile's in-page fetch occasionally fails and
+    # leaves `src=data:,`. `_acs_inline_figures` post-capture refetches
+    # any leftover `<img class=inline-fig src=data:,>` via a same-origin
+    # CDP tab (Cloudflare bot protection 403s urllib).
     "pubs.acs.org": {
         "wait_delay": 15000,
+        "post_capture": lambda path, port: _acs_inline_figures(path, port),
+        # _acs_inline_figures opens a same-origin CDP tab (Cloudflare 403s
+        # urllib); needs a live browser at `port`.
+        "post_capture_needs_browser": True,
     },
     # Wiley (onlinelibrary.wiley.com): figures lazy-load via
     # `data-lg-src`; full URL on parent `<a>`. The browser-script
@@ -726,12 +2824,42 @@ _PUBLISHER_RULES = {
     "onlinelibrary.wiley.com": {
         "wait_delay": 20000,
     },
+    # Mol Biol Cell (molbiolcell.org, Atypon — same platform as Wiley):
+    # figures arrive with the publisher's 500-px base64 thumbnail in
+    # `<img class=figure__image src="data:image/jpeg;base64,...">` and the
+    # full-resolution JPEG/PNG URL on the same tag's
+    # `data-lg-src=/cms/asset/<uuid>/<asset-id>.<ext>` (relative). Rendered
+    # at the 658-px column width the thumbnail visibly upscales / blurs.
+    # `_molbiolcell_inline_figures` post-capture refetches each high-res
+    # asset via urllib server-side (Cloudflare-fronted but no challenge —
+    # public, no cookies needed) and replaces the thumbnail src with the
+    # full-res data URL.
+    "molbiolcell.org": {
+        "post_capture": lambda path, port: _molbiolcell_inline_figures(path, port),
+    },
     # Nature (nature.com): figure images lazy-load via empty srcset; the
     # JSON-LD `image` array holds the lw1200 URLs in order. The browser-
     # script `_NATURE_FIGURES_FIX_JS` swaps each <img> to the matching
     # JSON-LD URL so SingleFile inlines the full-resolution image.
     "nature.com": {
         "wait_delay": 20000,
+        "post_capture": lambda path, port: _nature_inline_figures(path, port),
+    },
+    # BMJ (heart.bmj.com, emj.bmj.com, rapm.bmj.com, etc.) runs on the
+    # HighWire platform. Each figure ships with `<img data-src=...F<N>.medium.gif
+    # width=263-440>` (low-res, upscaled to 716-px column width). The
+    # full-resolution `F<N>.large.jpg` URL is directly available on the
+    # parent `<a class=colorbox-load href=...>` and on the sibling
+    # `<a class=highwire-figure-link-newtab>` — no sub-page indirection.
+    # `_bmj_inline_figures` post-capture derives the .large.jpg URL by
+    # simple substitution of the data-src medium URL and re-fetches via
+    # urllib server-side. Single substring `bmj.com` matches every
+    # journal subdomain.
+    "bmj.com": {
+        "post_capture": lambda path, port: _bmj_inline_figures(path, port),
+        # _bmj_inline_figures opens a same-origin CDP tab; needs a live
+        # browser at `port`.
+        "post_capture_needs_browser": True,
     },
     # ScienceDirect (sciencedirect.com): each figure has download links
     # with the high-res JPEG URL on `<a class=download-link href=...
@@ -742,6 +2870,59 @@ _PUBLISHER_RULES = {
     "sciencedirect.com": {
         "wait_delay": 25000,
     },
+    # PNAS (pnas.org, Atypon platform): figures arrive from SingleFile as
+    # `<img src='data:image/svg+xml,<transparent placeholder>'
+    #   style="...background-image:var(--sf-img-<N>)...">`. The full-
+    # resolution JPEG bytes are embedded in `:root{--sf-img-<N>:
+    # url("data:image/jpeg;base64,...")}` CSS variables in the page's inline
+    # `<style>` block (SingleFile's CSS-var inlining mode), so browsers
+    # render the figure correctly via background-image. There is no DOM
+    # `<a href>` / `data-src` indirection and no derivable CDN URL —
+    # the CSS-var bytes are the only available source. The shared
+    # `_singlefile_inline_css_var_figures` post-capture promotes each
+    # CSS-var data URL to its `<img src>` so downstream tooling that
+    # reads `src` (rather than the CSS background) sees the real image.
+    # Pure local rewrite — no network calls.
+    "pnas.org": {
+        "post_capture": lambda path, port: _singlefile_inline_css_var_figures(
+            path, port, label="pnas", fig_container_re=_PNAS_FIG_RE,
+        ),
+    },
+    # Sage (journals.sagepub.com, Atypon platform): unlike sister Atypon
+    # journals (wiley, molbiolcell, pnas), Sage figure <img>s are captured
+    # by SingleFile directly with the high-resolution JPEG inlined as a
+    # `data:image/jpeg;base64,...` `src=` (no `data-lg-src` indirection,
+    # no `--sf-img-N` background-image trick). Article figures live in
+    # `<figure id=fig<N>-<doi-tail> class=graphic>`; biography photos in
+    # `<span class=inline-graphic>` (typically `data:image/webp;base64,...`,
+    # also valid bytes). Verified across 3 fixtures (10597123261435796,
+    # 20584601261443992, 24723444261432710): 11 figure-imgs + 1 inline-
+    # graphic, all decode cleanly via Pillow at full publisher resolution
+    # (1500-2700 px wide, 200-800 KB each). No post_capture hook needed,
+    # default wait_delay sufficient. The Phase 2 audit's `naturalWidth=0`
+    # finding for the 10597 biography WEBP was a measurement artifact
+    # (likely missing WEBP support in the audit harness) — the embedded
+    # bytes are a structurally valid RIFF/WEBP/VP8L 373x440 image.
+    #
+    # tandfonline.com (Atypon platform): NO-OP — investigated, no higher-
+    # resolution variant exists for the publisher. Figures arrive with the
+    # 500-px-long-axis thumbnail inlined as `<img id=d1eN
+    # src="data:image/{gif,jpeg};base64,...">`. The popup that the
+    # `<button class=show-full-size>` triggers loads the same JS sub-page
+    # at `/doi/figure/<DOI>`, whose `<img src=/cms/asset/<uuid>/<journal>_a
+    # _<id>_f000N{,_oc}.{gif,jpg}>` resolves to byte-identical bytes (e.g.
+    # Kabir 2010 F1: 42208 B embedded == 42208 B from /cms/asset/, both
+    # 500x488 GIF). The Atypon CDN keys on the UUID and ignores filename
+    # variants (`_oc` vs `_p` vs `_orig` vs `_oc_hires` all return the
+    # same blob). No `data-lg-src` / `data-large-src` / `download-hi-res`
+    # indirection in the page DOM, no `/doi/img/` endpoint (404), no
+    # `/action/showImage` endpoint (500). Verified across all 3 fixtures
+    # (Kabir 2010, Timashev 2020, John 1999): 14 figures, all already
+    # inlined at the publisher's maximum resolution. Audit's "Display full
+    # size" popup hypothesis was incorrect — the popup just zooms the same
+    # 500-px image. Mild upscaling (1.0–1.4x to 716-px column width) is
+    # the only path; acceptable per audit ("not blocking"). No rule entry
+    # needed (no URL rewrite, no wait_delay tweak, no post_capture).
 }
 
 
@@ -1013,7 +3194,7 @@ def _collect_cross_origin_css(ws_url, page_url):
                 "User-Agent": _BROWSER_UA,
                 "Accept": "text/css,*/*;q=0.1",
             })
-            with urllib.request.urlopen(req, timeout=30) as resp:
+            with polite_urlopen(req, timeout=30) as resp:
                 if resp.status != 200:
                     continue
                 data = resp.read()
@@ -2123,9 +4304,11 @@ def _fetch_batch(batch, port):
 # ---------------------------------------------------------------------------
 
 def _url_name(url):
-    """Convert a URL to a filesystem-safe name (punctuation -> underscore).
+    """Convert a URL to a filesystem-safe name.
 
-    Always derived from the input URL exactly as supplied — redirects and
+    Replace every run of non-alphanumeric characters with a single '_' (this
+    also collapses any consecutive '_' that appear in the input). Always
+    derived from the input URL exactly as supplied — redirects and
     SingleFile-comment URLs in the saved HTML are not consulted, so a given
     input URL deterministically maps to one filename.
     """

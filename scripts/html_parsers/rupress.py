@@ -1,4 +1,4 @@
-"""Oxford University Press (oup.com) HTML parser."""
+"""Rockefeller University Press (rupress) HTML parser."""
 
 import re
 from html import unescape
@@ -40,9 +40,13 @@ _SUPP_RE = re.compile(
     re.IGNORECASE,
 )
 
-# h2 classes for body vs back matter vs references
+# h2 classes for body vs back matter vs references.
+# rupress emits `<h2 class="back<name>-title ...">` for every back-matter
+# heading (backreferences-title, backacknowledgements-title, etc.); the
+# generic `_BACK_PREFIX` catches all of them so Acknowledgments / Author
+# Notes / Footnotes are recognized as back matter rather than `other`.
 _BODY_HEADING = "section-title"
-_BACK_HEADING = "backsection-title"
+_BACK_PREFIX = "back"
 _REF_HEADING = "backreferences-title"
 _ABSTRACT_HEADING = "abstract-title"
 
@@ -52,205 +56,103 @@ _ABSTRACT_HEADING = "abstract-title"
 # ---------------------------------------------------------------------------
 
 
-def _extract_nested(html, start_pattern):
-    """Return (match_start, match_end, inner_html) for the first element
-    matching start_pattern, with the matching close tag located by
-    tracking same-tag nesting. Returns None when no match.
-    """
-    m = re.search(start_pattern, html, re.DOTALL)
-    if not m:
-        return None
-    tag_m = re.match(r"<(\w+)", m.group())
-    if not tag_m:
-        return None
-    tag = tag_m.group(1)
-    pos = m.end()
-    depth = 1
-    open_pat = re.compile(rf"<{tag}[\s>]", re.IGNORECASE)
-    close_pat = re.compile(rf"</{tag}\s*>", re.IGNORECASE)
-    while depth > 0 and pos < len(html):
-        next_open = open_pat.search(html, pos)
-        next_close = close_pat.search(html, pos)
-        if next_close is None:
-            return None
-        if next_open and next_open.start() < next_close.start():
-            depth += 1
-            pos = next_open.end()
-        else:
-            depth -= 1
-            pos = next_close.end()
-    return m.start(), pos, html[m.start():pos]
-
-
-def _inline_metadata_widgets(html):
-    """Fill an empty `<div class="article-metadata-panel ...
-    at-ArticleMetadata">` placeholder with Keywords + Topic + Issue
-    Section so it renders as the single-box layout academic.oup.com
-    shows natively.
-
-    On oup.com, JS moves the three bands into that placeholder ~5–18 s
-    after load. When SingleFile captures before the JS settles (slow
-    network or cold cache) the placeholder is empty and the Topic /
-    Issue widgets still sit at the end of the article. This reproduces
-    the move statically. When the placeholder is already populated
-    (late-capture case) the function is a no-op.
-    """
-    # Locate the placeholder. Match both "clearfix at-ArticleMetadata"
-    # and "at-ArticleMetadata clearfix" orderings defensively.
-    ph = _extract_nested(
-        html,
-        r'<div[^>]*\bclass="[^"]*\bat-ArticleMetadata\b[^"]*"[^>]*>',
-    )
-    if not ph:
-        return html
-    ph_start, ph_end, ph_full = ph
-    # Find the opening tag end to inspect inner HTML
-    ot_end = html.find(">", ph_start) + 1
-    inner = html[ot_end:ph_end - len("</div>")].strip()
-    if len(inner) > 100:
-        # Already populated by runtime JS — leave alone.
-        return html
-
-    # Extract Keywords, Topic, and the SolrResourceMetadata's inner
-    # panel (which holds article-metadata-taxonomies +
-    # article-metadata-tocSections as siblings). Use the INNER classes
-    # rather than the outer widget wrappers so the injected content
-    # sits as a direct child of the at-ArticleMetadata panel — matching
-    # what native academic.oup.com's JS does (it moves the children of
-    # .article-metadata-panel.solr-resource-metadata, not the panel
-    # itself, into the placeholder; and the outer .article-metadata-
-    # panel has `>div:first-of-type{border-top: ...}` which would
-    # render a line above Issue Section if any wrapper were kept).
-    kw = _extract_nested(
-        html,
-        r'<div\b[^>]*\bclass=["\']?kwd-group\b',
-    )
-    rt = _extract_nested(
-        html,
-        r'<div\b[^>]*\bclass=["\']?related-topic-tags\b',
-    )
-    # The inner SolrResourceMetadata panel — we pull its INNER HTML
-    # (its direct children: article-metadata-taxonomies, article-
-    # metadata-tocSections, and anything else the publisher adds on
-    # other papers) so they end up as siblings inside the placeholder.
-    rm_panel = _extract_nested(
-        html,
-        r'<div\b[^>]*\bclass="article-metadata-panel solr-resource-metadata[^"]*"',
-    )
-    if not (kw or rt or rm_panel):
-        return html
-
-    # Also remove the outer widget wrappers so Topic / Issue aren't
-    # duplicated at the end of the article body.
-    rt_widget = _extract_nested(
-        html,
-        r'<div\b[^>]*\bclass="widget widget-RelatedTags\b[^"]*"',
-    )
-    rm_widget = _extract_nested(
-        html,
-        r'<div\b[^>]*\bclass="widget widget-SolrResourceMetadata\b[^"]*"',
-    )
-
-    # Extract the rm_panel's inner-HTML (its direct children) rather
-    # than the panel wrapper itself.
-    rm_inner = ""
-    if rm_panel:
-        rm_start, rm_end, rm_full = rm_panel
-        rm_open_end = rm_full.find(">") + 1
-        rm_inner = rm_full[rm_open_end:-len("</div>")]
-
-    # Remove originals (highest offset first so earlier removals don't
-    # shift later offsets). Remove widget wrappers rather than just
-    # the inner divs to drop all the related chrome at the end.
-    found = [x for x in (kw, rt_widget, rm_widget) if x]
-    found.sort(key=lambda x: x[0], reverse=True)
-    kw_html = kw[2] if kw else ""
-    rt_html = rt[2] if rt else ""
-    for start, end, _inner in found:
-        html = html[:start] + html[end:]
-
-    # After removing, re-locate the placeholder (its offset may have
-    # shifted if any of the removed blocks preceded it).
-    ph2 = _extract_nested(
-        html,
-        r'<div[^>]*\bclass="[^"]*\bat-ArticleMetadata\b[^"]*"[^>]*>',
-    )
-    if not ph2:
-        return html
-    ph2_start, ph2_end, _ = ph2
-    ph2_ot_end = html.find(">", ph2_start) + 1
-
-    # Build the populated placeholder: Keywords → Topic →
-    # (taxonomies + Issue Section, etc. — whatever the inner solr panel
-    # held as siblings).
-    filled = kw_html + rt_html + rm_inner
-    return (
-        html[:ph2_ot_end]
-        + filled
-        + html[ph2_end - len("</div>"):]
-    )
-
-
 def remove_banners(html):
-    """Apply Phase 2 layout rules for academic.oup.com.
+    """Apply Phase 2 layout rules for rupress.org (Silverchair).
 
     Step 1: cap body width at 752 px, center, neutralize @media queries
-            so the publisher's narrow CSS branch always applies; clear
-            the page-bg-colored body to white. Also populate the
-            at-ArticleMetadata placeholder when SingleFile captured it
-            empty (early-capture race vs. publisher JS that moves Topic
-            / Issue Section into it).
-    Step 2: remove the OneTrust cookie consent wrapper (banner + dark
-            backdrop are both children of #onetrust-consent-sdk).
-    Steps 3, 4, 7: no-op (no sticky elements after media-query
-            neutralization, no tall sidebars, all images loaded at
-            usable resolution).
-    Step 5: remove ad blocks — ad-banner header/footer/riser variants,
-            at-adblock advertisement-text labels, prestitial-ad,
-            sticky-footer-ad.
-    Step 6: clear the body's page-bg color (rgb(250,250,250)) so the
-            scan_gaps bg verdict is clean at every viewport.
-    Step 8: figure CSS — image above caption, both 100%-wide, 12 px gap
-            between them. OUP markup uses <div class="fig fig-section">
-            > .graphic-wrap > img.content-image + .graphic-bottom, NOT
-            <figure>/<figcaption>.
-    Step 9: no-op. The Silverchair .al-author-info-wrap is an overlay
-            tooltip card (closed-state CSS: position:absolute;
-            z-index:1200; box-shadow; width:290-320px), not in-place
-            push-down expansion, so per Step 9 it is left alone. Author
-            affiliations are already extracted from
-            citation_author_institution meta tags and the
-            info-card-author widget by _parse_authors.
-    Steps 10-12: scan_gaps clean (zero gaps, L=R, W=728≤cap, body width
-            tracks min(vw, cap)) at every viewport across all three
-            test fixtures.
+            so the publisher's narrow CSS branch always applies.
+    Step 2: remove the OneTrust cookie banner. The whole consent SDK
+            wrapper (`#onetrust-consent-sdk`) carries the banner, the
+            preference-center modal, and its dark-filter backdrop —
+            removing the wrapper drops all three in one shot.
+    Step 3: remove sticky elements detected by scan_sticky.py — the
+            focus-only `<a class=skipnav>` (position: fixed top:-100,
+            unquoted-class `<a>` so the by-selector helper does not
+            match it), the `#InfoColumn` left article-navigation column
+            (position: fixed; the publisher's narrow CSS translates it
+            off-screen but the wrapper still ships sticky), and the
+            entire `widget-ArticleJumpLinks` widget. Removing
+            `#InfoColumn` also cleans up its `info-inner-wrap can-stick`
+            child.
+    Step 3 (cont.): rupress saves the page with the Hypothes.is
+            annotation client embedded — `<hypothesis-sidebar>`,
+            `<hypothesis-adder>`, `<hypothesis-notebook>`,
+            `<hypothesis-profile>`, `<hypothesis-highlight-cluster-toolbar>`
+            tags ship with shadow-rooted UI. The sidebar paints a fixed
+            right-edge column ~22 px wide that reaches to the viewport
+            edge at every width, breaking the centering invariant.
+            Strip all hypothesis-* custom elements.
+    Step 5: remove ad blocks. rupress uses the same Silverchair classes
+            as ASH/AACR/biologists/portlandpress: `ad-banner` and
+            `widget-AdBlock`. Both can appear multiple times.
+    Step 8: figure CSS so each image sits above its caption, full width
+            of the column. Same Silverchair markup as siblings.
+    Step 9: per-author affiliation popups (`.al-author-info-wrap`) are
+            floating tooltip cards (position:absolute, z-index:1200,
+            box-shadow, fixed pixel width ~290-320), NOT push-down
+            expansions — leaving them collapsed. Affiliations are
+            already extracted from publisher metadata by
+            `_parse_authors`, so the popup contributes nothing.
     """
-    # Step 1 — populate the at-ArticleMetadata placeholder if SingleFile
-    # captured it empty (must run before media-query neutralization since
-    # the placeholder/widgets live in the DOM, not in CSS rules).
-    html = _inline_metadata_widgets(html)
     html = neutralize_media_queries(html)
 
-    # Step 2 — cookie consent banner + backdrop (OneTrust wrapper).
+    # Step 2 — OneTrust cookie consent SDK (banner + preference-center
+    # modal + dark-filter backdrop all live under #onetrust-consent-sdk).
     html = remove_elements_by_id(html, "onetrust-consent-sdk")
 
-    # Step 5 — ad blocks (header/footer/riser banners, prestitial,
-    # at-adblock advertisement-text labels, sticky-footer-ad). Loop
-    # because multiple instances exist; the helper removes one per call.
-    for cls in (
-        "ad-banner",
-        "at-adblock",
-        "prestitial-ad-container",
-        "sticky-footer-ad",
+    # Step 3 — sticky elements detected by scan_sticky. rupress ships
+    # these with unquoted attribute values, so the by-selector helper
+    # (which matches double-quoted class on `<div>`) does not apply
+    # for the `<a>` skip link.
+    html = _remove_nested_element(
+        html, r'<a\s[^>]*\bclass=skipnav\b[^>]*>',
+    )
+    # `#InfoColumn` is the left article-navigation column (position:
+    # fixed; translated off-screen by narrow-form CSS but still sticky).
+    # Removing it also strips the inner `info-inner-wrap can-stick`
+    # child and the widget-ArticleJumpLinks flyout living inside it.
+    html = remove_elements_by_id(html, "InfoColumn")
+    html = remove_elements_by_selector(html, "widget-ArticleJumpLinks")
+
+    # Step 3 (cont.) — Hypothes.is annotation client. The custom
+    # elements ship with `<template shadowrootmode=open>` UI; the
+    # sidebar in particular paints a thin fixed column at the right
+    # viewport edge that breaks the centering invariant. Strip all
+    # five tags. `_remove_nested_element`'s `\w+` tag-name capture
+    # does not match hyphenated custom elements (`hypothesis-sidebar`
+    # captures only `hypothesis`), so iterate with a local nesting walk
+    # over the actual hyphenated tag name.
+    for tag in (
+        "hypothesis-sidebar", "hypothesis-adder", "hypothesis-notebook",
+        "hypothesis-profile", "hypothesis-highlight-cluster-toolbar",
     ):
+        open_re = re.compile(rf"<{tag}\b[^>]*>", re.IGNORECASE)
+        close_re = re.compile(rf"</{tag}\s*>", re.IGNORECASE)
+        while True:
+            m = open_re.search(html)
+            if not m:
+                break
+            pos = m.end()
+            depth = 1
+            while depth > 0 and pos < len(html):
+                no = open_re.search(html, pos)
+                nc = close_re.search(html, pos)
+                if nc is None:
+                    break
+                if no and no.start() < nc.start():
+                    depth += 1
+                    pos = no.end()
+                else:
+                    depth -= 1
+                    pos = nc.end()
+            html = html[:m.start()] + html[pos:]
+
+    # Step 5 — ad blocks. Loop because the helper removes one element
+    # per call and multiple instances exist.
+    for cls in ("ad-banner", "widget-AdBlock"):
         while True:
             prev = html
-            html = _remove_nested_element(
-                html,
-                rf'<\w+[^>]*\bclass=("[^"]*\b{re.escape(cls)}\b[^"]*"|'
-                rf'\'[^\']*\b{re.escape(cls)}\b[^\']*\'|'
-                rf'{re.escape(cls)}\b)[^>]*>',
-            )
+            html = remove_elements_by_selector(html, cls)
             if html == prev:
                 break
 
@@ -263,27 +165,32 @@ def remove_banners(html):
         "box-sizing:border-box!important;"
         "background:#fff!important;"
         "overflow-wrap:break-word!important;word-wrap:break-word!important;}"
-        # Step 8 — figures: image fills column, image above caption,
-        # 12 px gap. OUP markup is
-        #   <div class="fig fig-section">
-        #     <div class="graphic-wrap">
-        #       <img class="content-image" src="data:...">
-        #       <div class="graphic-bottom">caption</div>
-        #     </div>
-        #   </div>
+        # Step 8 — figures. Same Silverchair markup as ASH/AACR/biologists/
+        # portlandpress:
+        #   <div class="fig fig-section"> > <div class=fig-label>
+        #     <div class=graphic-wrap> > <a><img class=content-image></a>
+        #     <div class="caption fig-caption">caption</div>
         ".fig.fig-section,.graphic-wrap"
         "{display:block!important;width:100%!important;"
-        "max-width:100%!important;}"
-        ".graphic-wrap img.content-image"
+        "max-width:100%!important;"
+        "margin-left:0!important;margin-right:0!important;"
+        "padding-left:0!important;padding-right:0!important;"
+        "box-sizing:border-box!important;}"
+        ".graphic-wrap a,.graphic-wrap img.content-image"
         "{display:block!important;width:100%!important;"
         "max-width:100%!important;height:auto!important;"
-        "margin:0 0 12px 0!important;}"
-        ".graphic-bottom"
-        "{display:block!important;width:100%!important;}"
-        # Step 9 — no expansion. The .al-author-info-wrap popups are
-        # overlay tooltip cards (position:absolute; z-index:1200;
-        # box-shadow; width:290-320px), not push-down expansion, so
-        # they are left in their native collapsed state.
+        "margin:0 0 12px 0!important;"
+        "box-sizing:border-box!important;}"
+        ".fig-caption"
+        "{display:block!important;width:100%!important;"
+        "margin-left:0!important;margin-right:0!important;}"
+        # Table-wrap shells use absolute pixel widths from the publisher
+        # PDF that overflow the narrow column. Cap them to the parent.
+        ".table-wrap,.table-wrap-inner,.table-wrap table,table.table-wrap"
+        "{max-width:100%!important;width:auto!important;"
+        "margin-left:0!important;margin-right:0!important;"
+        "table-layout:auto!important;}"
+        ".table-wrap{overflow-x:auto!important;}"
         "</style>"
     )
     if "</head>" in html:
@@ -384,7 +291,7 @@ def _parse_metadata(html):
       - volume, issue: str (may be empty)
       - pages: "firstpage-lastpage" or firstpage alone
       - doi: "https://doi.org/..." URL
-    OUP-specific: tries citation_ meta tags first (newer format), falls back to
+    rupress-specific: tries citation_ meta tags first (newer format), falls back to
     ww-citation-primary div (older format).
     """
     # Try meta tags first
@@ -440,12 +347,25 @@ def _parse_metadata(html):
 # Authors
 # ---------------------------------------------------------------------------
 
+# rupress meta tags glue ROR identifier URLs to the head of affiliation
+# strings with no separator ("https://ror.org/00bvhmc43Cancer Immunity
+# Laboratory ..."). Stripped per-affiliation before storage.
+_ROR_PREFIX_RE = re.compile(r"^\s*https?://ror\.org/[0-9a-z]{9,}\s*")
+
+
+def _clean_aff(aff):
+    """Strip leading ROR identifier URL from an affiliation string."""
+    if not aff:
+        return aff
+    return _ROR_PREFIX_RE.sub("", aff).strip(" ,")
+
+
 def _parse_authors(html):
     """Extract authors with affiliations.
 
     Returns list of {"author": "LastName IN", "affiliation": [str, ...]}.
     Author name format is enforced by _helpers.format_author_name.
-    Tries citation_author meta tags first (newer OUP format with comma-
+    Tries citation_author meta tags first (newer rupress format with comma-
     separated LastName, Given). Falls back to al-author-name links
     (older format, full display names).
 
@@ -453,6 +373,11 @@ def _parse_authors(html):
     (common on older NAR / Genetics papers), falls back to the
     <div class="info-card-author"> author-popup widget which carries
     each author's full-name display plus an optional <div class=aff>.
+
+    rupress-specific: newer papers (2024+) embed ROR identifier URLs
+    inline at the head of each affiliation string with no separator
+    (e.g. "https://ror.org/00bvhmc43Cancer Immunity Laboratory ...").
+    Strip those prefixes via _clean_aff before returning.
     """
     # Build name -> affiliation lookup from info-card author widgets.
     info_card_affs = {}
@@ -504,7 +429,7 @@ def _parse_authors(html):
             txt = re.sub(r'\s*,\s*,\s*', ', ', txt).strip(' ,')
             txt = re.sub(r'\s+', ' ', txt).strip()
             if txt:
-                affs.append(txt)
+                affs.append(_clean_aff(txt))
             pos = p
         if affs:
             info_card_affs[display] = affs
@@ -528,6 +453,8 @@ def _parse_authors(html):
         result = []
         for a in meta_authors:
             affs = a.get("affiliations", [])
+            if affs:
+                affs = [_clean_aff(x) for x in affs]
             if not affs:
                 affs = lookup_info_card(a["name"])
             result.append({
@@ -721,7 +648,7 @@ def _parse_references(html):
 # ---------------------------------------------------------------------------
 
 def _parse_abstract(html):
-    """Extract abstract from OUP HTML."""
+    """Extract abstract from rupress HTML."""
     # Match <section class=abstract ...> (unquoted) that is NOT a graphical
     # abstract.  OUP uses unquoted class=abstract for the text abstract and
     # quoted class="abstract ... graphicalAbstract" for graphical ones.
@@ -748,7 +675,7 @@ def _parse_abstract(html):
 
 
 def _parse_keywords(html):
-    """Extract keywords from OUP HTML (often absent).
+    """Extract keywords from rupress HTML (often absent).
 
     Tries kwd-group/kwd-part (classic Silverchair) first, then
     content-metadata-keywords (Royal Society / Portland Press variant).
@@ -812,14 +739,14 @@ def _extract_div_content(html, start_pos):
 
 
 def _find_h2_sections(html):
-    """Find section headings in OUP HTML.
+    """Find section headings in rupress HTML.
 
     Returns list of (start_pos, heading_text, class_type) where class_type
     is 'body', 'back', 'ref', 'abstract', or 'other'.
     """
     entries = []
     for m in re.finditer(
-        r'<h2[^>]*class=(?:"([^"]*)"|([^\s>]+))[^>]*>(.*?)</h2>',
+        r'<h2[^>]*class=(?:"([^"]*)"|(\S+))[^>]*>(.*?)</h2>',
         html, re.DOTALL,
     ):
         cls = m.group(1) or m.group(2) or ""
@@ -828,9 +755,9 @@ def _find_h2_sections(html):
             continue
         if _ABSTRACT_HEADING in cls:
             kind = "abstract"
-        elif _REF_HEADING in cls:
+        elif _REF_HEADING in cls or _REF_RE.search(text):
             kind = "ref"
-        elif _BACK_HEADING in cls:
+        elif _BACK_PREFIX in cls and "-title" in cls:
             kind = "back"
         elif _BODY_HEADING in cls:
             kind = "body"
@@ -862,12 +789,6 @@ def _parse_body(html):
         return ""
 
     content = _extract_div_content(html, body_m.end())
-    # Strip the user-comments widget that lives inside article-body on
-    # academic.oup.com (a `<div class=comments>` block holding the
-    # "Add comment" modal form). Its inner `<h2>Comments</h2>` has no
-    # class attribute so it falls through _find_h2_sections and would
-    # otherwise leak the entire modal markup into main_text.
-    content = _remove_nested_element(content, r'<div\s+class=comments\b[^>]*>')
     h2s = _find_h2_sections(content)
     if not h2s:
         return ""
@@ -898,12 +819,19 @@ def _parse_body(html):
     # Capture un-headed intro text between abstract and first body h2
     # (some OUP journals omit the "Introduction" heading).
     # Skip metadata panels (keywords, issue section) that may appear
-    # before the actual intro text.
+    # before the actual intro text. Cap the gap at the first references
+    # heading so commentary articles (which lack body H2s but have
+    # back-matter H2s after refs) don't drag the references list into
+    # the gap as fallback intro content.
     first_body_pos = None
     for pos, text, kind in h2s:
         if kind in ("body", "back") and pos >= start:
             first_body_pos = pos
             break
+    if first_ref_idx is not None:
+        ref_pos = h2s[first_ref_idx][0]
+        if first_body_pos is None or first_body_pos > ref_pos:
+            first_body_pos = ref_pos
     if first_body_pos is not None and start < first_body_pos:
         gap = content[start:first_body_pos]
         # Skip past article-metadata-panel if present
@@ -985,7 +913,7 @@ def _parse_main_text(html):
       - Remove all references sections.
     Pipeline: locate article container -> slice body zones -> extract_captions
     -> strip_common -> tags_to_text -> drop_noise.
-    OUP-specific: main_text is composed of abstract + keywords + body (with
+    rupress-specific: main_text is composed of abstract + keywords + body (with
     markdown headers "## Abstract" and "## Keywords" prepended to their sections).
     """
     parts = []
@@ -1006,7 +934,7 @@ def _parse_main_text(html):
 # ---------------------------------------------------------------------------
 
 def parse_article(html):
-    """Parse OUP HTML into a papers/*.json-format dict."""
+    """Parse Rockefeller University Press HTML into a papers/*.json-format dict."""
     meta = _parse_metadata(html)
     return {
         "title": meta["title"],

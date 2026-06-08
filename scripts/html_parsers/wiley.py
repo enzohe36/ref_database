@@ -11,7 +11,6 @@ from ._helpers import (
     format_doi,
     get_meta,
     neutralize_media_queries,
-    remove_elements_by_id,
     remove_elements_by_selector,
     strip_common,
     strip_tags,
@@ -41,232 +40,140 @@ _SUPP_RE = re.compile(
 # Banner removal
 # ---------------------------------------------------------------------------
 
+# CSS injected before </head> to lock the rendered article to a 720-px-wide
+# native column, force the article__content reading column to fill that
+# width (overriding Bootstrap col-md-8/col-lg-8 sizing), apply the
+# 56/16 reading-column padding, and resolve the Wiley figure layout to a
+# single block-level image above its caption.
+_OVERRIDE_CSS = """<style>
+html, body { background: #ffffff !important; }
+body {
+    max-width: 752px !important;
+    margin: 0 auto !important;
+    background: #ffffff !important;
+}
+:root #article__content {
+    width: 100% !important;
+    max-width: 100% !important;
+    flex: 0 0 100% !important;
+    padding: 56px 16px !important;
+    margin: 0 !important;
+    float: none !important;
+    box-sizing: border-box !important;
+}
+:root .row.article-row { display: block !important; margin: 0 !important; }
+/* Bootstrap container/row/col wrappers around #article__content add
+   15 px gutter padding and 20 px article top padding — zero them so the
+   #article__content padding above is the sole margin source. */
+:root #pb-page-content .container,
+:root #pb-page-content .container > .row,
+:root #pb-page-content .container > .row > div {
+    padding-left: 0 !important;
+    padding-right: 0 !important;
+    margin-left: 0 !important;
+    margin-right: 0 !important;
+    max-width: 100% !important;
+    width: 100% !important;
+}
+:root #pb-page-content article {
+    padding: 0 !important;
+    margin: 0 !important;
+}
+:root #article__content figure.figure,
+:root #article__content figure.figure > * {
+    display: block !important;
+    width: 100% !important;
+    text-align: left !important;
+    box-sizing: border-box !important;
+}
+:root #article__content figure.figure picture,
+:root #article__content figure.figure a {
+    display: block !important;
+    width: 100% !important;
+}
+:root #article__content figure.figure img.figure__image {
+    display: block !important;
+    width: 100% !important;
+    height: auto !important;
+    max-width: 100% !important;
+    margin: 0 0 5px 0 !important;
+}
+</style>"""
+
+
 def remove_banners(html):
-    """Normalize Wiley HTML to a single centered text column.
+    """Apply Phase 2 layout rules for onlinelibrary.wiley.com.
 
-    Chrome stripped (Step 3):
-      - <header class=page-header> (top nav) and <footer
-        class=page-footer>.
-      - `<nav class=skip-links>` and the floating article toolbar
-        (`<nav class="coolBar stickybar">` with QR code / PDF / Cite /
-        Share buttons).
-      - "Citing Literature" panel (#cited-by section) — per note main
-        text ends before "Citing Literature".
-
-    Reading column: the outer <article data-mathjax ...> wraps the
-    journal + volume/issue/pages line, the title, authors, abstract,
-    body, references. Per note start anchor is the journal+vol/issue
-    line which sits inside this outer article.
+    Step 1: cap body width at 752 px, center, neutralize @media queries
+            so the publisher's narrow CSS branch always applies at any
+            viewport.
+    Step 2: Osano cookie consent — the page ships a hidden
+            `.osano-cm-window` dialog plus an `.osano-cm-info-dialog`
+            full-viewport drawer. Both are `position: fixed` and remain
+            in the DOM after capture.
+    Step 3: sticky elements — `<nav class="coolBar stickybar">` is the
+            in-article tools bar (PDF / share / cite / etc.) that pins
+            below the page header on scroll; `.w-slide` / `.w-slide_head`
+            are the off-canvas slide-in drawers that ship `position: fixed`
+            even when not activated.
+    Step 5: ad slots — Wiley publishes empty `<div class="ad-slot">` /
+            `<div class="advertisement">` reservation wrappers in some
+            article templates; remove on sight.
+    Steps 6-11: handled by the override CSS injected before </head>,
+            which (a) forces the article column to fill the body cap,
+            (b) zeros Bootstrap container/row gutters, (c) renders
+            figures block-level with image above caption, and
+            (d) keeps publisher chrome (header/footer) inside the cap.
     """
-    # Lock layout to publisher's narrow (≤1024 px) form at any viewport.
     html = neutralize_media_queries(html)
-    # -------------------------------------------------------------------
-    # Step 3 — strip chrome.
-    # -------------------------------------------------------------------
-    html = _remove_nested_element(html, r"<header\b[^>]*>")
-    html = _remove_nested_element(html, r"<footer\b[^>]*>")
-    # Skip-links navigation (on-screen at narrow vw).
-    html = _remove_nested_element(
-        html, r'<nav\b[^>]*\bclass="[^"]*skip-links[^"]*"[^>]*>'
-    )
-    # Note: `<nav class="coolBar stickybar">` is sticky at desktop
-    # but renders `position: static` at narrow viewports — an inline
-    # TOC-like row ("About / Sections / CITE / Tools / Share").
-    # Keep it.
-    # "Citing Literature" section at the bottom of the article.
-    html = remove_elements_by_id(html, "cited-by")
-    # Also strip the trailing "Related articles" panel in the <aside>
-    # inside the article and the access-denial slot placeholder.
-    html = remove_elements_by_id(html, "accessDenialslot")
-    # Leaderboard ad above the article (`.banner-wrapper` housing
-    # `.advert-leaderboard`).
-    html = _remove_nested_element(
-        html, r'<div\b[^>]*\bclass="[^"]*\bbanner-wrapper\b[^"]*"[^>]*>'
-    )
-    html = remove_elements_by_id(html, "advert-leaderboard")
-    # Stray "Download PDF" link div right after the article (bare inline
-    # style `text-align:right`). Matches the specific inline-style +
-    # single anchor child pattern Wiley puts at that position.
-    html = _remove_nested_element(
-        html,
-        r'<div\b[^>]*style=text-align:right!important[^>]*>',
-    )
-    # Osano Cookie Preferences floating widget button (bottom-left
-    # sticky: `<button class="osano-cm-window__widget">`).
-    for _ in range(4):
-        before = html
-        html = _remove_nested_element(
+
+    # Step 2 — Osano cookie consent dialog and drawer (fixed-position,
+    # always present in the captured DOM regardless of opt-in state).
+    for cls in (
+        "osano-cm-window",
+        "osano-cm-info-dialog",
+    ):
+        while True:
+            prev = html
+            html = remove_elements_by_selector(html, cls)
+            if html == prev:
+                break
+
+    # Step 3 — sticky/fixed elements:
+    #   1. `<nav class="coolBar stickybar">` is the in-article tools
+    #      strip (PDF / share / cite). It sticks below the site header
+    #      on scroll and obscures content; remove the whole nav block.
+    while True:
+        new = _remove_nested_element(
             html,
-            r'<button\b[^>]*\bclass="[^"]*\bosano-cm-widget\b[^"]*"[^>]*>',
+            r'<nav\s+class="?coolBar\s+stickybar[^"]*"?[^>]*>',
         )
-        if html == before:
+        if new == html:
             break
-    html = _remove_nested_element(
-        html, r'<div\b[^>]*\bclass="[^"]*\bosano-cm\b[^"]*"[^>]*>'
-    )
+        html = new
+    #   2. `.w-slide` / `.w-slide_head` off-canvas drawers (fixed,
+    #      parked off-screen until activated).
+    for cls in ("w-slide", "w-slide_head"):
+        while True:
+            prev = html
+            html = remove_elements_by_selector(html, cls)
+            if html == prev:
+                break
 
-    # -------------------------------------------------------------------
-    # Steps 2 + 4 — layout freeze and reading-column cap.
-    # -------------------------------------------------------------------
-    override = (
-        "<style>"
-        "html{width:100% !important;max-width:100% !important;"
-        "margin:0 !important;background:#fff !important;"
-        "overflow-y:overlay !important}"
-        "html::-webkit-scrollbar{width:0 !important;height:0 !important}"
-        "body{width:100% !important;min-width:0 !important;"
-        "max-width:752px !important;margin:0 auto !important;"
-        "background:#fff !important;color:#000 !important}"
-        "main,#main-content,.pageBody,.page-body,#pb-page-content,"
-        ".container,.container-fluid,.row,"
-        "[class*=col-]{"
-        "display:block !important;float:none !important;"
-        "width:100% !important;max-width:100% !important;"
-        "min-width:0 !important;flex:0 0 auto !important;"
-        "margin:0 !important;padding:0 !important;"
-        "box-sizing:border-box !important;background:#fff !important}"
-        # Outer article wraps journal/vol/issue line + title + body +
-        # references.
-        "article[data-mathjax]{"
-        "float:none !important;display:block !important;"
-        "width:auto !important;max-width:752px !important;"
-        "margin:0 auto !important;padding:56px 16px !important;"
-        "box-sizing:border-box !important;background:#fff !important}"
-        "article[data-mathjax] *{"
-        "max-width:100% !important;min-width:0 !important}"
-        # Zero margin only on the wrapper's DIRECT first/last children
-        # so nested section headings keep their native vertical rhythm.
-        "article[data-mathjax]>*:first-child{"
-        "margin-top:0 !important;padding-top:0 !important}"
-        "article[data-mathjax]>*:last-child,"
-        "article[data-mathjax]>*:last-child>*:last-child,"
-        "article[data-mathjax]>*:last-child>*:last-child>*:last-child,"
-        "article[data-mathjax]>*:last-child>*:last-child>*:last-child>*:last-child,"
-        "article[data-mathjax]>*:last-child>*:last-child>*:last-child>*:last-child>*:last-child,"
-        "article[data-mathjax]>*:last-child>*:last-child>*:last-child>*:last-child>*:last-child>*:last-child"
-        "{margin-bottom:0 !important;padding-bottom:0 !important}"
-        # Kill only the *margin*-bottom cascade on nested last-children
-        # (descendant combinator). The Bibliography accordion's nested
-        # `margin-bottom` chain at .accordion / .article-section /
-        # ancestor wrappers otherwise leaves 62-68 px of trailing
-        # whitespace below the last reference. Padding-bottom is left
-        # intact so `.accordion__content` (which has a 1px solid blue
-        # border on all sides + padding:1.5rem) keeps its 24-px inner
-        # gap between the last reference and the bottom border.
-        "article[data-mathjax] *:last-child{"
-        "margin-bottom:0 !important}"
-        # Hide `.getFTR__placeholder` — a 40-px tall empty `<div>` that
-        # the GetFTR JS service populates with an icon/status badge.
-        # In a static capture it's dead and just inflates the .extra-
-        # links flex row to 48 px tall, leaving 15 px of empty space
-        # below the visible link text and pushing measured B at the
-        # last reference from 56 to 71-72 at vw ≥ 720.
-        "article[data-mathjax] .extra-links .getFTR__placeholder{"
-        "display:none !important}"
-        # Force the journal + volume/issue/pages line visible at the
-        # top of the article per format-html-extra note. Native CSS
-        # hides .volume-issue and .citation__page-range at desktop
-        # viewports (and the 752-px body cap forces narrow layout).
-        # Use the narrow `inline-block` so the slash separator
-        # (`.citation__page-range::before { content:"/" }`, also
-        # narrow-only) sits between volume and pages without inserting
-        # a line break.
-        "article[data-mathjax] .volume-issue,"
-        "article[data-mathjax] .citation__page-range{"
-        "display:inline-block !important;visibility:visible !important}"
-        # Restore narrow-only "/" separators that the publisher
-        # places between (a) journal name and volume-issue and
-        # (b) volume-issue and citation__page-range. The publisher's
-        # desktop @media overrides both ::before/::after content to
-        # `none`.
-        "article[data-mathjax] .citation__page-range::before{"
-        "content:\"/\" !important}"
-        "article[data-mathjax] .journal-banner-text>a::after{"
-        "content:\"/\" !important;margin:0 0.1875rem !important}"
-        # Keep the journal name inline with volume/issue/pages on a
-        # single line at any viewport. The publisher's `.journal-
-        # banner-text` switches from `display:inline-block` (narrow)
-        # to `display:block` at desktop, pushing volume + pages onto
-        # a second line. Lock to the narrow inline-block form.
-        "article[data-mathjax] .journal-banner-text{"
-        "display:inline-block !important}"
-        # Expand the Bibliography accordion. Native markup sets
-        # style="display:none" inline on .accordion__content; override.
-        # Also lock padding-bottom to the narrow value (1.125rem) — the
-        # publisher's desktop @media bumps it to 1.5rem, which adds 6 px
-        # of trailing whitespace below the last reference at vw≥820.
-        "article[data-mathjax] .accordion__content{"
-        "display:block !important;height:auto !important;"
-        "max-height:none !important;overflow:visible !important;"
-        "padding-bottom:1.125rem !important}"
-        # Hide the right-rail <aside> and its col container (related
-        # articles, metrics, figures-jump) that render alongside the
-        # article at wide vw.
-        "article[data-mathjax] aside,"
-        "article[data-mathjax] .article-row-right{"
-        "display:none !important}"
-        # Hide the "Citing Literature" / trending / recommended panels
-        # inside #publicationContentRefs, and the access-denial placeholder.
-        "article[data-mathjax] #cited-by,"
-        "article[data-mathjax] .issue-items,"
-        "article[data-mathjax] .article-recommendations,"
-        "article[data-mathjax] .recommended-articles,"
-        "article[data-mathjax] #accessDenialslot{"
-        "display:none !important}"
-        # Figures: wiley wraps each figure in
-        #   <figure class=figure id=f<N>>
-        #     <a target=_blank href=https://onlinelibrary.wiley.com/cms/asset/<uuid>/<file>.<ext>>
-        #       <picture>
-        #         <img class=figure__image src="data:..." data-lg-src=/cms/asset/<uuid>/<file>.<ext>
-        #              loading=lazy>
-        #       </picture>
-        #     </a>
-        #     <figcaption class=figure__caption>
-        #       <div class=figure__caption__header>
-        #         <strong class=figure__title>Figure N</strong>
-        #         <div class=figure-extra>
-        #           <a class=open-figure-link>Open in figure viewer</a>
-        #           <a class=ppt-figure-link>PowerPoint</a>
-        #         </div>
-        #       </div>
-        #       <div class="figure__caption figure__caption-text"><p>...</p></div>
-        #     </figcaption>
-        #   </figure>
-        # Native order: image above caption (correct). Images lazy-load
-        # via `data-lg-src`; partial captures leave many figures at
-        # placeholder src. get_refs.py uses `_WILEY_FIGURES_FIX_JS` to
-        # swap src ← parent <a href> (same as data-lg-src). Visual
-        # fixes: force img full-width above caption, hide JS-only
-        # "Open in figure viewer" + "PowerPoint" buttons in
-        # `.figure-extra`.
-        "article[data-mathjax] figure.figure{"
-        "margin:1rem 0 !important;padding:0 !important;"
-        "width:100% !important;max-width:100% !important;"
-        "display:block !important}"
-        "article[data-mathjax] figure.figure > a,"
-        "article[data-mathjax] figure.figure picture{"
-        "display:block !important;margin:0 !important;padding:0 !important;"
-        "width:100% !important;max-width:100% !important}"
-        "article[data-mathjax] figure.figure img.figure__image{"
-        "display:block !important;width:100% !important;"
-        "height:auto !important;max-width:100% !important;"
-        "margin:0 0 5px 0 !important}"
-        # Drop the JS-only figure-extra toolbar.
-        "article[data-mathjax] figure.figure .figure-extra{"
-        "display:none !important}"
-        "</style>"
-    )
+    # Step 5 — ad placeholders. Empty in the static capture but reserve
+    # vertical space when present.
+    for cls in ("ad-slot", "advertisement"):
+        while True:
+            prev = html
+            html = remove_elements_by_selector(html, cls)
+            if html == prev:
+                break
+
     if "</head>" in html:
-        html = html.replace("</head>", override + "</head>", 1)
+        html = html.replace("</head>", _OVERRIDE_CSS + "</head>", 1)
     else:
-        html = re.sub(r"(<body\b)", override + r"\1", html, count=1)
+        html = re.sub(r"(<body\b)", _OVERRIDE_CSS + r"\1", html, count=1)
     return html
-
-
-# ---------------------------------------------------------------------------
-# Metadata
-# ---------------------------------------------------------------------------
-
 def _parse_metadata(html):
     """Extract bundled metadata: title, journal, year, volume, issue, pages, doi.
 
@@ -640,6 +547,22 @@ def _parse_main_text(html):
                 end = pos + nc.start()
             pos += nc.end()
     body_html = html[body_m.end():end]
+
+    # Strip figure-extra widgets ("Open in figure viewer", "PowerPoint")
+    # that sit in the figcaption header, otherwise they get concatenated
+    # to the "FIGURE N" label as inline link text.
+    body_html = re.sub(
+        r'<div\s+class="?figure-extra"?[^>]*>.*?</div>',
+        '', body_html, flags=re.DOTALL,
+    )
+
+    # Strip the Supporting Information section. Its body is a download
+    # table (Filename / Description) plus a publisher disclaimer; both
+    # are publisher chrome, not paper content.
+    body_html = re.sub(
+        r'<section\s+class="?article-section\s+article-section__supporting"?[^>]*>.*?</section>',
+        '', body_html, flags=re.DOTALL,
+    )
 
     # Find references section boundary
     ref_m = re.search(

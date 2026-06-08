@@ -601,7 +601,12 @@ def parse_combined_name(name):
     # Strip leading honorifics (Prof., Dr., Mr., ...) and trailing
     # suffix tokens (Jr., III, PhD, ...). Single-letter-with-period tokens
     # ("N.", "V.") are initials, not Roman-numeral suffixes, so skip those.
+    # All-caps 1-2 letter tokens ("MS", "JR") are initials in "Initials Last"
+    # form ("MS Wold", "JR Yates"), not honorifics — preserve them.
     while len(tokens) > 1 and tokens[0].rstrip(".").lower() in _NAME_HONORIFICS:
+        tok = tokens[0]
+        if tok.isalpha() and tok.isupper() and 1 <= len(tok) <= 2:
+            break
         tokens.pop(0)
     while len(tokens) > 1:
         tail = tokens[-1]

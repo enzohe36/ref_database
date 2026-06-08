@@ -10,6 +10,10 @@ The skill executes one tick of the autonomous outline-refinement loop documented
 
 The skill is **project-scoped**. All state lives under `projects/<name>/`. The outline must be inside a project subtree.
 
+## Citation format
+
+A citation in an outline bullet is the literal `stem` value (basename of `papers/parsed/<stem>.json`, e.g. `Cao_2024_Nature_38123456`). `search_refs.py` returns the stem in every result. Copy it verbatim into the bullet — no conversion, no shortening. Multiple stems separated by `; `.
+
 ## When to invoke
 
 User says: "refine the outline", "iterate the outline", "run one outline tick", "deepen the outline", "search literature and update bullets", "next ralph tick".
@@ -125,15 +129,15 @@ Multiple recent-first queries per question are expected. Vary phrasing if the fi
 
 ### Step 6: Local search (rebuild + query)
 
-After all this tick's abstracts have been fetched, rebuild the index ONCE:
+After all this tick's abstracts have been fetched, rebuild the project's chroma collection ONCE so the new abstracts become searchable in this tick's queries:
 ```
-python search_refs.py --build
+python scripts/build_model.py <name>
 ```
-Do not rebuild between every individual query — that wastes time. Then for each question:
+This rebuilds `chroma_db/<name>` from `projects/<name>/pmids.txt`. Do not rebuild between every individual query — that wastes time. Then for each question (run from inside `projects/<name>/` so cwd resolves to the project's collection rather than `_global`):
 ```
-python search_refs.py "<question>"
+python scripts/search_refs.py "<question>"
 ```
-This surfaces top-K semantically relevant abstracts from the now-augmented index. The index contains all abstracts harvested in any prior tick, so this finds cross-cutting evidence that might otherwise be missed.
+This surfaces top-K semantically relevant abstracts from the now-augmented project collection. The collection contains all PMIDs in `projects/<name>/pmids.txt`, so this finds cross-cutting evidence within the project that might otherwise be missed.
 
 ### Step 7: Synthesize answers (search-first discipline)
 

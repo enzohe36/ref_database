@@ -1,7 +1,4 @@
-"""Taylor & Francis (tandfonline.com) HTML parser."""
-
-# Note: tandfonline HTML uses unquoted attributes (class=foo not class="foo").
-# All regex patterns must handle both quoted and unquoted attribute values.
+"""Taylor & Francis (tandfonline) HTML parser."""
 
 import re
 import urllib.parse
@@ -14,14 +11,15 @@ from ._helpers import (
     extract_captions,
     format_author_name,
     format_doi,
+    neutralize_media_queries,
     remove_elements_by_id,
-    remove_elements_by_selector,
     strip_common,
     strip_tags,
     tags_to_text,
 )
 
-# Publisher-specific noise strings removed from main_text
+# Lines starting with any string in this tuple are dropped from main_text
+# after the text pipeline runs.
 _NOISE = (
     "Open in a new window",
     "Display full size",
@@ -34,12 +32,14 @@ _NOISE = (
     "Google Scholar",
 )
 
-# All NLM_sec div opening tags (any attribute order)
+# All NLM_sec div opening tags (any attribute order). Tandfonline HTML uses
+# unquoted attributes (class=foo not class="foo") for many tags, so the
+# class-attr regex must accept either form.
 _ALL_SECTION_RE = re.compile(
     r'<div\s[^>]*class="?NLM_sec[^">\s]*[^>]*>', re.DOTALL
 )
 
-# Supplementary section patterns (kept after first references)
+# Supplementary section heading patterns (kept after first references).
 _SUPPLEMENTARY_RE = re.compile(
     r"supplement|extended data|source data|expanded view|appendix",
     re.IGNORECASE,
@@ -50,447 +50,96 @@ _SUPPLEMENTARY_RE = re.compile(
 # Banner removal
 # ---------------------------------------------------------------------------
 
-# Lock the publisher's CSS to its narrow (≤ 1024 px) layout regardless of
-# the viewer's actual viewport. Tandfonline (Silverchair) ships a single
-# stylesheet whose desktop layout — multi-column grid, 100-px-wide vertical
-# metrics sidebar, expanded gray-box journal-nav with cover image + submit
-# buttons, larger title font — is entirely controlled by `@media (min-width:
-# 1025px)` blocks; the corresponding narrow form lives in `@media (max-width:
-# 1024px)` blocks (and the unconditional defaults). Forcing every desktop
-# breakpoint OFF and every narrow breakpoint ON at any viewport collapses
-# the head block, metrics widget, and article column into a single 720-style
-# layout that scales by re-centering the page-body wrapper.
-#
-# Two transforms applied to every `<style>` block:
-#   1. `@media (min-width: N) { rules }` for N ≥ 1025 → entire block deleted
-#      (desktop rules never fire).
-#   2. `@media (max-width: N) { rules }` for N ≥ 720 → `@media` wrapper
-#      stripped, leaving rules unconditional (narrow rules always fire).
-# Other media queries (orientation, prefers-color-scheme, print, max-width
-# mobile breakpoints below 720) are left intact.
-_MEDIA_THRESH_MIN_DESKTOP = 721   # delete `@media (min-width: N)` for N >= this
-_MEDIA_THRESH_MAX_NARROW = 720    # unwrap `@media (max-width: N)` for N >= this
+def remove_banners(html):
+    """Apply Phase 2 layout rules for tandfonline.com.
 
-
-def _scan_balanced_block(text, open_idx):
-    """Return the index just past the matching `}` for `{` at open_idx.
-
-    Tracks brace depth, skipping over CSS strings ("..." or '...') and
-    `url(...)` content (which can hold parens but not braces in valid
-    CSS). Returns -1 if no matching brace found within the slice.
+    Step 1: cap body width at 752 px, center, neutralize @media queries
+            so the publisher's narrow CSS branch always applies.
+    Step 2: remove the Transcend cookie consent banner
+            (#transcend-consent-manager is a single `position:fixed`
+            inline-styled wrapper with no separate backdrop).
+    Step 3: remove the empty in-article reference popup overlay
+            (#ref-overlay; a `position:fixed` dialog placeholder T&F
+            populates on click) AND the in-article sectionsNavigation
+            widget (a JS-driven sticky bar that pins to the viewport
+            top during scroll — repeats the in-page heading list and
+            doesn't add new content).
+    Steps 4, 5, 6: no-op (no escaping sidebars, no ad widgets in T&F
+            HTML, body bg already white).
+    Step 7: drop `loading=lazy` on figureView <img> tags so the
+            decoded figures appear in CDP screenshots without scrolling
+            them through the viewport.
+    Step 8: figure CSS — image fills column, image above caption,
+            12 px gap. T&F markup is
+                <div class="figureView">
+                  <div class="short-legend"><p class=captionText>...</p></div>
+                  <a class=thumbnail><img ...></a>
+                  <div><button class=show-full-size>Display full size</button></div>
+                </div>
+            Reorder visually so the thumbnail image renders above the
+            short-legend caption.
+    Step 9: no-op. Per-author <span class=overlay> popups are
+            publisher-native overlays (open-state CSS:
+            `.literatumAuthors .entryAuthor.overlayed .overlay
+            {position:absolute;width:320px;box-shadow:...}`),
+            so per Step 9 the parser does not expand them. The
+            affiliation text is already extracted from the same
+            overlay span by `_parse_authors`.
+    Steps 10-12: scan_gaps clean (zero gaps, L=R, W<=cap, body width
+            tracks min(vw, cap)) at every viewport across all three
+            test fixtures.
     """
-    depth = 1
-    i = open_idx + 1
-    n = len(text)
-    while i < n:
-        c = text[i]
-        if c in '"\'':
-            quote = c
-            i += 1
-            while i < n and text[i] != quote:
-                if text[i] == '\\':
-                    i += 2
-                else:
-                    i += 1
-            i += 1
-        elif c == '{':
-            depth += 1
-            i += 1
-        elif c == '}':
-            depth -= 1
-            i += 1
-            if depth == 0:
-                return i
-        else:
-            i += 1
-    return -1
+    html = neutralize_media_queries(html)
 
+    # Step 2 — cookie consent banner (Transcend).
+    html = remove_elements_by_id(html, "transcend-consent-manager")
 
-def _neutralize_media_queries_in_css(css):
-    """Walk CSS text once; rewrite or delete viewport-width @media blocks.
-
-    Lock to the narrow (≤ 1024 px) layout: delete every `@media (min-width:
-    N)` block for N ≥ _MEDIA_THRESH_MIN_DESKTOP, and unwrap every `@media
-    (max-width: N)` block for N ≥ _MEDIA_THRESH_MAX_NARROW.
-    """
-    # Match @media at-rule heads: `@media <feature-list> {`. Capture the
-    # full feature list (everything between `@media` and the opening `{`)
-    # so we can decide whether the block represents a viewport-width gate.
-    media_re = re.compile(r"@media\b([^{]+)\{", re.IGNORECASE)
-    out_parts = []
-    pos = 0
+    # Step 3 — empty inline-reference popup placeholder + the
+    # JS-driven sticky in-article sectionsNavigation bar.
+    html = remove_elements_by_id(html, "ref-overlay")
     while True:
-        m = media_re.search(css, pos)
-        if not m:
-            out_parts.append(css[pos:])
-            break
-        out_parts.append(css[pos:m.start()])
-
-        feat = m.group(1)
-        body_start = m.end()
-        body_end = _scan_balanced_block(css, body_start - 1)
-        if body_end == -1:
-            # Unbalanced — leave the rest untouched and stop.
-            out_parts.append(css[m.start():])
+        prev = html
+        html = _remove_nested_element(
+            html,
+            r'<div[^>]*\bclass="[^"]*\bsectionsNavigation\b[^"]*"[^>]*>',
+        )
+        if html == prev:
             break
 
-        rules = css[body_start:body_end - 1]  # inside the braces
-        next_pos = body_end
-
-        # Decide based on min-width / max-width values in feature list.
-        # Only flip a block when it is purely viewport-width gated; if it
-        # mixes other features (orientation, prefers-color-scheme, etc.)
-        # leave it alone to be safe.
-        min_w = re.search(r"\(\s*min-width\s*:\s*(\d+)(?:px|em|rem)?\s*\)", feat, re.IGNORECASE)
-        max_w = re.search(r"\(\s*max-width\s*:\s*(\d+)(?:px|em|rem)?\s*\)", feat, re.IGNORECASE)
-        # Reject if other recognizable feature tokens are present.
-        feat_clean = re.sub(r"\(\s*(?:min-width|max-width)\s*:\s*\d+(?:px|em|rem)?\s*\)", "", feat, flags=re.IGNORECASE)
-        feat_clean = re.sub(r"\b(?:and|only|screen|all)\b|,", "", feat_clean, flags=re.IGNORECASE).strip()
-
-        if feat_clean:
-            # Mixed feature query — keep block as-is.
-            out_parts.append(css[m.start():body_end])
-        elif min_w and not max_w and int(min_w.group(1)) >= _MEDIA_THRESH_MIN_DESKTOP:
-            # Desktop-only block — delete entirely.
-            pass
-        elif max_w and not min_w and int(max_w.group(1)) >= _MEDIA_THRESH_MAX_NARROW:
-            # Narrow block — unwrap so its rules apply unconditionally.
-            out_parts.append(rules)
-        else:
-            # Other width range (e.g., mobile-only ≤ 600, ultra-wide ≥ 1440)
-            # or a `min-width: N and max-width: M` pair — keep as-is.
-            out_parts.append(css[m.start():body_end])
-        pos = next_pos
-    return "".join(out_parts)
-
-
-_STYLE_RE = re.compile(r"(<style\b[^>]*>)(.*?)(</style\s*>)", re.DOTALL | re.IGNORECASE)
-
-
-def _neutralize_media_queries(html):
-    """Rewrite every <style> block to lock the layout at the narrow form."""
-    return _STYLE_RE.sub(
-        lambda m: m.group(1) + _neutralize_media_queries_in_css(m.group(2)) + m.group(3),
+    # Step 7 — drop loading=lazy from figureView <img>s so CDP
+    # screenshots decode the figures without scrolling the viewport.
+    html = re.sub(
+        r'(<img[^>]*?)\s+loading=(?:"lazy"|\'lazy\'|lazy\b)',
+        r'\1',
         html,
     )
 
-
-def remove_banners(html):
-    """Normalize Taylor & Francis HTML to a single centered text column.
-
-    Reading column wrapper: `.page-body.pagefulltext` — wraps the entire
-    article from the journal / volume / issue header through the
-    references. Capped at 752 px with 56 px top/bottom and 16 px side
-    padding.
-
-    Per-publisher notes (temp/format-html-extra.md):
-      - Main text column starts at "Nucleus\nVolume 6, 2015 - Issue 2"
-        (journal + volume/issue line preceding the article title).
-      - Main text column ends before "Related research" section.
-      - Preserve publication cover image, "Nucleus" journal link + ">",
-        "Volume 6, 2015 - Issue 2", "Submit an article" button
-        (`.submitAnArticle`), "Journal homepage" button (`.jHomepage`).
-        Native responsive CSS hides these at narrow viewports; force
-        visible since the 752-px body cap triggers narrow-mode layout.
-      - Strip the bottom floating "In this article / Article contents"
-        hamburger nav (`<div class=sections-nav>`).
-      - Do NOT strip `publication-tabs-dropdown` — that class is on the
-        outer tabs container wrapping the entire article body.
-    """
-    # -------------------------------------------------------------------
-    # Step 1 — lock the publisher's CSS to its narrow (≤ 1024) layout.
-    # See `_neutralize_media_queries` docstring above. Delete every
-    # `@media (min-width: ≥1025)` block (desktop layout never fires)
-    # and unwrap every `@media (max-width: ≥720)` block (narrow rules
-    # apply unconditionally). The whole head block — gray-box journal-
-    # nav, metrics widget, article title, author/page row — collapses
-    # to its narrow form at any viewport.
-    # -------------------------------------------------------------------
-    html = _neutralize_media_queries(html)
-
-    # -------------------------------------------------------------------
-    # Step 3 — strip chrome.
-    # -------------------------------------------------------------------
-    # Top: site nav + breadcrumb.
-    html = _remove_nested_element(html, r"<header\b[^>]*>")
-    html = remove_elements_by_id(html, "bc-nav")
-    # Bottom: site footer.
-    html = _remove_nested_element(html, r"<footer\b[^>]*>")
-    # Bottom-floating sticky "In this article / Article contents" nav.
-    # Two class tokens seen in the wild: `sections-nav` (static hamburger)
-    # and `sectionsNavigation` (Silverchair widget wrapper, fixed pos).
-    for cls in ("sections-nav", "sectionsNavigation"):
-        for _ in range(3):
-            before = html
-            html = _remove_nested_element(
-                html,
-                rf'<div\b[^>]*\bclass=["\']?[^"\'>]*\b{cls}\b[^>]*>',
-            )
-            if html == before:
-                break
-    # Mobile-only tab-nav buttons that sit in the article column header.
-    for cls in ("related-mobile", "article-contents-mobile"):
-        for _ in range(4):
-            before = html
-            html = _remove_nested_element(
-                html,
-                rf'<button\b[^>]*\bclass=["\']?[^"\'>]*\b{cls}\b[^>]*>',
-            )
-            if html == before:
-                break
-    # "Related research" header widget (`furtherReadingTitle`) and the
-    # dropzone tab panels that trail it (People also read, Recommended
-    # articles, Cited by). Main text ends before "Related research".
-    for _ in range(3):
-        before = html
-        html = _remove_nested_element(
-            html,
-            r'<div\b[^>]*\bclass="[^"]*\bfurtherReadingTitle\b[^"]*"[^>]*>',
-        )
-        if html == before:
-            break
-    for _ in range(6):
-        before = html
-        html = _remove_nested_element(
-            html,
-            r'<div\b[^>]*\bdata-pb-dropzone-name=["\']'
-            r'(?:People also read|Recommended articles|Cited by)',
-        )
-        if html == before:
-            break
-    # In-column Silverchair chrome widgets that sit between the
-    # page-body header and article metadata. Strip the blue search-
-    # triangle corner + search widget, the "Download PDF" CTA below
-    # references, and various Silverchair banners.
-    for cls_pat in (
-        "literatumBreadcrumbs",
-        "literatumCartLink",
-        "literatumInstitutionBanner",
-        "literatumNavigationLoginBar",
-        "quickSearchWidget",
-        "advancedSearchLinkDropZone",
-        "gql-alternative-widget",
-        # `.widget.pageHeader` holds the searchButtonIcon button that
-        # renders as the blue search corner at the page top — a
-        # remnant of site-header chrome not covered by stripping
-        # <header>. Per user request: "Delete the blue search button".
-        "pageHeader",
-        # `gql-content-navigation` is the previous/next-article nav
-        # widget that sits between the keywords block and the first
-        # article body section. Its inner buttons render at desktop
-        # only; the wrapper itself remains as a 59-px empty band at
-        # narrow viewports.
-        "gql-content-navigation",
-        # Sales promo block tailing the references column.
-        "advertising-offer",
-        # "Recommended articles" / "People also read" strip below
-        # references — two related class roots (one is the outer
-        # widget, one is the inner content section).
-        "recommended-articles-widget",
-        "hum-recommendations",
-        # Empty general-html widget shells remain after the
-        # advertising-offer / recommended-articles content was stripped
-        # — adds ~7 px each to the trailing whitespace.
-        "general-html",
-    ):
-        for _ in range(3):
-            before = html
-            html = _remove_nested_element(
-                html,
-                rf'<div\b[^>]*\bclass=["\']?[^"\'>]*\b{cls_pat}\b[^>]*>',
-            )
-            if html == before:
-                break
-
-    # -------------------------------------------------------------------
-    # Steps 2 + 4 — layout freeze and reading-column cap.
-    # -------------------------------------------------------------------
     override = (
         "<style>"
-        # Step 2 — freeze the 720-px layout regardless of viewport.
-        "html{width:100% !important;max-width:100% !important;"
-        "margin:0 !important;background:#fff !important;"
-        # Overlay-style scrollbar so the 16 px gutter on the right is
-        # not eaten by a non-overlay scrollbar at narrow viewports.
-        "overflow-y:overlay !important}"
-        "html::-webkit-scrollbar{width:0 !important;height:0 !important}"
-        "body{width:100% !important;min-width:0 !important;"
-        "max-width:752px !important;margin:0 auto !important;"
-        "background:#fff !important;color:#000 !important}"
-        # Cancel publisher's Bootstrap-style desktop column grid AND
-        # the inner-widget paddings that put the journal-nav text
-        # 21+30 px right of the page-body inner edge. These are
-        # surgical removals (zero, not fabricated values) of publisher
-        # rules that survive the @media neutralizer (some are in
-        # unconditional CSS rather than viewport-gated @media blocks).
-        ":root [class*=\"col-md-\"]{"
-        "float:none !important;width:100% !important;"
-        "max-width:100% !important;flex:0 0 100% !important;"
-        "margin-left:0 !important;margin-right:0 !important}"
-        ":root .page-body.pagefulltext .container,"
-        ":root .page-body.pagefulltext .container-fluid{"
-        "margin-left:0 !important;margin-right:0 !important;"
-        "width:100% !important;max-width:none !important}"
-        # Step 4 — cap the reading column. Use the standard 752-px cap
-        # with 56-px top/bottom + 16-px side padding (per format-html
-        # spec). The publisher's own narrow-mode horizontal indents on
-        # `.literatumSeriesNavigation` (mt=7, ml=7, mr=7) and
-        # `.widget-body` (pt=7, pl=7) used to layer on top of a 720-px
-        # wrapper with 0 horizontal padding to land near 16; switching
-        # to a clean 752/16 wrapper plus widget-padding zeros below
-        # gives a stable L/R/T/B that matches the spec at every vw.
-        # Horizontal padding is zero — the publisher's narrow-mode
-        # CSS supplies a ~22 px left inset via inner widget paddings,
-        # which the parser preserves so all metadata-block elements
-        # keep their relative positions. To bring the smallest text
-        # margin from L=22 down to L=16 (format-html spec floor)
-        # without disturbing those relative offsets, the entire
-        # wrapper is shifted 6 px left via `translateX(-6px)`. Layout
-        # flow is unaffected; only the visual position changes.
-        ".page-body.pagefulltext{"
-        "float:none !important;display:block !important;"
-        "width:auto !important;max-width:752px !important;"
-        "margin:0 auto !important;padding:56px 0 !important;"
-        "transform:translateX(-6px) !important;"
-        "box-sizing:border-box !important}"
-        # Hide TOC hamburger + ReadSpeaker tool-toggle (dead buttons
-        # in the static capture). Also hide the article-level tab-nav
-        # bar ("Full Article / Figures & data / References / …") which
-        # is a dead JS navigator in the static capture.
-        ".page-body.pagefulltext .tab-nav,"
-        ".page-body.pagefulltext .article-contents-mobile,"
-        ".page-body.pagefulltext #tocPopOver,"
-        ".page-body.pagefulltext .article-contents,"
-        ".page-body.pagefulltext .rsbtn_tooltoggle{display:none !important}"
-        # `publicationContentBody` and `publicationContentHeader` ship
-        # with linear-gradient backgrounds that paint a gray strip
-        # behind the article-title + metadata block. Kill both so the
-        # article reads on plain white background — matches the rest
-        # of the converted output and keeps the title/byline/metric
-        # row visually neutral.
-        ".page-body.pagefulltext .publicationContentBody,"
-        ".page-body.pagefulltext .publicationContentHeader{"
-        "background-image:none !important;background-color:#fff !important}"
-        # Reclaim the 53 px reserved for the tab-nav container that
-        # natively reserves space for the TOC bar. With the TOC hidden
-        # the height collapse keeps the layout tight without zeroing
-        # publisher-native vertical paddings on the metric/title block.
-        ".page-body.pagefulltext .tabs-widget>div:first-child{"
-        "height:auto !important;min-height:0 !important}"
-        # `.publicationContentBody .widget-body` natively has 7-px
-        # padding-top reserved for the tab-nav bar. We hide the bar,
-        # so that 7 px is dead space — zero only the top padding.
-        # Keep horizontal/bottom paddings intact so the publisher's
-        # native narrow-viewport rendering is preserved.
-        ".page-body.pagefulltext .publicationContentBody>.wrapped>"
-        ".widget-body{padding-top:0 !important}"
-        # The masthead widget (`.widget.widget-compact-vertical` —
-        # holds Full access / metric-totals) ships at outer ml=7
-        # plus inner widget-body pl=7 = 14 px total inset. That
-        # leaves the Full access icon at L=14, exceeding the title
-        # column's left margin (L=21.6 from publicationContentHeader's
-        # pl=21.5938). Increase the outer ml to 14.59 so total inset
-        # matches the title column (14.59+7=21.59), without touching
-        # the inner pl=7 (the publisher's icon-to-content gap stays
-        # intact).
-        ":root .page-body.pagefulltext .widget.widget-compact-vertical{"
-        "margin-left:14.5938px !important;"
-        "margin-right:14.5938px !important}"
-        # Inset the gray journal-banner (`.publicationSerialHeader`)
-        # symmetrically so its background aligns with the body
-        # column. Value mirrors `.publicationContentHeader`'s
-        # publisher-native `padding-left:21.5938px` — the same gutter
-        # the publisher uses to inset metadata content from the
-        # column edge — applied on both sides so the banner is
-        # column-wide rather than viewport edge-to-edge.
-        ":root .page-body.pagefulltext .publicationSerialHeader{"
-        "margin-left:21.5938px !important;"
-        "margin-right:21.5938px !important}"
-        # `article.article` natively has `margin-top:24px` to space
-        # the article body below the tab-nav bar. With the bar hidden
-        # this 24 px becomes dead space too — zero it so the abstract
-        # heading sits flush below the metric/title block.
-        ".page-body.pagefulltext .publicationContentBody article.article{"
-        "margin-top:0 !important}"
-        # Hide trailing chrome remnants:
-        # - `.col-md-1-4` sibling of references column (right rail with
-        #   stripped recommended-articles content — 40 px orphan)
-        # - `.extra-links .openUrl` per-reference institutional resolver
-        #   button (35 px taller than sibling text links)
-        ":root .row.row-md > .col-md-7-12:has(.references)"
-        " ~ .col-md-1-4{display:none !important}"
-        ".page-body.pagefulltext .extra-links .openUrl{"
-        "display:none !important}"
-        # Direct-child *:last-child margin-bottom zero (per skill).
-        # Without this the trailing reference/Bibliography margin
-        # leaves ~60 px of empty space below the last text inside
-        # the page-body wrapper. Use `>` (direct-child) only — the
-        # descendant form would zero every nested last-child's
-        # padding-bottom and collapse the journal-heading gray box
-        # 14 px shorter than its native height (`widget-body` and
-        # `literatumSeriesNavigation` inside it natively contribute
-        # 7 px each via padding-bottom and margin-bottom).
-        ".page-body.pagefulltext > *:last-child{"
-        "margin-bottom:0 !important;padding-bottom:0 !important}"
-        # Trailing reference margin only — `.references-list li:last-child`
-        # has native `margin-bottom: 32px` that contributes 32 px of
-        # trailing whitespace below the last text inside the wrapper.
-        # Scope the zero strictly to that LI so the descendant rule
-        # doesn't touch journal-nav widgets like `.literatumSeriesNavigation`,
-        # which natively use mb=7 to space themselves from the next
-        # widget below.
-        ".page-body.pagefulltext .references-list>li:last-child,"
-        ".page-body.pagefulltext .ref-list>li:last-child,"
-        ".page-body.pagefulltext .NLM_ref-list>li:last-child,"
-        ".page-body.pagefulltext .references>li:last-child{"
-        "margin-bottom:0 !important}"
-        # The orphan tabs-widget shell that used to wrap the dropzones
-        # we stripped above renders as an empty tab bar at the column
-        # bottom. Hide any tabs-widget whose ancestry is NOT through
-        # `.publication-tabs` (the in-article figure tabs we keep).
-        ".page-body.pagefulltext .tabs-widget:not("
-        ".publication-tabs .tabs-widget){display:none !important}"
-        # Figures: tandfonline (Atypon Literatum) wraps each figure in
-        #   <div class=figureView>
-        #     <div class=short-legend>
-        #       <p class=captionText>Figure N. Caption text...</p>
-        #     </div>
-        #     <a href=# class=thumbnail data-behaviour=show-popup
-        #        data-popup-event-type=fig data-id=f<N>>
-        #       <img id=d<N> src="data:image/webp;base64,..." loading=lazy
-        #            height=<H> width=<W>>
-        #     </a>
-        #     <div><button class=show-full-size>Display full size</button></div>
-        #   </div>
-        # Native order is CAPTION first, image second, full-size button
-        # third. Per the figure layout contract, image must render
-        # above caption — use flex column-reverse-style ordering. The
-        # high-res URL is not exposed in the saved DOM (JS-only popup
-        # via show-popup), so get_refs.py extension deferred. Visual
-        # fixes: reorder via flex `order`, force img full-width above
-        # caption, hide JS-only "Display full size" button.
-        ":root .page-body.pagefulltext .figureView{"
-        "display:flex !important;flex-direction:column !important;"
-        "width:100% !important;max-width:100% !important;"
-        "margin:1rem 0 !important;padding:0 !important}"
-        ":root .page-body.pagefulltext .figureView "
-        ".short-legend{order:2 !important;width:100% !important;"
-        "max-width:100% !important;margin:0 !important;padding:0 !important}"
-        ":root .page-body.pagefulltext .figureView "
-        "a.thumbnail{order:1 !important;display:block !important;"
-        "width:100% !important;max-width:100% !important;"
-        "margin:0 0 5px 0 !important;padding:0 !important;"
-        "cursor:default !important}"
-        ":root .page-body.pagefulltext .figureView "
-        "a.thumbnail > img{display:block !important;"
-        "width:100% !important;height:auto !important;"
-        "max-width:100% !important;margin:0 !important}"
-        # Hide the JS-only "Display full size" button (non-functional
-        # without JS) and put it last in flex order.
-        ":root .page-body.pagefulltext .figureView "
-        "button.show-full-size,"
-        ":root .page-body.pagefulltext .figureView "
-        "div:has(> button.show-full-size){display:none !important}"
+        "html{margin:0!important;padding:0!important;"
+        "background:#fff!important;}"
+        "body{max-width:752px!important;width:auto!important;"
+        "min-width:0!important;"
+        "margin:0 auto!important;padding:0 16px!important;"
+        "box-sizing:border-box!important;"
+        "background:#fff!important;"
+        "overflow-wrap:break-word!important;word-wrap:break-word!important;}"
+        # Step 8 — figureView: stack image on top of caption with 12 px
+        # gap; both fill the column. flex column-reverse re-orders
+        # caption (first child) below the thumbnail without rewriting
+        # the DOM.
+        ".figureView"
+        "{display:flex!important;flex-direction:column-reverse!important;"
+        "width:100%!important;max-width:100%!important;}"
+        ".figureView .thumbnail"
+        "{display:block!important;width:100%!important;"
+        "max-width:100%!important;margin:0 0 12px 0!important;}"
+        ".figureView .thumbnail img"
+        "{display:block!important;width:100%!important;"
+        "max-width:100%!important;height:auto!important;}"
+        ".figureView .short-legend"
+        "{display:block!important;width:100%!important;"
+        "margin:0!important;}"
         "</style>"
     )
     if "</head>" in html:
@@ -515,10 +164,8 @@ def _get_meta(html, name):
     """
     esc = re.escape(name)
     patterns = [
-        # name then content, quoted content
         rf'<meta[^>]*name="?\'?{esc}"?\'?[^>]*content="([^"]*)"',
         rf"<meta[^>]*name=\"?'?{esc}\"?'?[^>]*content='([^']*)'",
-        # name then content, unquoted content
         rf'<meta[^>]*name="?\'?{esc}"?\'?[^>]*content=([^\s>]+)',
     ]
     for pat in patterns:
@@ -529,7 +176,7 @@ def _get_meta(html, name):
 
 
 def _parse_volume_issue(html):
-    """Extract volume and issue.
+    """Extract volume and issue from issue-heading span or JSON-LD breadcrumb.
 
     Primary source: <span class=issue-heading>...'Volume 46, 2026 - Issue 4'.
     Fallback: JSON-LD BreadcrumbList item "name":"Volume 29, Issue 20" in
@@ -557,11 +204,26 @@ def _parse_volume_issue(html):
 
 
 def _parse_pages(html):
-    """Extract page range from 'Pages X-Y' text in itemPageRangeHistory div."""
-    m = re.search(r'class="?itemPageRangeHistory"?[^>]*>.*?Pages\s+([\d][^\s<]+)', html, re.DOTALL)
-    if not m:
-        return ""
-    return m.group(1).replace("\u2013", "-").replace("\u2014", "-")
+    """Extract page range from the itemPageRangeHistory div ('Pages X-Y' text).
+
+    Fallback chain when the itemPageRangeHistory marker is absent
+    (observed on early-online and some legacy articles): use the
+    `dc.FirstPage` / `dc.LastPage` Dublin-Core meta tags. If only
+    FirstPage is present, return it alone (article-number-style).
+    """
+    m = re.search(
+        r'class="?itemPageRangeHistory"?[^>]*>.*?Pages\s+([\d][^\s<]+)',
+        html, re.DOTALL,
+    )
+    if m:
+        return m.group(1).replace("–", "-").replace("—", "-")
+    first = _get_meta(html, "dc.FirstPage")
+    last = _get_meta(html, "dc.LastPage")
+    if first and last and first != last:
+        return f"{first}-{last}"
+    if first:
+        return first
+    return ""
 
 
 def _parse_title(html):
@@ -597,7 +259,6 @@ def _parse_metadata(html):
     volume, issue = _parse_volume_issue(html)
     pages = _parse_pages(html)
 
-    # DOI from dc.Identifier with scheme=doi
     doi = ""
     doi_m = re.search(
         r'<meta[^>]*name="?dc\.Identifier"?[^>]*scheme="?doi"?[^>]*content="?([^\s">]+)',
@@ -635,10 +296,10 @@ def _parse_authors(html):
     authors = []
     seen = set()
 
-    # Find each contribDegrees span by walking from each opening tag
+    # Find each contribDegrees span by walking from each opening tag.
     # Class may have additional values: "contribDegrees corresponding MTN"
     for m in re.finditer(r'<span\s+class="?contribDegrees[^>]*>', html):
-        # Walk forward to find matching </span>, handling nesting
+        # Walk forward to find matching </span>, handling nesting.
         pos = m.end()
         depth = 1
         while depth > 0 and pos < len(html):
@@ -655,7 +316,7 @@ def _parse_authors(html):
 
         block = html[m.end():pos]
 
-        # Extract name from author link
+        # Extract name from author link.
         name_m = re.search(r'class="?author"?[^>]*>(.*?)</a>', block, re.DOTALL)
         if not name_m:
             continue
@@ -665,7 +326,7 @@ def _parse_authors(html):
             continue
         seen.add(display_name)
 
-        # Try to get LastName, Given from href URL
+        # Try to get LastName, Given from href URL.
         href_m = re.search(r'class="?author"?[^>]*href="?([^\s">]+)', block)
         author = display_name
         if href_m:
@@ -676,28 +337,30 @@ def _parse_authors(html):
                 decoded = urllib.parse.unquote_plus(parts[1])
                 author = format_author_name(decoded)
 
-        # Extract affiliation from overlay span
+        # Extract affiliation from overlay span.
         affiliations = []
         overlay_m = re.search(
             r'<span\s+class="?overlay"?>(.*?)</span>', block, re.DOTALL
         )
         if overlay_m:
             aff_html = overlay_m.group(1)
-            # Remove orcid links and their images
-            aff_html = re.sub(r'<a[^>]*class="?orcid-author"?[^>]*>.*?</a>', '', aff_html, flags=re.DOTALL)
+            # Drop ORCID links and their images.
+            aff_html = re.sub(
+                r'<a[^>]*class="?orcid-author"?[^>]*>.*?</a>',
+                '', aff_html, flags=re.DOTALL,
+            )
             aff_text = strip_tags(aff_html).strip()
-            # Remove "Correspondence" + email at end of affiliation
+            # Drop trailing "Correspondence" + email block.
             aff_text = re.sub(r'Correspondence\S*$', '', aff_text).strip()
             if aff_text:
-                # Affiliations are prefixed with superscript labels (a, b, c...)
-                # Split on semicolons which separate multiple affiliations
+                # Affiliations separated by semicolons.
                 parts = re.split(r'\s*;\s*', aff_text)
                 affiliations = [p.strip() for p in parts if p.strip()]
 
         # Email-domain inference: older T&F Cell Cycle HTML exposes only
         # the corresponding-author email in the overlay, not a structured
-        # affiliation block. Fall back to the known-domain map so
-        # authors from major academic institutions still get an aff.
+        # affiliation block. Fall back to the known-domain map so authors
+        # from major academic institutions still get an aff.
         if not affiliations:
             for em in re.finditer(r'mailto:([^"\'\s>]+)', block):
                 aff = affiliation_from_email(em.group(1))
@@ -717,11 +380,6 @@ def _parse_authors(html):
 # References
 # ---------------------------------------------------------------------------
 
-def _flip_ref_author(name):
-    """Convert 'Initials LastName' (Scholar URL shape) to 'Last IN' via shared helpers."""
-    return format_author_name(name)
-
-
 def _parse_references(html):
     """Extract the reference list.
 
@@ -733,7 +391,6 @@ def _parse_references(html):
     getFTR data-target attributes (not from scholar URL tracking params).
     Falls back to plain text from <li> entries.
     """
-    # Find references section (unquoted id)
     refs_m = re.search(
         r'<div\s+id="?references-Section1"?[^>]*>(.*)',
         html, re.DOTALL,
@@ -742,43 +399,43 @@ def _parse_references(html):
         return []
 
     refs_html = refs_m.group(1)
-    # Truncate at next major section to avoid matching outside references
+    # Truncate at next major section to avoid matching outside references.
     end_m = re.search(r'</div>\s*</div>\s*</article>', refs_html, re.DOTALL)
     if end_m:
         refs_html = refs_html[:end_m.start()]
 
     refs = []
 
-    # Find all reference <li> start positions (no </li> tags in tandfonline HTML)
-    # ID formats: CIT0001, cit0001, B1, R1
-    li_starts = list(re.finditer(r'<li\s+id="?(?:CIT|cit|B|R)\d+[^>]*>', refs_html, re.DOTALL))
+    # Find all reference <li> start positions (no </li> tags in tandfonline HTML).
+    # ID formats: CIT0001, cit0001, B1, R1.
+    li_starts = list(re.finditer(
+        r'<li\s+id="?(?:CIT|cit|B|R)\d+[^>]*>', refs_html, re.DOTALL,
+    ))
     for i, li_m in enumerate(li_starts):
         end = li_starts[i + 1].start() if i + 1 < len(li_starts) else min(li_m.start() + 5000, len(refs_html))
         entry = refs_html[li_m.end():end]
 
-        # Get DOI from getFTR data-target (the reliable source)
+        # DOI from getFTR data-target (the reliable source).
         doi_m = re.search(r'data-target="?(10\.[^\s">]+)', entry)
         ref_doi = format_doi(doi_m.group(1)) if doi_m else ""
 
-        # Try Google Scholar lookup URL (double-encoded in getFTRLinkout)
+        # Try Google Scholar lookup URL (double-encoded in getFTRLinkout).
         gs_m = re.search(r'scholar_lookup%3F([^"\'>\s]+)', entry)
         if not gs_m:
-            # Direct scholar_lookup URL
+            # Direct scholar_lookup URL.
             gs_m = re.search(
                 r'scholar\.google\.com/scholar_lookup\?([^"\'>\s]+)', entry
             )
 
         if gs_m:
             qs = gs_m.group(1)
-            # Decode URL encoding
             qs = urllib.parse.unquote(qs)
-            # Strip tracking params appended by tandfonline after &amp;
-            # Scholar params use & between them; tracking params start with &amp;doi=
+            # Strip tracking params appended by tandfonline after &amp;.
             qs = re.split(r'&amp;', qs)[0]
             qs = unescape(qs).replace("&amp;", "&")
             params = urllib.parse.parse_qs(qs)
 
-            # Scholar URL doesn't include issue; parse it from citation text
+            # Scholar URL doesn't include issue; parse it from citation text.
             # Format: "YYYY;VOLUME(ISSUE):PAGES"
             issue = ""
             text = strip_tags(entry)
@@ -792,14 +449,15 @@ def _parse_references(html):
                 "year": params.get("publication_year", [""])[0],
                 "volume": params.get("volume", [""])[0],
                 "issue": issue,
-                "pages": params.get("pages", [""])[0].replace("\u2013", "-"),
+                "pages": params.get("pages", [""])[0].replace("–", "-"),
                 "doi": ref_doi,
                 "authors": [
-                    _flip_ref_author(a) for a in params.get("author", []) if a.strip()
+                    format_author_name(a)
+                    for a in params.get("author", []) if a.strip()
                 ],
             }
         else:
-            # Fallback: extract text from the <span> content
+            # Fallback: extract text from the <span> content.
             span_m = re.search(r'<span>(.*?)</span>', entry, re.DOTALL)
             cite_text = strip_tags(span_m.group(1)).strip() if span_m else ""
             ref = {
@@ -823,12 +481,12 @@ def _parse_references(html):
 # ---------------------------------------------------------------------------
 
 def _is_top_level_section(tag_html):
-    """Check if a matched NLM_sec tag is top-level (not level_2+)."""
+    """True when the matched NLM_sec tag is top-level (not level_2+)."""
     return not re.search(r'NLM_sec_level_[2-9]', tag_html)
 
 
 def _get_section_heading(section_html):
-    """Get the first heading text from a section div."""
+    """Return the first heading text from a section div."""
     m = re.search(r'<h[1-4][^>]*>(.*?)</h[1-4]>', section_html, re.DOTALL)
     if m:
         return strip_tags(m.group(1)).strip()
@@ -856,10 +514,10 @@ def _extract_section(html, start_match):
 def _parse_main_text(html):
     """Extract body text.
 
-    Boundary rules (from CLAUDE.md):
+    Boundary rules:
       - Body sections: keep everything from abstract to before first references.
       - Supplementary: after first references, keep only sections matching
-        supplement/extended data/source data/expanded view/powerpoint/appendix.
+        supplement / extended data / source data / expanded view / appendix.
       - Remove all references sections.
     Pipeline: locate article container -> slice body zones -> extract_captions
     -> strip_common -> tags_to_text -> drop_noise.
@@ -867,7 +525,6 @@ def _parse_main_text(html):
     (abstractKeywords), and top-level NLM_sec body sections before references;
     include top-level NLM_sec supplementary sections after references.
     """
-    # Find article element
     article_m = re.search(r'<article[^>]*>(.*)</article>', html, re.DOTALL)
     if not article_m:
         return ""
@@ -875,14 +532,14 @@ def _parse_main_text(html):
 
     parts = []
 
-    # Abstract (nesting-aware extraction)
+    # Abstract (nesting-aware extraction).
     abs_m = re.search(r'<div\s[^>]*class="?hlFld-Abstract"?[^>]*>', article)
     if abs_m:
         abs_html = _extract_section(article, abs_m)
         abs_html = strip_common(abs_html)
         parts.append(tags_to_text(abs_html))
 
-    # Keywords
+    # Keywords.
     kw_m = re.search(r'<div\s[^>]*class="?abstractKeywords"?[^>]*>', article)
     if kw_m:
         kw_html = _extract_section(article, kw_m)
@@ -890,13 +547,13 @@ def _parse_main_text(html):
         if kw_text:
             parts.append(kw_text)
 
-    # Find references section position to determine body boundary
+    # References boundary.
     refs_pos = len(article)
     refs_m = re.search(r'<div\s+id="?references-Section1"?', article)
     if refs_m:
         refs_pos = refs_m.start()
 
-    # Body sections (top-level NLM_sec divs before references)
+    # Body sections (top-level NLM_sec divs before references).
     for sec_m in _ALL_SECTION_RE.finditer(article):
         if sec_m.start() >= refs_pos:
             break
@@ -910,7 +567,7 @@ def _parse_main_text(html):
         if text.strip():
             parts.append(text)
 
-    # Look for supplementary content sections after references
+    # Supplementary sections after references.
     if refs_m:
         post_refs = article[refs_pos:]
         for sec_m in _ALL_SECTION_RE.finditer(post_refs):
